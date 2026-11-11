@@ -205,9 +205,32 @@ type Engine struct {
 	next     int
 	models   []Model
 	modelsAt time.Time
+
+	sigMu sync.Mutex
+	sigs  map[string]string
 }
 
 func (e *Engine) Default() string { return e.DefaultModel }
+
+// rememberSig caches a Gemini thoughtSignature by tool-call ID so it can be
+// echoed back on the next turn; Gemini 3 rejects functionCall parts without it.
+func (e *Engine) rememberSig(id, sig string) {
+	if id == "" || sig == "" {
+		return
+	}
+	e.sigMu.Lock()
+	defer e.sigMu.Unlock()
+	if e.sigs == nil || len(e.sigs) >= 4096 {
+		e.sigs = map[string]string{}
+	}
+	e.sigs[id] = sig
+}
+
+func (e *Engine) lookupSig(id string) string {
+	e.sigMu.Lock()
+	defer e.sigMu.Unlock()
+	return e.sigs[id]
+}
 
 func NewEngine(store AuthStore, baseURL string, auths []*Auth) (*Engine, error) {
 	if len(auths) == 0 {
@@ -598,7 +621,7 @@ func (e *Engine) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDe
 	sessionID := fmt.Sprintf("-%d", int64(binary.BigEndian.Uint64(sb[:])&0x7FFFFFFFFFFFFFFF))
 	usedClaude := strings.Contains(strings.ToLower(model), "claude")
 	inner := map[string]any{
-		"contents":  chatContents(req.Messages),
+		"contents":  chatContents(req.Messages, e.lookupSig),
 		"sessionId": sessionID,
 		"labels": map[string]string{
 			"last_step_index":          "1",
@@ -653,7 +676,7 @@ func (e *Engine) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDe
 }
 
 // chatContents converts unified chat messages into Antigravity/Gemini contents.
-func chatContents(msgs []ChatMessage) []map[string]any {
+func chatContents(msgs []ChatMessage, sig func(string) string) []map[string]any {
 	contents := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
 		switch m.Role {
@@ -672,15 +695,22 @@ func chatContents(msgs []ChatMessage) []map[string]any {
 					if tc.ID != "" {
 						fc["id"] = tc.ID
 					}
-					parts = append(parts, map[string]any{"functionCall": fc})
+					part := map[string]any{"functionCall": fc}
+					if sig != nil {
+						if s := sig(tc.ID); s != "" {
+							part["thoughtSignature"] = s
+						}
+					}
+					parts = append(parts, part)
 				}
 				contents = append(contents, map[string]any{"role": "model", "parts": parts})
 			} else {
 				contents = append(contents, map[string]any{"role": "model", "parts": []map[string]any{{"text": m.Content}}})
 			}
 		case "tool":
+			// Antigravity rejects role "function"; function responses ride a user turn.
 			contents = append(contents, map[string]any{
-				"role": "function",
+				"role": "user",
 				"parts": []map[string]any{{"functionResponse": map[string]any{
 					"name":     m.Name,
 					"response": map[string]any{"output": m.Content},
@@ -772,9 +802,10 @@ type chatChunk struct {
 		Candidates []struct {
 			Content struct {
 				Parts []struct {
-					Text         string `json:"text"`
-					Thought      bool   `json:"thought"`
-					FunctionCall *struct {
+					Text             string `json:"text"`
+					Thought          bool   `json:"thought"`
+					ThoughtSignature string `json:"thoughtSignature"`
+					FunctionCall     *struct {
 						Name string          `json:"name"`
 						Args json.RawMessage `json:"args"`
 						ID   string          `json:"id"`
@@ -864,6 +895,7 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, onDel
 								if tc.ID == "" {
 									tc.ID = newID("call_")
 								}
+								e.rememberSig(tc.ID, part.ThoughtSignature)
 								toolCalls = append(toolCalls, tc)
 								started = true
 								if onDelta != nil {

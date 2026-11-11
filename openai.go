@@ -207,6 +207,7 @@ func buildChatRequest(req chatRequest, model string) (*ChatRequest, error) {
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 	}
+	toolNames := map[string]string{}
 	for _, m := range req.Messages {
 		text, err := parseContent(m.Content)
 		if err != nil {
@@ -215,6 +216,10 @@ func buildChatRequest(req chatRequest, model string) (*ChatRequest, error) {
 		cm := ChatMessage{Role: m.Role, Content: text, Name: m.Name, ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
 			cm.ToolCalls = append(cm.ToolCalls, ToolCall{ID: tc.ID, Type: tc.Type, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+			toolNames[tc.ID] = tc.Function.Name
+		}
+		if cm.Role == "tool" && cm.Name == "" {
+			cm.Name = toolNames[cm.ToolCallID]
 		}
 		cr.Messages = append(cr.Messages, cm)
 	}

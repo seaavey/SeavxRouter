@@ -176,4 +176,26 @@ func TestOpenAIToolCalls(t *testing.T) {
 			t.Fatalf("tool message = %+v", tool)
 		}
 	})
+
+	t.Run("tool name resolved from tool_call_id", func(t *testing.T) {
+		stub := &chatStub{result: &ChatResult{Content: "done", FinishReason: "stop"}}
+		s := &Server{backend: stub}
+		body := `{"model":"m","messages":[` +
+			`{"role":"user","content":"weather?"},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},` +
+			`{"role":"tool","tool_call_id":"call_1","content":"sunny"}` +
+			`]}`
+		w := httptest.NewRecorder()
+		s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		if w.Code != 200 {
+			t.Fatalf("code %d body %s", w.Code, w.Body.String())
+		}
+		if stub.gotReq == nil || len(stub.gotReq.Messages) != 3 {
+			t.Fatalf("messages not parsed: %+v", stub.gotReq)
+		}
+		tool := stub.gotReq.Messages[2]
+		if tool.Role != "tool" || tool.ToolCallID != "call_1" || tool.Name != "get_weather" {
+			t.Fatalf("tool name not resolved from tool_call_id: %+v", tool)
+		}
+	})
 }

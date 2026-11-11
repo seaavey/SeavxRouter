@@ -113,7 +113,7 @@ func TestEngineConversions(t *testing.T) {
 			{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
 			{Role: "tool", Name: "f", ToolCallID: "call_1", Content: "result"},
 		}
-		got := chatContents(msgs)
+		got := chatContents(msgs, nil)
 		if len(got) != 4 {
 			t.Fatalf("contents len = %d, want 4", len(got))
 		}
@@ -134,12 +134,37 @@ func TestEngineConversions(t *testing.T) {
 		if fc["args"].(map[string]any)["x"] != float64(1) {
 			t.Fatalf("args = %v", fc["args"])
 		}
-		if got[3]["role"] != "function" {
-			t.Fatalf("tool role = %v, want function", got[3]["role"])
+		if got[3]["role"] != "user" {
+			t.Fatalf("tool role = %v, want user", got[3]["role"])
 		}
 		fr := got[3]["parts"].([]map[string]any)[0]["functionResponse"].(map[string]any)
 		if fr["name"] != "f" || fr["response"].(map[string]any)["output"] != "result" {
 			t.Fatalf("functionResponse = %v", fr)
+		}
+	})
+	t.Run("thought signature", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
+		}
+		sig := func(id string) string {
+			if id == "call_1" {
+				return "SIGBASE64"
+			}
+			return ""
+		}
+		got := chatContents(msgs, sig)
+		part := got[0]["parts"].([]map[string]any)[0]
+		if part["thoughtSignature"] != "SIGBASE64" {
+			t.Fatalf("thoughtSignature not attached at part level: %v", part)
+		}
+		fc := part["functionCall"].(map[string]any)
+		if _, ok := fc["thoughtSignature"]; ok {
+			t.Fatalf("thoughtSignature must not be nested in functionCall: %v", fc)
+		}
+		gotNone := chatContents(msgs, func(string) string { return "" })
+		partNone := gotNone[0]["parts"].([]map[string]any)[0]
+		if _, ok := partNone["thoughtSignature"]; ok {
+			t.Fatalf("thoughtSignature should be absent when unavailable: %v", partNone)
 		}
 	})
 	t.Run("tools", func(t *testing.T) {
@@ -192,7 +217,7 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"},\"id\":\"call_abc\"}}]}}]}}\n\n")
+		fmt.Fprint(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thoughtSignature\":\"SIG123\",\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"},\"id\":\"call_abc\"}}]}}]}}\n\n")
 		fmt.Fprint(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"cachedContentTokenCount\":7,\"totalTokenCount\":15}}}\n\n")
 	}))
 	defer srv.Close()
@@ -242,5 +267,25 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 	}
 	if !sawTool || !sawText {
 		t.Fatalf("deltas missing tool/text: %+v", deltas)
+	}
+	if e.lookupSig("call_abc") != "SIG123" {
+		t.Fatalf("thoughtSignature not captured: %q", e.lookupSig("call_abc"))
+	}
+
+	roundTrip := &ChatRequest{
+		Model: "gemini-3.8-flash-high",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "weather?"},
+			{Role: "assistant", ToolCalls: []ToolCall{tc}},
+			{Role: "tool", Name: "get_weather", ToolCallID: "call_abc", Content: "sunny"},
+		},
+		Tools:  []ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
+		Stream: true,
+	}
+	if _, err := e.Chat(context.Background(), roundTrip, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(upstreamBody, []byte(`"thoughtSignature":"SIG123"`)) {
+		t.Fatalf("round-trip upstream missing thoughtSignature: %s", upstreamBody)
 	}
 }
