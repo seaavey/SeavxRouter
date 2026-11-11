@@ -1,0 +1,9 @@
+# Credentials — never commit
+.seavx/
+
+# Build artifacts
+seavxrouter
+*.exe
+
+# SDD scratch workspace
+.superpowers/
