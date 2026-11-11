@@ -110,9 +110,12 @@ func buildPrompt(instructions string, msgs []textMessage) string {
 }
 
 type openAIUsage struct {
-	PromptTokens            int `json:"prompt_tokens"`
-	CompletionTokens        int `json:"completion_tokens"`
-	TotalTokens             int `json:"total_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 	CompletionTokensDetails struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
@@ -124,6 +127,7 @@ func mapUsage(u Usage) openAIUsage {
 		CompletionTokens: u.OutputTokens,
 		TotalTokens:      u.TotalTokens,
 	}
+	ou.PromptTokensDetails.CachedTokens = u.CacheReadTokens
 	ou.CompletionTokensDetails.ReasoningTokens = u.ThinkingTokens
 	return ou
 }
@@ -160,13 +164,84 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 // --- POST /v1/chat/completions ---
 
+type openAITool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description"`
+		Parameters  map[string]any `json:"parameters"`
+	} `json:"function"`
+}
+
+type openAIToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type chatRequest struct {
 	Model    string `json:"model"`
 	Messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role       string           `json:"role"`
+		Content    json.RawMessage  `json:"content"`
+		Name       string           `json:"name"`
+		ToolCallID string           `json:"tool_call_id"`
+		ToolCalls  []openAIToolCall `json:"tool_calls"`
 	} `json:"messages"`
-	Stream bool `json:"stream"`
+	Tools       []openAITool `json:"tools"`
+	ToolChoice  any          `json:"tool_choice"`
+	Stream      bool         `json:"stream"`
+	Temperature *float64     `json:"temperature"`
+	MaxTokens   *int         `json:"max_tokens"`
+}
+
+// buildChatRequest converts an OpenAI chat request into the unified ChatRequest.
+func buildChatRequest(req chatRequest, model string) (*ChatRequest, error) {
+	cr := &ChatRequest{
+		Model:       model,
+		Stream:      req.Stream,
+		ToolChoice:  req.ToolChoice,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+	}
+	for _, m := range req.Messages {
+		text, err := parseContent(m.Content)
+		if err != nil {
+			return nil, err
+		}
+		cm := ChatMessage{Role: m.Role, Content: text, Name: m.Name, ToolCallID: m.ToolCallID}
+		for _, tc := range m.ToolCalls {
+			cm.ToolCalls = append(cm.ToolCalls, ToolCall{ID: tc.ID, Type: tc.Type, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+		}
+		cr.Messages = append(cr.Messages, cm)
+	}
+	for _, t := range req.Tools {
+		if t.Type != "" && t.Type != "function" {
+			continue
+		}
+		cr.Tools = append(cr.Tools, ToolDefinition{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters})
+	}
+	return cr, nil
+}
+
+// openAIToolCalls renders unified tool calls in OpenAI wire form.
+func openAIToolCalls(calls []ToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(calls))
+	for _, tc := range calls {
+		typ := tc.Type
+		if typ == "" {
+			typ = "function"
+		}
+		out = append(out, map[string]any{
+			"id":       tc.ID,
+			"type":     typ,
+			"function": map[string]any{"name": tc.Name, "arguments": tc.Arguments},
+		})
+	}
+	return out
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -179,39 +254,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &apiError{http.StatusBadRequest, "messages must not be empty", "invalid_request_error", "missing_messages"})
 		return
 	}
-	msgs := make([]textMessage, 0, len(req.Messages))
-	for _, m := range req.Messages {
-		text, err := parseContent(m.Content)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		msgs = append(msgs, textMessage{Role: m.Role, Text: text})
-	}
 	model, ok := s.resolveModel(w, r, req.Model)
 	if !ok {
 		return
 	}
-	prompt := buildPrompt("", msgs)
+	cr, err := buildChatRequest(req, model)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	created := time.Now().Unix()
 	id := newID("chatcmpl-")
 
 	if !req.Stream {
-		result, err := s.backend.Complete(r.Context(), model, prompt)
+		result, err := s.backend.Chat(r.Context(), cr, nil)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
+		message := map[string]any{"role": "assistant", "content": strings.TrimRight(result.Content, "\n")}
+		finish := result.FinishReason
+		if finish == "" {
+			finish = "stop"
+		}
+		if len(result.ToolCalls) > 0 {
+			message["tool_calls"] = openAIToolCalls(result.ToolCalls)
+			finish = "tool_calls"
+		}
 		writeJSON(w, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": model,
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role": "assistant", "content": strings.TrimRight(result.Response, "\n"),
-				},
-				"finish_reason": "stop",
-			}},
-			"usage": mapUsage(result.Usage),
+			"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": finish}},
+			"usage":   mapUsage(result.Usage),
 		})
 		return
 	}
@@ -239,8 +312,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chunk(map[string]any{"role": "assistant"}, nil, nil)
-	result, err := s.backend.Stream(r.Context(), model, prompt, func(delta string) {
-		chunk(map[string]any{"content": delta}, nil, nil)
+	toolIndex := 0
+	result, err := s.backend.Chat(r.Context(), cr, func(d ChatDelta) {
+		if d.Content != "" {
+			chunk(map[string]any{"content": d.Content}, nil, nil)
+		}
+		if len(d.ToolCalls) > 0 {
+			tcs := make([]map[string]any, 0, len(d.ToolCalls))
+			for _, tc := range d.ToolCalls {
+				tcs = append(tcs, map[string]any{
+					"index":    toolIndex,
+					"id":       tc.ID,
+					"type":     "function",
+					"function": map[string]any{"name": tc.Name, "arguments": tc.Arguments},
+				})
+				toolIndex++
+			}
+			chunk(map[string]any{"tool_calls": tcs}, nil, nil)
+		}
 	})
 	if err != nil {
 		slog.Warn("chat stream failed", "err", err)
@@ -252,7 +341,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	chunk(map[string]any{}, "stop", mapUsage(result.Usage))
+	finish := result.FinishReason
+	if finish == "" {
+		finish = "stop"
+	}
+	if len(result.ToolCalls) > 0 {
+		finish = "tool_calls"
+	}
+	chunk(map[string]any{}, finish, mapUsage(result.Usage))
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
