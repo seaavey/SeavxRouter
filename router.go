@@ -25,6 +25,31 @@ func (m *MultiBackend) Default() string {
 	return ""
 }
 
+// normalizeModel maps common user-facing aliases to canonical backend model
+// IDs. The "gemini." separator is treated like "gemini-" so dotted and dashed
+// spellings resolve alike; version dots (e.g. 3.8) are preserved.
+func normalizeModel(model string) string {
+	m := model
+	if rest, ok := strings.CutPrefix(m, "gemini."); ok {
+		m = "gemini-" + rest
+	}
+	switch m {
+	case "gemini-3.8-flash", "gemini-3.8-flash-preview", "gemini-flash":
+		return "gemini-3.8-flash-high"
+	case "gemini-2.5-flash":
+		return "gemini-2.5-flash"
+	case "gemini-2.5-pro":
+		return "gemini-2.5-pro"
+	}
+	switch {
+	case strings.HasPrefix(m, "claude-3-7-sonnet"), strings.HasPrefix(m, "claude-3-5-sonnet"):
+		return "claude-sonnet-4-6"
+	case strings.HasPrefix(m, "claude-3-opus"):
+		return "claude-opus-4-6-thinking"
+	}
+	return m
+}
+
 func (m *MultiBackend) resolve(ctx context.Context, model string) (BackendAPI, string, error) {
 	if name, id, ok := strings.Cut(model, "/"); ok {
 		switch name {
@@ -32,14 +57,15 @@ func (m *MultiBackend) resolve(ctx context.Context, model string) (BackendAPI, s
 			if m.codex == nil {
 				return nil, "", fmt.Errorf("codex provider not configured; run: seavxrouter login codex")
 			}
-			return m.codex, id, nil
+			return m.codex, normalizeModel(id), nil
 		case "antigravity":
 			if m.antigravity == nil {
 				return nil, "", fmt.Errorf("antigravity provider not configured; run: seavxrouter login")
 			}
-			return m.antigravity, id, nil
+			return m.antigravity, normalizeModel(id), nil
 		}
 	}
+	model = normalizeModel(model)
 	if m.codex != nil && model != "" && m.codex.HasModel(ctx, model) {
 		return m.codex, model, nil
 	}
