@@ -167,6 +167,22 @@ func TestEngineConversions(t *testing.T) {
 			t.Fatalf("thoughtSignature should be absent when unavailable: %v", partNone)
 		}
 	})
+	t.Run("assistant text with tool calls", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{Role: "assistant", Content: "Let me check.", ToolCalls: []ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
+		}
+		got := chatContents(msgs, nil)
+		parts := got[0]["parts"].([]map[string]any)
+		if len(parts) != 2 {
+			t.Fatalf("parts len = %d, want 2 (text + functionCall): %v", len(parts), parts)
+		}
+		if parts[0]["text"] != "Let me check." {
+			t.Fatalf("assistant text dropped: %v", parts[0])
+		}
+		if _, ok := parts[1]["functionCall"]; !ok {
+			t.Fatalf("functionCall missing: %v", parts[1])
+		}
+	})
 	t.Run("tools", func(t *testing.T) {
 		tools := []ToolDefinition{{Name: "f", Description: "d", Parameters: map[string]any{
 			"type":       "object",
@@ -218,7 +234,7 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 		upstreamBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thoughtSignature\":\"SIG123\",\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"},\"id\":\"call_abc\"}}]}}]}}\n\n")
-		fmt.Fprint(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"cachedContentTokenCount\":7,\"totalTokenCount\":15}}}\n\n")
+		fmt.Fprint(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":3,\"cachedContentTokenCount\":7,\"totalTokenCount\":15}}}\n\n")
 	}))
 	defer srv.Close()
 
@@ -250,7 +266,7 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 	if res.Content != "ok" {
 		t.Fatalf("content = %q", res.Content)
 	}
-	if res.Usage.InputTokens != 10 || res.Usage.OutputTokens != 5 || res.Usage.CacheReadTokens != 7 || res.Usage.TotalTokens != 15 {
+	if res.Usage.InputTokens != 10 || res.Usage.OutputTokens != 8 || res.Usage.ThinkingTokens != 3 || res.Usage.CacheReadTokens != 7 || res.Usage.TotalTokens != 15 {
 		t.Fatalf("usage = %+v", res.Usage)
 	}
 	if !bytes.Contains(upstreamBody, []byte("functionDeclarations")) {

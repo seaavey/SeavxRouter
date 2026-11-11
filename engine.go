@@ -682,7 +682,10 @@ func chatContents(msgs []ChatMessage, sig func(string) string) []map[string]any 
 		switch m.Role {
 		case "assistant":
 			if len(m.ToolCalls) > 0 {
-				parts := make([]map[string]any, 0, len(m.ToolCalls))
+				parts := make([]map[string]any, 0, len(m.ToolCalls)+1)
+				if m.Content != "" {
+					parts = append(parts, map[string]any{"text": m.Content})
+				}
 				for _, tc := range m.ToolCalls {
 					var args any = map[string]any{}
 					if tc.Arguments != "" {
@@ -910,7 +913,7 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, onDel
 					if u := chunk.Response.UsageMetadata; u != nil {
 						usage = Usage{
 							InputTokens:     u.PromptTokenCount,
-							OutputTokens:    u.CandidatesTokenCount,
+							OutputTokens:    u.CandidatesTokenCount + u.ThoughtsTokenCount,
 							ThinkingTokens:  u.ThoughtsTokenCount,
 							CacheReadTokens: u.CachedContentTokenCount,
 							TotalTokens:     u.TotalTokenCount,
@@ -1078,7 +1081,7 @@ func (e *Engine) streamOnce(ctx context.Context, a *Auth, data []byte, onDelta f
 					if u := chunk.Response.UsageMetadata; u != nil {
 						usage = Usage{
 							InputTokens:     u.PromptTokenCount,
-							OutputTokens:    u.CandidatesTokenCount,
+							OutputTokens:    u.CandidatesTokenCount + u.ThoughtsTokenCount,
 							ThinkingTokens:  u.ThoughtsTokenCount,
 							CacheReadTokens: u.CachedContentTokenCount,
 							TotalTokens:     u.TotalTokenCount,
