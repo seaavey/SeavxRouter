@@ -161,6 +161,7 @@ func main() {
 	})
 	mux.HandleFunc("GET /v1/models", srv.auth(srv.handleModels))
 	mux.HandleFunc("POST /v1/chat/completions", srv.auth(srv.handleChat))
+	mux.HandleFunc("POST /v1/messages", srv.auth(srv.handleAnthropicMessages))
 	mux.HandleFunc("POST /v1/responses", srv.auth(srv.handleResponses))
 
 	httpSrv := &http.Server{
