@@ -35,12 +35,20 @@ type CodexEngine struct {
 	Store        AuthStore
 	HTTP         *http.Client
 	DefaultModel string
+	BaseURL      string
 
 	mu       sync.Mutex
 	auths    []*Auth
 	next     int
 	models   []Model
 	modelsAt time.Time
+}
+
+func (e *CodexEngine) apiBase() string {
+	if e.BaseURL != "" {
+		return e.BaseURL
+	}
+	return codexAPIBase
 }
 
 func NewCodexEngine(store AuthStore, auths []*Auth) (*CodexEngine, error) {
@@ -378,7 +386,252 @@ func (e *CodexEngine) Stream(ctx context.Context, model, prompt string, onDelta 
 }
 
 func (e *CodexEngine) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
-	return chatViaText(ctx, e, req, onDelta)
+	model := req.Model
+	if model == "" {
+		model = e.DefaultModel
+	}
+	if model == "" {
+		models, err := e.Models(ctx)
+		if err != nil {
+			return nil, err
+		}
+		model = models[0].ID
+	}
+	instructions, input := codexChatInput(req.Messages)
+	payload := map[string]any{
+		"model":        model,
+		"instructions": instructions,
+		"input":        input,
+		"stream":       true,
+		"store":        false,
+	}
+	if tools := codexChatTools(req.Tools); tools != nil {
+		payload["tools"] = tools
+	}
+	if req.ToolChoice != nil {
+		payload["tool_choice"] = req.ToolChoice
+	}
+	if req.Temperature != nil {
+		payload["temperature"] = *req.Temperature
+	}
+	if req.MaxTokens != nil {
+		payload["max_output_tokens"] = *req.MaxTokens
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for i, n := 0, e.count(); i < n; i++ {
+		a := e.pick()
+		result, started, err := e.chatStreamOnce(ctx, a, data, onDelta)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if started || !isQuotaError(err) || ctx.Err() != nil {
+			return nil, err
+		}
+		slog.Warn("codex account quota exhausted, trying next", "email", a.Email)
+	}
+	return nil, lastErr
+}
+
+// codexChatInput translates unified messages into the Responses API instructions
+// string and input items (message / function_call / function_call_output).
+func codexChatInput(msgs []ChatMessage) (string, []map[string]any) {
+	var instructions strings.Builder
+	input := make([]map[string]any, 0, len(msgs))
+	for _, m := range msgs {
+		switch m.Role {
+		case "system", "developer":
+			if instructions.Len() > 0 {
+				instructions.WriteString("\n\n")
+			}
+			instructions.WriteString(m.Content)
+		case "assistant":
+			if m.Content != "" {
+				input = append(input, map[string]any{
+					"type": "message", "role": "assistant",
+					"content": []map[string]any{{"type": "output_text", "text": m.Content}},
+				})
+			}
+			for _, tc := range m.ToolCalls {
+				input = append(input, map[string]any{
+					"type": "function_call", "call_id": tc.ID, "name": tc.Name, "arguments": tc.Arguments,
+				})
+			}
+		case "tool":
+			input = append(input, map[string]any{
+				"type": "function_call_output", "call_id": m.ToolCallID, "output": m.Content,
+			})
+		default:
+			input = append(input, map[string]any{
+				"type": "message", "role": "user",
+				"content": []map[string]any{{"type": "input_text", "text": m.Content}},
+			})
+		}
+	}
+	return instructions.String(), input
+}
+
+// codexChatTools converts unified tool definitions into Responses API function
+// tools. Parameters stay as standard (lowercase) JSON Schema.
+func codexChatTools(tools []ToolDefinition) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		f := map[string]any{"type": "function", "name": t.Name, "strict": false}
+		if t.Description != "" {
+			f["description"] = t.Description
+		}
+		if t.Parameters != nil {
+			f["parameters"] = t.Parameters
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+type codexChatEvent struct {
+	Type        string `json:"type"`
+	Delta       string `json:"delta"`
+	OutputIndex int    `json:"output_index"`
+	Item        *struct {
+		ID        string `json:"id"`
+		Type      string `json:"type"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"item"`
+	Response *struct {
+		Usage *struct {
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			TotalTokens        int `json:"total_tokens"`
+			InputTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
+			OutputTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"output_tokens_details"`
+		} `json:"usage"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	} `json:"response"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+	Message string `json:"message"`
+}
+
+// chatStreamOnce streams one structured Responses API request, parsing text
+// deltas and completed function_call items. started reports whether any output
+// was already delivered (which makes retrying unsafe).
+func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, onDelta func(ChatDelta)) (*ChatResult, bool, error) {
+	var full strings.Builder
+	var toolCalls []ToolCall
+	var usage Usage
+	started := false
+	for attempt := 0; ; attempt++ {
+		token, err := e.token(ctx, a)
+		if err != nil {
+			return nil, started, err
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", e.apiBase()+"/responses", bytes.NewReader(data))
+		if err != nil {
+			return nil, started, err
+		}
+		e.setHeaders(req, token, a, true)
+		resp, err := e.HTTP.Do(req)
+		if err != nil {
+			return nil, started, err
+		}
+		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+			resp.Body.Close()
+			e.mu.Lock()
+			a.Expiry = time.Time{}
+			e.mu.Unlock()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			return nil, started, apiHTTPError(resp)
+		}
+
+		full.Reset()
+		toolCalls = nil
+		reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+		for {
+			line, readErr := reader.ReadBytes('\n')
+			if payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:")); ok {
+				var ev codexChatEvent
+				if json.Unmarshal(payload, &ev) == nil {
+					switch ev.Type {
+					case "response.output_text.delta":
+						if ev.Delta != "" {
+							full.WriteString(ev.Delta)
+							started = true
+							if onDelta != nil {
+								onDelta(ChatDelta{Content: ev.Delta})
+							}
+						}
+					case "response.output_item.done":
+						if ev.Item != nil && ev.Item.Type == "function_call" {
+							args := ev.Item.Arguments
+							if args == "" {
+								args = "{}"
+							}
+							tc := ToolCall{ID: ev.Item.CallID, Type: "function", Name: ev.Item.Name, Arguments: args}
+							if tc.ID == "" {
+								tc.ID = newID("call_")
+							}
+							toolCalls = append(toolCalls, tc)
+							started = true
+							if onDelta != nil {
+								onDelta(ChatDelta{ToolCalls: []ToolCall{tc}})
+							}
+						}
+					case "response.completed", "response.done":
+						if ev.Response != nil && ev.Response.Usage != nil {
+							u := ev.Response.Usage
+							usage = Usage{
+								InputTokens:     u.InputTokens,
+								OutputTokens:    u.OutputTokens,
+								ThinkingTokens:  u.OutputTokensDetails.ReasoningTokens,
+								CacheReadTokens: u.InputTokensDetails.CachedTokens,
+								TotalTokens:     u.TotalTokens,
+							}
+						}
+					case "response.failed", "error":
+						msg := ev.Message
+						if ev.Error != nil && ev.Error.Message != "" {
+							msg = ev.Error.Message
+						} else if ev.Response != nil && ev.Response.Error != nil {
+							msg = ev.Response.Error.Message
+						}
+						resp.Body.Close()
+						return nil, started, fmt.Errorf("codex: %s", msg)
+					}
+				}
+			}
+			if readErr != nil {
+				break
+			}
+		}
+		resp.Body.Close()
+		if ctx.Err() != nil {
+			return nil, started, ctx.Err()
+		}
+		finish := "stop"
+		if len(toolCalls) > 0 {
+			finish = "tool_calls"
+		}
+		return &ChatResult{Content: full.String(), ToolCalls: toolCalls, Usage: usage, FinishReason: finish}, started, nil
+	}
 }
 
 type codexEvent struct {
