@@ -59,11 +59,21 @@ func (f *fakeBackend) HasModel(_ context.Context, id string) bool {
 }
 func (f *fakeBackend) Complete(_ context.Context, model, _ string) (*Result, error) {
 	f.lastModel = model
-	return &Result{Status: "SUCCESS"}, nil
+	return &Result{Status: "SUCCESS", Response: "hello"}, nil
 }
-func (f *fakeBackend) Stream(_ context.Context, model, _ string, _ func(string)) (*Result, error) {
+func (f *fakeBackend) Stream(_ context.Context, model, _ string, onDelta func(string)) (*Result, error) {
 	f.lastModel = model
-	return &Result{Status: "SUCCESS"}, nil
+	if onDelta != nil {
+		onDelta("hello")
+	}
+	return &Result{Status: "SUCCESS", Response: "hello"}, nil
+}
+func (f *fakeBackend) Chat(_ context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
+	f.lastModel = req.Model
+	if onDelta != nil {
+		onDelta(ChatDelta{Content: "x"})
+	}
+	return &ChatResult{Content: "ok", FinishReason: "stop"}, nil
 }
 func (f *fakeBackend) Default() string { return f.def }
 

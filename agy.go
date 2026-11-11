@@ -129,6 +129,10 @@ func (b *Backend) Stream(ctx context.Context, model, prompt string, onDelta func
 	return b.run(ctx, model, prompt, true, onDelta)
 }
 
+func (b *Backend) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
+	return chatViaText(ctx, b, req, onDelta)
+}
+
 func (b *Backend) run(ctx context.Context, model, prompt string, stream bool, onDelta func(string)) (*Result, error) {
 	if len(prompt) > maxPromptBytes {
 		return nil, fmt.Errorf("prompt too long: %d bytes (limit %d)", len(prompt), maxPromptBytes)

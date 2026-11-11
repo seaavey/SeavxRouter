@@ -377,6 +377,10 @@ func (e *CodexEngine) Stream(ctx context.Context, model, prompt string, onDelta 
 	return e.generate(ctx, model, prompt, onDelta)
 }
 
+func (e *CodexEngine) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
+	return chatViaText(ctx, e, req, onDelta)
+}
+
 type codexEvent struct {
 	Type     string `json:"type"`
 	Delta    string `json:"delta"`

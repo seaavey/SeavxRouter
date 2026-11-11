@@ -22,6 +22,7 @@ type BackendAPI interface {
 	HasModel(context.Context, string) bool
 	Complete(context.Context, string, string) (*Result, error)
 	Stream(context.Context, string, string, func(string)) (*Result, error)
+	Chat(context.Context, *ChatRequest, func(ChatDelta)) (*ChatResult, error)
 	Default() string
 }
 

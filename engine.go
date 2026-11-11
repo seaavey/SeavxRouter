@@ -580,6 +580,10 @@ func (e *Engine) Stream(ctx context.Context, model, prompt string, onDelta func(
 	return e.generate(ctx, model, prompt, onDelta)
 }
 
+func (e *Engine) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
+	return chatViaText(ctx, e, req, onDelta)
+}
+
 type genChunk struct {
 	Response struct {
 		Candidates []struct {

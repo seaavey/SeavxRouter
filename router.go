@@ -142,3 +142,17 @@ func (m *MultiBackend) Stream(ctx context.Context, model, prompt string, onDelta
 	}
 	return b.Stream(ctx, id, prompt, onDelta)
 }
+
+func (m *MultiBackend) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
+	model := req.Model
+	if model == "" {
+		model = m.Default()
+	}
+	b, id, err := m.resolve(ctx, model)
+	if err != nil {
+		return nil, err
+	}
+	r := *req
+	r.Model = id
+	return b.Chat(ctx, &r, onDelta)
+}
