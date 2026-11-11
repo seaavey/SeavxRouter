@@ -581,7 +581,326 @@ func (e *Engine) Stream(ctx context.Context, model, prompt string, onDelta func(
 }
 
 func (e *Engine) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
-	return chatViaText(ctx, e, req, onDelta)
+	model := req.Model
+	if model == "" {
+		model = e.DefaultModel
+	}
+	if model == "" {
+		models, err := e.Models(ctx)
+		if err != nil {
+			return nil, err
+		}
+		model = models[0].ID
+	}
+
+	var sb [8]byte
+	rand.Read(sb[:])
+	sessionID := fmt.Sprintf("-%d", int64(binary.BigEndian.Uint64(sb[:])&0x7FFFFFFFFFFFFFFF))
+	usedClaude := strings.Contains(strings.ToLower(model), "claude")
+	inner := map[string]any{
+		"contents":  chatContents(req.Messages),
+		"sessionId": sessionID,
+		"labels": map[string]string{
+			"last_step_index":          "1",
+			"model_enum":               model,
+			"trajectory_id":            sessionID,
+			"used_claude":              fmt.Sprint(usedClaude),
+			"used_claude_conservative": fmt.Sprint(usedClaude),
+		},
+		"toolConfig": map[string]any{
+			"functionCallingConfig": map[string]string{"mode": "VALIDATED"},
+		},
+	}
+	if tools := chatTools(req.Tools); tools != nil {
+		inner["tools"] = tools
+	}
+	if req.Temperature != nil || req.MaxTokens != nil {
+		gc := map[string]any{}
+		if req.Temperature != nil {
+			gc["temperature"] = *req.Temperature
+		}
+		if req.MaxTokens != nil {
+			gc["maxOutputTokens"] = *req.MaxTokens
+		}
+		inner["generationConfig"] = gc
+	}
+
+	var lastErr error
+	for i, n := 0, e.count(); i < n; i++ {
+		a := e.pick()
+		payload := map[string]any{
+			"project":     a.ProjectID,
+			"requestId":   fmt.Sprintf("agent/%s/%d/%s/1", uuid4(), time.Now().UnixMilli(), uuid4()),
+			"model":       model,
+			"requestType": "agent",
+			"request":     inner,
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		result, started, err := e.chatStreamOnce(ctx, a, data, onDelta)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if started || !isQuotaError(err) || ctx.Err() != nil {
+			return nil, err
+		}
+		slog.Warn("account quota exhausted, trying next", "email", a.Email)
+	}
+	return nil, lastErr
+}
+
+// chatContents converts unified chat messages into Antigravity/Gemini contents.
+func chatContents(msgs []ChatMessage) []map[string]any {
+	contents := make([]map[string]any, 0, len(msgs))
+	for _, m := range msgs {
+		switch m.Role {
+		case "assistant":
+			if len(m.ToolCalls) > 0 {
+				parts := make([]map[string]any, 0, len(m.ToolCalls))
+				for _, tc := range m.ToolCalls {
+					var args any = map[string]any{}
+					if tc.Arguments != "" {
+						var parsed any
+						if json.Unmarshal([]byte(tc.Arguments), &parsed) == nil {
+							args = parsed
+						}
+					}
+					fc := map[string]any{"name": tc.Name, "args": args}
+					if tc.ID != "" {
+						fc["id"] = tc.ID
+					}
+					parts = append(parts, map[string]any{"functionCall": fc})
+				}
+				contents = append(contents, map[string]any{"role": "model", "parts": parts})
+			} else {
+				contents = append(contents, map[string]any{"role": "model", "parts": []map[string]any{{"text": m.Content}}})
+			}
+		case "tool":
+			contents = append(contents, map[string]any{
+				"role": "function",
+				"parts": []map[string]any{{"functionResponse": map[string]any{
+					"name":     m.Name,
+					"response": map[string]any{"output": m.Content},
+				}}},
+			})
+		default:
+			// user, system, developer: carry the text as a user turn so no
+			// instruction is dropped.
+			contents = append(contents, map[string]any{"role": "user", "parts": []map[string]any{{"text": m.Content}}})
+		}
+	}
+	return contents
+}
+
+// chatTools converts unified tool definitions into Gemini functionDeclarations.
+func chatTools(tools []ToolDefinition) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	decls := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		d := map[string]any{"name": t.Name}
+		if t.Description != "" {
+			d["description"] = t.Description
+		}
+		if t.Parameters != nil {
+			d["parameters"] = uppercaseSchemaTypes(t.Parameters)
+		}
+		decls = append(decls, d)
+	}
+	return []map[string]any{{"functionDeclarations": decls}}
+}
+
+// uppercaseSchemaTypes uppercases JSON Schema "type" values (object -> OBJECT)
+// recursively through properties and items, matching Gemini's Schema format.
+func uppercaseSchemaTypes(schema map[string]any) map[string]any {
+	out := make(map[string]any, len(schema))
+	for k, v := range schema {
+		switch k {
+		case "type":
+			if s, ok := v.(string); ok {
+				out[k] = strings.ToUpper(s)
+			} else {
+				out[k] = v
+			}
+		case "properties":
+			if props, ok := v.(map[string]any); ok {
+				np := make(map[string]any, len(props))
+				for pk, pv := range props {
+					if pm, ok := pv.(map[string]any); ok {
+						np[pk] = uppercaseSchemaTypes(pm)
+					} else {
+						np[pk] = pv
+					}
+				}
+				out[k] = np
+			} else {
+				out[k] = v
+			}
+		case "items":
+			if im, ok := v.(map[string]any); ok {
+				out[k] = uppercaseSchemaTypes(im)
+			} else {
+				out[k] = v
+			}
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func mapFinishReason(reason string, hasToolCalls bool) string {
+	if hasToolCalls {
+		return "tool_calls"
+	}
+	switch reason {
+	case "STOP", "":
+		return "stop"
+	case "MAX_TOKENS":
+		return "length"
+	default:
+		return strings.ToLower(reason)
+	}
+}
+
+type chatChunk struct {
+	Response struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text         string `json:"text"`
+					Thought      bool   `json:"thought"`
+					FunctionCall *struct {
+						Name string          `json:"name"`
+						Args json.RawMessage `json:"args"`
+						ID   string          `json:"id"`
+					} `json:"functionCall"`
+				} `json:"parts"`
+			} `json:"content"`
+			FinishReason string `json:"finishReason"`
+		} `json:"candidates"`
+		UsageMetadata *struct {
+			PromptTokenCount        int `json:"promptTokenCount"`
+			CandidatesTokenCount    int `json:"candidatesTokenCount"`
+			TotalTokenCount         int `json:"totalTokenCount"`
+			ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+			CachedContentTokenCount int `json:"cachedContentTokenCount"`
+		} `json:"usageMetadata"`
+	} `json:"response"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// chatStreamOnce streams one structured chat request with one account, parsing
+// both text and functionCall parts. started reports whether any output was
+// already delivered (which makes retrying unsafe).
+func (e *Engine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, onDelta func(ChatDelta)) (*ChatResult, bool, error) {
+	var full strings.Builder
+	var toolCalls []ToolCall
+	var usage Usage
+	finishReason := ""
+	started := false
+	for attempt := 0; ; attempt++ {
+		token, err := e.token(ctx, a)
+		if err != nil {
+			return nil, started, err
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", e.BaseURL+"/v1internal:streamGenerateContent?alt=sse", bytes.NewReader(data))
+		if err != nil {
+			return nil, started, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", agyUserAgent)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("requestId", "req-"+uuid4())
+		req.Header.Set("requestType", "agent")
+		resp, err := e.HTTP.Do(req)
+		if err != nil {
+			return nil, started, err
+		}
+		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+			resp.Body.Close()
+			e.invalidate(a)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			return nil, started, apiHTTPError(resp)
+		}
+
+		full.Reset()
+		toolCalls = nil
+		reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+		for {
+			line, readErr := reader.ReadBytes('\n')
+			if payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:")); ok {
+				var chunk chatChunk
+				if json.Unmarshal(payload, &chunk) == nil {
+					if chunk.Error != nil {
+						resp.Body.Close()
+						return nil, started, fmt.Errorf("upstream: %s", chunk.Error.Message)
+					}
+					for _, cand := range chunk.Response.Candidates {
+						for _, part := range cand.Content.Parts {
+							if part.Text != "" && !part.Thought {
+								full.WriteString(part.Text)
+								started = true
+								if onDelta != nil {
+									onDelta(ChatDelta{Content: part.Text})
+								}
+							}
+							if part.FunctionCall != nil {
+								args := "{}"
+								if len(part.FunctionCall.Args) > 0 {
+									args = string(part.FunctionCall.Args)
+								}
+								tc := ToolCall{ID: part.FunctionCall.ID, Type: "function", Name: part.FunctionCall.Name, Arguments: args}
+								if tc.ID == "" {
+									tc.ID = newID("call_")
+								}
+								toolCalls = append(toolCalls, tc)
+								started = true
+								if onDelta != nil {
+									onDelta(ChatDelta{ToolCalls: []ToolCall{tc}})
+								}
+							}
+						}
+						if cand.FinishReason != "" {
+							finishReason = cand.FinishReason
+						}
+					}
+					if u := chunk.Response.UsageMetadata; u != nil {
+						usage = Usage{
+							InputTokens:     u.PromptTokenCount,
+							OutputTokens:    u.CandidatesTokenCount,
+							ThinkingTokens:  u.ThoughtsTokenCount,
+							CacheReadTokens: u.CachedContentTokenCount,
+							TotalTokens:     u.TotalTokenCount,
+						}
+					}
+				}
+			}
+			if readErr != nil {
+				break
+			}
+		}
+		resp.Body.Close()
+		if ctx.Err() != nil {
+			return nil, started, ctx.Err()
+		}
+		return &ChatResult{
+			Content:      full.String(),
+			ToolCalls:    toolCalls,
+			Usage:        usage,
+			FinishReason: mapFinishReason(finishReason, len(toolCalls) > 0),
+		}, started, nil
+	}
 }
 
 type genChunk struct {
@@ -596,10 +915,11 @@ type genChunk struct {
 			FinishReason string `json:"finishReason"`
 		} `json:"candidates"`
 		UsageMetadata *struct {
-			PromptTokenCount     int `json:"promptTokenCount"`
-			CandidatesTokenCount int `json:"candidatesTokenCount"`
-			TotalTokenCount      int `json:"totalTokenCount"`
-			ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
+			PromptTokenCount        int `json:"promptTokenCount"`
+			CandidatesTokenCount    int `json:"candidatesTokenCount"`
+			TotalTokenCount         int `json:"totalTokenCount"`
+			ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+			CachedContentTokenCount int `json:"cachedContentTokenCount"`
 		} `json:"usageMetadata"`
 	} `json:"response"`
 	Error *struct {
@@ -725,10 +1045,11 @@ func (e *Engine) streamOnce(ctx context.Context, a *Auth, data []byte, onDelta f
 					}
 					if u := chunk.Response.UsageMetadata; u != nil {
 						usage = Usage{
-							InputTokens:    u.PromptTokenCount,
-							OutputTokens:   u.CandidatesTokenCount,
-							ThinkingTokens: u.ThoughtsTokenCount,
-							TotalTokens:    u.TotalTokenCount,
+							InputTokens:     u.PromptTokenCount,
+							OutputTokens:    u.CandidatesTokenCount,
+							ThinkingTokens:  u.ThoughtsTokenCount,
+							CacheReadTokens: u.CachedContentTokenCount,
+							TotalTokens:     u.TotalTokenCount,
 						}
 					}
 				}
