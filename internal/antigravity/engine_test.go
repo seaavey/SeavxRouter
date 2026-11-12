@@ -1,4 +1,4 @@
-package main
+package antigravity
 
 import (
 	"bytes"
@@ -7,113 +7,25 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
+
+	"seavxrouter/internal/auth"
+	"seavxrouter/internal/backend"
 )
-
-func TestStripJSONC(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"plain", `{"a":1}`, `{"a":1}`},
-		{"line comment", "// header\n{\"a\":1}\n// tail", "{\"a\":1}\n"},
-		{"block comment", "/* hi */{\"a\":1}", "{\"a\":1}"},
-		{"slashes in string", `{"url":"https://x.dev/a//b"}`, `{"url":"https://x.dev/a//b"}`},
-		{"escaped quote", `{"s":"a\"//b"}`, `{"s":"a\"//b"}`},
-		{"trailing comment", "{\"a\":1} // note", "{\"a\":1} "},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := string(stripJSONC([]byte(tc.in)))
-			if got != tc.want {
-				t.Fatalf("got %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestAuthRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	store := AuthStore{Path: dir + "/auth.jsonc"}
-	in := []*Auth{
-		{AccessToken: "at1", RefreshToken: "1//rt1", ProjectID: "proj1", Tier: "pro", Email: "a@x.dev"},
-		{AccessToken: "at2", RefreshToken: "1//rt2", ProjectID: "proj2", Email: "b@x.dev"},
-	}
-	if err := store.Save(in); err != nil {
-		t.Fatal(err)
-	}
-	out, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out) != 2 || out[0].RefreshToken != "1//rt1" || out[1].ProjectID != "proj2" {
-		t.Fatalf("round trip mismatch: %+v", out)
-	}
-}
-
-func TestLoadLegacySingleObject(t *testing.T) {
-	dir := t.TempDir()
-	store := AuthStore{Path: dir + "/auth.jsonc"}
-	legacy := "// legacy\n{\"access_token\":\"at\",\"refresh_token\":\"1//rt\",\"project_id\":\"p\"}\n"
-	if err := os.WriteFile(store.Path, []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	out, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out) != 1 || out[0].RefreshToken != "1//rt" {
-		t.Fatalf("legacy load mismatch: %+v", out)
-	}
-}
-
-func TestSaveRotatedRefreshToken(t *testing.T) {
-	dir := t.TempDir()
-	store := AuthStore{Path: dir + "/auth.jsonc"}
-	agy := []*Auth{
-		{Provider: "antigravity", RefreshToken: "1//a", Email: "a@x.dev"},
-		{Provider: "antigravity", RefreshToken: "1//b", Email: "b@x.dev"},
-	}
-	codex := []*Auth{{Provider: "codex", RefreshToken: "rt-c", Email: "c@x.dev"}}
-	if err := store.Save(agy); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(codex); err != nil {
-		t.Fatal(err)
-	}
-	// codex refreshes its token and saves only its own subset
-	codex[0].RefreshToken = "rt-c2"
-	if err := store.Save(codex); err != nil {
-		t.Fatal(err)
-	}
-	out, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out) != 3 {
-		t.Fatalf("expected 3 accounts, got %d: %+v", len(out), out)
-	}
-	counts := map[string]int{}
-	for _, a := range out {
-		counts[a.Provider]++
-	}
-	if counts["antigravity"] != 2 || counts["codex"] != 1 {
-		t.Fatalf("provider counts wrong: %v", counts)
-	}
-}
 
 func TestEngineConversions(t *testing.T) {
 	t.Run("contents", func(t *testing.T) {
-		msgs := []ChatMessage{
+		msgs := []backend.ChatMessage{
 			{Role: "user", Content: "hi"},
 			{Role: "assistant", Content: "thinking"},
-			{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
+			{Role: "assistant", ToolCalls: []backend.ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
 			{Role: "tool", Name: "f", ToolCallID: "call_1", Content: "result"},
 		}
-		got := chatContents(msgs, nil)
+		got, err := chatContents(msgs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(got) != 4 {
 			t.Fatalf("contents len = %d, want 4", len(got))
 		}
@@ -141,10 +53,13 @@ func TestEngineConversions(t *testing.T) {
 		if fr["name"] != "f" || fr["response"].(map[string]any)["output"] != "result" {
 			t.Fatalf("functionResponse = %v", fr)
 		}
+		if fr["id"] != "call_1" {
+			t.Fatalf("functionResponse id = %v, want call_1", fr["id"])
+		}
 	})
 	t.Run("thought signature", func(t *testing.T) {
-		msgs := []ChatMessage{
-			{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
+		msgs := []backend.ChatMessage{
+			{Role: "assistant", ToolCalls: []backend.ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
 		}
 		sig := func(id string) string {
 			if id == "call_1" {
@@ -152,7 +67,10 @@ func TestEngineConversions(t *testing.T) {
 			}
 			return ""
 		}
-		got := chatContents(msgs, sig)
+		got, err := chatContents(msgs, sig)
+		if err != nil {
+			t.Fatal(err)
+		}
 		part := got[0]["parts"].([]map[string]any)[0]
 		if part["thoughtSignature"] != "SIGBASE64" {
 			t.Fatalf("thoughtSignature not attached at part level: %v", part)
@@ -161,17 +79,23 @@ func TestEngineConversions(t *testing.T) {
 		if _, ok := fc["thoughtSignature"]; ok {
 			t.Fatalf("thoughtSignature must not be nested in functionCall: %v", fc)
 		}
-		gotNone := chatContents(msgs, func(string) string { return "" })
+		gotNone, err := chatContents(msgs, func(string) string { return "" })
+		if err != nil {
+			t.Fatal(err)
+		}
 		partNone := gotNone[0]["parts"].([]map[string]any)[0]
 		if _, ok := partNone["thoughtSignature"]; ok {
 			t.Fatalf("thoughtSignature should be absent when unavailable: %v", partNone)
 		}
 	})
 	t.Run("assistant text with tool calls", func(t *testing.T) {
-		msgs := []ChatMessage{
-			{Role: "assistant", Content: "Let me check.", ToolCalls: []ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
+		msgs := []backend.ChatMessage{
+			{Role: "assistant", Content: "Let me check.", ToolCalls: []backend.ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
 		}
-		got := chatContents(msgs, nil)
+		got, err := chatContents(msgs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		parts := got[0]["parts"].([]map[string]any)
 		if len(parts) != 2 {
 			t.Fatalf("parts len = %d, want 2 (text + functionCall): %v", len(parts), parts)
@@ -183,8 +107,28 @@ func TestEngineConversions(t *testing.T) {
 			t.Fatalf("functionCall missing: %v", parts[1])
 		}
 	})
+	t.Run("images", func(t *testing.T) {
+		msgs := []backend.ChatMessage{{Role: "user", Content: "what is this?", Images: []backend.ImagePart{{MIMEType: "image/png", Data: "aGVsbG8="}}}}
+		got, err := chatContents(msgs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts := got[0]["parts"].([]map[string]any)
+		if len(parts) != 2 {
+			t.Fatalf("parts len = %d, want 2 (text + inlineData): %v", len(parts), parts)
+		}
+		inline := parts[1]["inlineData"].(map[string]any)
+		if inline["mimeType"] != "image/png" || inline["data"] != "aGVsbG8=" {
+			t.Fatalf("inlineData = %v", inline)
+		}
+
+		remote := []backend.ChatMessage{{Role: "user", Images: []backend.ImagePart{{URL: "https://example.com/a.png"}}}}
+		if _, err := chatContents(remote, nil); err == nil {
+			t.Fatal("remote image URL should be rejected for the antigravity backend")
+		}
+	})
 	t.Run("tools", func(t *testing.T) {
-		tools := []ToolDefinition{{Name: "f", Description: "d", Parameters: map[string]any{
+		tools := []backend.ToolDefinition{{Name: "f", Description: "d", Parameters: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"x": map[string]any{"type": "string"}},
 		}}}
@@ -238,18 +182,18 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	e, err := NewEngine(AuthStore{}, srv.URL, []*Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour), ProjectID: "p"}})
+	e, err := NewEngine(auth.AuthStore{}, srv.URL, []*auth.Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour), ProjectID: "p"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var deltas []ChatDelta
-	req := &ChatRequest{
+	var deltas []backend.ChatDelta
+	req := &backend.ChatRequest{
 		Model:    "gemini-3.8-flash-high",
-		Messages: []ChatMessage{{Role: "user", Content: "weather?"}},
-		Tools:    []ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
+		Messages: []backend.ChatMessage{{Role: "user", Content: "weather?"}},
+		Tools:    []backend.ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
 		Stream:   true,
 	}
-	res, err := e.Chat(context.Background(), req, func(d ChatDelta) { deltas = append(deltas, d) })
+	res, err := e.Chat(context.Background(), req, func(d backend.ChatDelta) { deltas = append(deltas, d) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,14 +232,14 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 		t.Fatalf("thoughtSignature not captured: %q", e.lookupSig("call_abc"))
 	}
 
-	roundTrip := &ChatRequest{
+	roundTrip := &backend.ChatRequest{
 		Model: "gemini-3.8-flash-high",
-		Messages: []ChatMessage{
+		Messages: []backend.ChatMessage{
 			{Role: "user", Content: "weather?"},
-			{Role: "assistant", ToolCalls: []ToolCall{tc}},
+			{Role: "assistant", ToolCalls: []backend.ToolCall{tc}},
 			{Role: "tool", Name: "get_weather", ToolCallID: "call_abc", Content: "sunny"},
 		},
-		Tools:  []ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
+		Tools:  []backend.ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
 		Stream: true,
 	}
 	if _, err := e.Chat(context.Background(), roundTrip, nil); err != nil {

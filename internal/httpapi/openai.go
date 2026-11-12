@@ -1,8 +1,7 @@
-package main
+package httpapi
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,13 +9,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
-)
 
-func newID(prefix string) string {
-	var b [12]byte
-	rand.Read(b[:])
-	return prefix + hex.EncodeToString(b[:])
-}
+	"seavxrouter/internal/backend"
+)
 
 type apiError struct {
 	status int
@@ -51,31 +46,79 @@ type textMessage struct {
 	Text string
 }
 
-func parseContent(raw json.RawMessage) (string, error) {
+func parseContent(raw json.RawMessage) (string, []backend.ImagePart, error) {
 	if len(raw) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
+		return s, nil, nil
 	}
 	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type     string          `json:"type"`
+		Text     string          `json:"text"`
+		ImageURL json.RawMessage `json:"image_url"`
 	}
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return "", &apiError{http.StatusBadRequest, "content must be a string or an array of text parts", "invalid_request_error", "invalid_content"}
+		return "", nil, &apiError{http.StatusBadRequest, "content must be a string or an array of content parts", "invalid_request_error", "invalid_content"}
 	}
 	var b strings.Builder
+	var images []backend.ImagePart
 	for _, p := range parts {
 		switch p.Type {
 		case "text", "input_text", "output_text":
 			b.WriteString(p.Text)
+		case "image_url", "input_image":
+			img, err := parseImageField(p.ImageURL)
+			if err != nil {
+				return "", nil, err
+			}
+			images = append(images, img)
 		default:
-			return "", &apiError{http.StatusBadRequest, "unsupported content part type: " + p.Type + " (only text is supported)", "invalid_request_error", "unsupported_content"}
+			return "", nil, &apiError{http.StatusBadRequest, "unsupported content part type: " + p.Type + " (only text and images are supported)", "invalid_request_error", "unsupported_content"}
 		}
 	}
-	return b.String(), nil
+	return b.String(), images, nil
+}
+
+// parseImageField accepts both wire forms: an object {"url": ...} from Chat
+// Completions and a bare URL string from Responses input_image parts.
+func parseImageField(raw json.RawMessage) (backend.ImagePart, error) {
+	if len(raw) == 0 {
+		return backend.ImagePart{}, &apiError{http.StatusBadRequest, "image part is missing image_url", "invalid_request_error", "invalid_content"}
+	}
+	var u string
+	if json.Unmarshal(raw, &u) == nil {
+		return parseImageURL(u)
+	}
+	var obj struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil || obj.URL == "" {
+		return backend.ImagePart{}, &apiError{http.StatusBadRequest, "image_url must be a URL string or an object with url", "invalid_request_error", "invalid_content"}
+	}
+	return parseImageURL(obj.URL)
+}
+
+func parseImageURL(u string) (backend.ImagePart, error) {
+	if u == "" {
+		return backend.ImagePart{}, &apiError{http.StatusBadRequest, "image URL is empty", "invalid_request_error", "invalid_content"}
+	}
+	if data, ok := strings.CutPrefix(u, "data:"); ok {
+		meta, payload, found := strings.Cut(data, ",")
+		if !found || !strings.HasSuffix(meta, ";base64") || payload == "" {
+			return backend.ImagePart{}, &apiError{http.StatusBadRequest, "image data URLs must look like data:<mime>;base64,<data>", "invalid_request_error", "invalid_content"}
+		}
+		mime := strings.TrimSuffix(meta, ";base64")
+		if !strings.HasPrefix(mime, "image/") {
+			return backend.ImagePart{}, &apiError{http.StatusBadRequest, "unsupported image media type: " + mime, "invalid_request_error", "unsupported_content"}
+		}
+		return backend.ImagePart{MIMEType: mime, Data: payload}, nil
+	}
+	if strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://") {
+		return backend.ImagePart{URL: u}, nil
+	}
+	return backend.ImagePart{}, &apiError{http.StatusBadRequest, "image URL must be a data: URI or an http(s) URL", "invalid_request_error", "invalid_content"}
 }
 
 func buildPrompt(instructions string, msgs []textMessage) string {
@@ -121,7 +164,7 @@ type openAIUsage struct {
 	} `json:"completion_tokens_details"`
 }
 
-func mapUsage(u Usage) openAIUsage {
+func mapUsage(u backend.Usage) openAIUsage {
 	ou := openAIUsage{
 		PromptTokens:     u.InputTokens,
 		CompletionTokens: u.OutputTokens,
@@ -146,6 +189,21 @@ func (s *Server) resolveModel(w http.ResponseWriter, r *http.Request, requested 
 
 // --- GET /v1/models ---
 
+type providerNamer interface {
+	Provider(context.Context, string) string
+}
+
+// ownerOf reports which provider serves a model ID, including provider-prefixed
+// IDs; bare IDs default to antigravity.
+func (s *Server) ownerOf(ctx context.Context, id string) string {
+	if pn, ok := s.backend.(providerNamer); ok {
+		if name := pn.Provider(ctx, id); name != "" {
+			return name
+		}
+	}
+	return "antigravity"
+}
+
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	models, err := s.backend.Models(r.Context())
 	if err != nil {
@@ -156,10 +214,21 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
 		data = append(data, map[string]any{
-			"id": m.ID, "object": "model", "created": now, "owned_by": "antigravity",
+			"id": m.ID, "object": "model", "created": now, "owned_by": s.ownerOf(r.Context(), m.ID),
 		})
 	}
 	writeJSON(w, map[string]any{"object": "list", "data": data})
+}
+
+func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.backend.HasModel(r.Context(), id) {
+		writeError(w, &apiError{http.StatusNotFound, "model not found: " + id, "invalid_request_error", "model_not_found"})
+		return
+	}
+	writeJSON(w, map[string]any{
+		"id": id, "object": "model", "created": time.Now().Unix(), "owned_by": s.ownerOf(r.Context(), id),
+	})
 }
 
 // --- POST /v1/chat/completions ---
@@ -196,26 +265,35 @@ type chatRequest struct {
 	Stream      bool         `json:"stream"`
 	Temperature *float64     `json:"temperature"`
 	MaxTokens   *int         `json:"max_tokens"`
+
+	MaxCompletionTokens *int `json:"max_completion_tokens"`
+	StreamOptions       *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
 }
 
-// buildChatRequest converts an OpenAI chat request into the unified ChatRequest.
-func buildChatRequest(req chatRequest, model string) (*ChatRequest, error) {
-	cr := &ChatRequest{
+// buildChatRequest converts an OpenAI chat request into the unified backend.ChatRequest.
+func buildChatRequest(req chatRequest, model string) (*backend.ChatRequest, error) {
+	maxTokens := req.MaxTokens
+	if req.MaxCompletionTokens != nil {
+		maxTokens = req.MaxCompletionTokens
+	}
+	cr := &backend.ChatRequest{
 		Model:       model,
 		Stream:      req.Stream,
 		ToolChoice:  req.ToolChoice,
 		Temperature: req.Temperature,
-		MaxTokens:   req.MaxTokens,
+		MaxTokens:   maxTokens,
 	}
 	toolNames := map[string]string{}
 	for _, m := range req.Messages {
-		text, err := parseContent(m.Content)
+		text, images, err := parseContent(m.Content)
 		if err != nil {
 			return nil, err
 		}
-		cm := ChatMessage{Role: m.Role, Content: text, Name: m.Name, ToolCallID: m.ToolCallID}
+		cm := backend.ChatMessage{Role: m.Role, Content: text, Images: images, Name: m.Name, ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
-			cm.ToolCalls = append(cm.ToolCalls, ToolCall{ID: tc.ID, Type: tc.Type, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+			cm.ToolCalls = append(cm.ToolCalls, backend.ToolCall{ID: tc.ID, Type: tc.Type, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
 			toolNames[tc.ID] = tc.Function.Name
 		}
 		if cm.Role == "tool" && cm.Name == "" {
@@ -227,13 +305,13 @@ func buildChatRequest(req chatRequest, model string) (*ChatRequest, error) {
 		if t.Type != "" && t.Type != "function" {
 			continue
 		}
-		cr.Tools = append(cr.Tools, ToolDefinition{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters})
+		cr.Tools = append(cr.Tools, backend.ToolDefinition{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters})
 	}
 	return cr, nil
 }
 
 // openAIToolCalls renders unified tool calls in OpenAI wire form.
-func openAIToolCalls(calls []ToolCall) []map[string]any {
+func openAIToolCalls(calls []backend.ToolCall) []map[string]any {
 	out := make([]map[string]any, 0, len(calls))
 	for _, tc := range calls {
 		typ := tc.Type
@@ -269,7 +347,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	created := time.Now().Unix()
-	id := newID("chatcmpl-")
+	id := backend.NewID("chatcmpl-")
 
 	if !req.Stream {
 		result, err := s.backend.Chat(r.Context(), cr, nil)
@@ -277,14 +355,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
-		message := map[string]any{"role": "assistant", "content": strings.TrimRight(result.Content, "\n")}
+		s.recordUsage(r, "chat", model, result.Usage)
+		var content any = strings.TrimRight(result.Content, "\n")
 		finish := result.FinishReason
 		if finish == "" {
 			finish = "stop"
 		}
 		if len(result.ToolCalls) > 0 {
-			message["tool_calls"] = openAIToolCalls(result.ToolCalls)
+			if content == "" {
+				content = nil
+			}
 			finish = "tool_calls"
+		}
+		message := map[string]any{"role": "assistant", "content": content}
+		if len(result.ToolCalls) > 0 {
+			message["tool_calls"] = openAIToolCalls(result.ToolCalls)
 		}
 		writeJSON(w, map[string]any{
 			"id": id, "object": "chat.completion", "created": created, "model": model,
@@ -303,24 +388,31 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
-	chunk := func(delta map[string]any, finish any, usage any) {
+	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+	chunk := func(delta map[string]any, finish any) {
 		payload := map[string]any{
 			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}},
 		}
-		if usage != nil {
-			payload["usage"] = usage
+		data, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	usageChunk := func(u openAIUsage) {
+		payload := map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []any{}, "usage": u,
 		}
 		data, _ := json.Marshal(payload)
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	}
 
-	chunk(map[string]any{"role": "assistant"}, nil, nil)
+	chunk(map[string]any{"role": "assistant"}, nil)
 	toolIndex := 0
-	result, err := s.backend.Chat(r.Context(), cr, func(d ChatDelta) {
+	result, err := s.backend.Chat(r.Context(), cr, func(d backend.ChatDelta) {
 		if d.Content != "" {
-			chunk(map[string]any{"content": d.Content}, nil, nil)
+			chunk(map[string]any{"content": d.Content}, nil)
 		}
 		if len(d.ToolCalls) > 0 {
 			tcs := make([]map[string]any, 0, len(d.ToolCalls))
@@ -333,7 +425,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				})
 				toolIndex++
 			}
-			chunk(map[string]any{"tool_calls": tcs}, nil, nil)
+			chunk(map[string]any{"tool_calls": tcs}, nil)
 		}
 	})
 	if err != nil {
@@ -346,6 +438,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
+	s.recordUsage(r, "chat", model, result.Usage)
 	finish := result.FinishReason
 	if finish == "" {
 		finish = "stop"
@@ -353,7 +446,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if len(result.ToolCalls) > 0 {
 		finish = "tool_calls"
 	}
-	chunk(map[string]any{}, finish, mapUsage(result.Usage))
+	chunk(map[string]any{}, finish)
+	if includeUsage {
+		usageChunk(mapUsage(result.Usage))
+	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
@@ -367,13 +463,13 @@ type responsesRequest struct {
 	Stream       bool            `json:"stream"`
 }
 
-func parseResponsesInput(raw json.RawMessage) ([]textMessage, error) {
+func parseResponsesInput(raw json.RawMessage) ([]backend.ChatMessage, error) {
 	if len(raw) == 0 {
 		return nil, &apiError{http.StatusBadRequest, "input is required", "invalid_request_error", "missing_input"}
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return []textMessage{{Role: "user", Text: s}}, nil
+		return []backend.ChatMessage{{Role: "user", Content: s}}, nil
 	}
 	var items []struct {
 		Role    string          `json:"role"`
@@ -382,9 +478,9 @@ func parseResponsesInput(raw json.RawMessage) ([]textMessage, error) {
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, &apiError{http.StatusBadRequest, "input must be a string or an array of messages", "invalid_request_error", "invalid_input"}
 	}
-	msgs := make([]textMessage, 0, len(items))
+	msgs := make([]backend.ChatMessage, 0, len(items))
 	for _, it := range items {
-		text, err := parseContent(it.Content)
+		text, images, err := parseContent(it.Content)
 		if err != nil {
 			return nil, err
 		}
@@ -392,7 +488,7 @@ func parseResponsesInput(raw json.RawMessage) ([]textMessage, error) {
 		if role == "" {
 			role = "user"
 		}
-		msgs = append(msgs, textMessage{Role: role, Text: text})
+		msgs = append(msgs, backend.ChatMessage{Role: role, Content: text, Images: images})
 	}
 	return msgs, nil
 }
@@ -410,7 +506,7 @@ type responsesOutput struct {
 }
 
 func newResponsesOutput(text, status string) responsesOutput {
-	out := responsesOutput{ID: newID("msg_"), Type: "message", Status: status, Role: "assistant"}
+	out := responsesOutput{ID: backend.NewID("msg_"), Type: "message", Status: status, Role: "assistant"}
 	out.Content = append(out.Content, struct {
 		Type        string   `json:"type"`
 		Text        string   `json:"text"`
@@ -426,7 +522,7 @@ func responseObject(id, model, status string, output []responsesOutput, usage an
 	}
 }
 
-func responsesUsage(u Usage) map[string]any {
+func responsesUsage(u backend.Usage) map[string]any {
 	return map[string]any{
 		"input_tokens": u.InputTokens, "output_tokens": u.OutputTokens, "total_tokens": u.TotalTokens,
 		"output_tokens_details": map[string]any{"reasoning_tokens": u.ThinkingTokens},
@@ -448,16 +544,20 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	prompt := buildPrompt(req.Instructions, msgs)
-	id := newID("resp_")
+	if req.Instructions != "" {
+		msgs = append([]backend.ChatMessage{{Role: "system", Content: req.Instructions}}, msgs...)
+	}
+	cr := &backend.ChatRequest{Model: model, Messages: msgs, Stream: req.Stream}
+	id := backend.NewID("resp_")
 
 	if !req.Stream {
-		result, err := s.backend.Complete(r.Context(), model, prompt)
+		result, err := s.backend.Chat(r.Context(), cr, nil)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		text := strings.TrimRight(result.Response, "\n")
+		s.recordUsage(r, "responses", model, result.Usage)
+		text := strings.TrimRight(result.Content, "\n")
 		writeJSON(w, responseObject(id, model, "completed", []responsesOutput{newResponsesOutput(text, "completed")}, responsesUsage(result.Usage)))
 		return
 	}
@@ -484,15 +584,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	send("response.content_part.added", map[string]any{"item_id": item.ID, "output_index": 0, "content_index": 0, "part": item.Content[0]})
 
 	var full strings.Builder
-	result, err := s.backend.Stream(r.Context(), model, prompt, func(delta string) {
-		full.WriteString(delta)
-		send("response.output_text.delta", map[string]any{"item_id": item.ID, "output_index": 0, "content_index": 0, "delta": delta})
+	result, err := s.backend.Chat(r.Context(), cr, func(d backend.ChatDelta) {
+		if d.Content == "" {
+			return
+		}
+		full.WriteString(d.Content)
+		send("response.output_text.delta", map[string]any{"item_id": item.ID, "output_index": 0, "content_index": 0, "delta": d.Content})
 	})
 	if err != nil {
 		slog.Warn("responses stream failed", "err", err)
 		send("response.failed", map[string]any{"response": responseObject(id, model, "failed", []responsesOutput{}, nil)})
 		return
 	}
+	s.recordUsage(r, "responses", model, result.Usage)
 
 	text := strings.TrimRight(full.String(), "\n")
 	done := newResponsesOutput(text, "completed")

@@ -1,4 +1,4 @@
-package main
+package agy
 
 import (
 	"bufio"
@@ -13,42 +13,22 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"seavxrouter/internal/backend"
 )
 
-type Usage struct {
-	InputTokens     int `json:"input_tokens"`
-	OutputTokens    int `json:"output_tokens"`
-	ThinkingTokens  int `json:"thinking_tokens"`
-	CacheReadTokens int `json:"cache_read_tokens"`
-	TotalTokens     int `json:"total_tokens"`
-}
-
-type Result struct {
-	ConversationID string `json:"conversation_id"`
-	Status         string `json:"status"`
-	Response       string `json:"response"`
-	Error          string `json:"error"`
-	NumTurns       int    `json:"num_turns"`
-	Usage          Usage  `json:"usage"`
-}
-
 type StepUpdate struct {
-	StepIndex int    `json:"step_index"`
-	State     string `json:"state"`
-	StepType  string `json:"step_type"`
-	TextDelta string `json:"text_delta"`
-	Usage     *Usage `json:"usage"`
+	StepIndex int            `json:"step_index"`
+	State     string         `json:"state"`
+	StepType  string         `json:"step_type"`
+	TextDelta string         `json:"text_delta"`
+	Usage     *backend.Usage `json:"usage"`
 }
 
 type Event struct {
-	Event      string      `json:"event"`
-	StepUpdate *StepUpdate `json:"step_update"`
-	Result     *Result     `json:"result"`
-}
-
-type Model struct {
-	ID   string
-	Name string
+	Event      string          `json:"event"`
+	StepUpdate *StepUpdate     `json:"step_update"`
+	Result     *backend.Result `json:"result"`
 }
 
 type Backend struct {
@@ -58,7 +38,7 @@ type Backend struct {
 	DefaultModel string
 
 	mu         sync.Mutex
-	models     []Model
+	models     []backend.Model
 	modelsAt   time.Time
 	modelsFail error
 }
@@ -66,7 +46,7 @@ type Backend struct {
 // Linux caps a single argv string at 128 KiB (MAX_ARG_STRLEN).
 const maxPromptBytes = 120 * 1024
 
-func (b *Backend) Models(ctx context.Context) ([]Model, error) {
+func (b *Backend) Models(ctx context.Context) ([]backend.Model, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.models != nil && time.Since(b.modelsAt) < 5*time.Minute {
@@ -77,13 +57,13 @@ func (b *Backend) Models(ctx context.Context) ([]Model, error) {
 		b.modelsFail = err
 		return nil, fmt.Errorf("agy models: %w", err)
 	}
-	var models []Model
+	var models []backend.Model
 	for _, line := range strings.Split(string(out), "\n") {
 		id, name, ok := strings.Cut(line, "\t")
 		if !ok || id == "" || strings.ContainsAny(id, " \t") {
 			continue
 		}
-		models = append(models, Model{ID: id, Name: name})
+		models = append(models, backend.Model{ID: id, Name: name})
 	}
 	if len(models) == 0 {
 		b.modelsFail = fmt.Errorf("no models parsed from agy output")
@@ -120,20 +100,20 @@ func (b *Backend) command(ctx context.Context, dir *string, args ...string) *exe
 func (b *Backend) Default() string { return b.DefaultModel }
 
 // Complete runs one headless turn and returns the final result.
-func (b *Backend) Complete(ctx context.Context, model, prompt string) (*Result, error) {
+func (b *Backend) Complete(ctx context.Context, model, prompt string) (*backend.Result, error) {
 	return b.run(ctx, model, prompt, false, nil)
 }
 
 // Stream runs one headless turn, calling onDelta for each assistant text chunk.
-func (b *Backend) Stream(ctx context.Context, model, prompt string, onDelta func(string)) (*Result, error) {
+func (b *Backend) Stream(ctx context.Context, model, prompt string, onDelta func(string)) (*backend.Result, error) {
 	return b.run(ctx, model, prompt, true, onDelta)
 }
 
-func (b *Backend) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
-	return chatViaText(ctx, b, req, onDelta)
+func (b *Backend) Chat(ctx context.Context, req *backend.ChatRequest, onDelta func(backend.ChatDelta)) (*backend.ChatResult, error) {
+	return backend.ChatViaText(ctx, b, req, onDelta)
 }
 
-func (b *Backend) run(ctx context.Context, model, prompt string, stream bool, onDelta func(string)) (*Result, error) {
+func (b *Backend) run(ctx context.Context, model, prompt string, stream bool, onDelta func(string)) (*backend.Result, error) {
 	if len(prompt) > maxPromptBytes {
 		return nil, fmt.Errorf("prompt too long: %d bytes (limit %d)", len(prompt), maxPromptBytes)
 	}
@@ -172,7 +152,7 @@ func (b *Backend) run(ctx context.Context, model, prompt string, stream bool, on
 		return nil, err
 	}
 
-	var result *Result
+	var result *backend.Result
 	if stream {
 		reader := bufio.NewReaderSize(stdout, 1024*1024)
 		for {
@@ -199,7 +179,7 @@ func (b *Backend) run(ctx context.Context, model, prompt string, stream bool, on
 		if err != nil {
 			return nil, err
 		}
-		var r Result
+		var r backend.Result
 		if err := json.Unmarshal(data, &r); err != nil {
 			return nil, fmt.Errorf("bad agy json output: %w", err)
 		}

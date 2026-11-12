@@ -1,8 +1,10 @@
-package main
+package multi
 
 import (
 	"context"
 	"testing"
+
+	"seavxrouter/internal/backend"
 )
 
 func TestNormalizeModel(t *testing.T) {
@@ -46,10 +48,10 @@ type fakeBackend struct {
 	def       string
 }
 
-func (f *fakeBackend) Models(context.Context) ([]Model, error) {
-	out := make([]Model, 0, len(f.models))
+func (f *fakeBackend) Models(context.Context) ([]backend.Model, error) {
+	out := make([]backend.Model, 0, len(f.models))
 	for id := range f.models {
-		out = append(out, Model{ID: id, Name: id})
+		out = append(out, backend.Model{ID: id, Name: id})
 	}
 	return out, nil
 }
@@ -57,30 +59,30 @@ func (f *fakeBackend) HasModel(_ context.Context, id string) bool {
 	f.lastModel = id
 	return f.models[id]
 }
-func (f *fakeBackend) Complete(_ context.Context, model, _ string) (*Result, error) {
+func (f *fakeBackend) Complete(_ context.Context, model, _ string) (*backend.Result, error) {
 	f.lastModel = model
-	return &Result{Status: "SUCCESS", Response: "hello"}, nil
+	return &backend.Result{Status: "SUCCESS", Response: "hello"}, nil
 }
-func (f *fakeBackend) Stream(_ context.Context, model, _ string, onDelta func(string)) (*Result, error) {
+func (f *fakeBackend) Stream(_ context.Context, model, _ string, onDelta func(string)) (*backend.Result, error) {
 	f.lastModel = model
 	if onDelta != nil {
 		onDelta("hello")
 	}
-	return &Result{Status: "SUCCESS", Response: "hello"}, nil
+	return &backend.Result{Status: "SUCCESS", Response: "hello"}, nil
 }
-func (f *fakeBackend) Chat(_ context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
+func (f *fakeBackend) Chat(_ context.Context, req *backend.ChatRequest, onDelta func(backend.ChatDelta)) (*backend.ChatResult, error) {
 	f.lastModel = req.Model
 	if onDelta != nil {
-		onDelta(ChatDelta{Content: "x"})
+		onDelta(backend.ChatDelta{Content: "x"})
 	}
-	return &ChatResult{Content: "ok", FinishReason: "stop"}, nil
+	return &backend.ChatResult{Content: "ok", FinishReason: "stop"}, nil
 }
 func (f *fakeBackend) Default() string { return f.def }
 
 func TestMultiBackendResolveNormalizes(t *testing.T) {
 	ctx := context.Background()
 	agy := &fakeBackend{models: map[string]bool{"gemini-3.8-flash-high": true, "claude-sonnet-4-6": true}}
-	m := &MultiBackend{antigravity: agy}
+	m := &MultiBackend{Antigravity: agy}
 
 	if _, id, err := m.resolve(ctx, "gemini.3.8-flash"); err != nil || id != "gemini-3.8-flash-high" {
 		t.Fatalf("bare alias: id=%q err=%v, want gemini-3.8-flash-high", id, err)

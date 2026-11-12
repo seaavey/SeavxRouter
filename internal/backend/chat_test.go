@@ -1,4 +1,4 @@
-package main
+package backend
 
 import (
 	"context"
@@ -69,34 +69,29 @@ func TestChatRequestOmitEmpty(t *testing.T) {
 	}
 }
 
-func TestMultiBackendChatDelegates(t *testing.T) {
-	agy := &fakeBackend{models: map[string]bool{"gemini-3.8-flash-high": true}}
-	m := &MultiBackend{antigravity: agy}
-	var deltas []ChatDelta
-	req := &ChatRequest{Model: "gemini.3.8-flash", Messages: []ChatMessage{{Role: "user", Content: "hi"}}}
-	res, err := m.Chat(context.Background(), req, func(d ChatDelta) { deltas = append(deltas, d) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if agy.lastModel != "gemini-3.8-flash-high" {
-		t.Fatalf("backend got model %q, want normalized id", agy.lastModel)
-	}
-	if res == nil || res.Content != "ok" {
-		t.Fatalf("result not passed through: %+v", res)
-	}
-	if len(deltas) != 1 || deltas[0].Content != "x" {
-		t.Fatalf("onDelta not wired: %+v", deltas)
-	}
-	if req.Model != "gemini.3.8-flash" {
-		t.Fatalf("caller request was mutated: %q", req.Model)
-	}
+type textStub struct{}
+
+func (textStub) Models(context.Context) ([]Model, error) { return nil, nil }
+func (textStub) HasModel(context.Context, string) bool   { return true }
+func (textStub) Complete(context.Context, string, string) (*Result, error) {
+	return &Result{Status: "SUCCESS", Response: "hello"}, nil
 }
+func (textStub) Stream(_ context.Context, _ string, _ string, onDelta func(string)) (*Result, error) {
+	if onDelta != nil {
+		onDelta("hello")
+	}
+	return &Result{Status: "SUCCESS", Response: "hello"}, nil
+}
+func (textStub) Chat(context.Context, *ChatRequest, func(ChatDelta)) (*ChatResult, error) {
+	return nil, nil
+}
+func (textStub) Default() string { return "m" }
 
 func TestBackendChatPlainText(t *testing.T) {
-	f := &fakeBackend{}
+	f := textStub{}
 	req := &ChatRequest{Model: "m", Messages: []ChatMessage{{Role: "user", Content: "hi"}}}
 
-	res, err := chatViaText(context.Background(), f, req, nil)
+	res, err := ChatViaText(context.Background(), f, req, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +101,7 @@ func TestBackendChatPlainText(t *testing.T) {
 
 	var deltas []ChatDelta
 	sreq := &ChatRequest{Model: "m", Stream: true, Messages: []ChatMessage{{Role: "user", Content: "hi"}}}
-	res, err = chatViaText(context.Background(), f, sreq, func(d ChatDelta) { deltas = append(deltas, d) })
+	res, err = ChatViaText(context.Background(), f, sreq, func(d ChatDelta) { deltas = append(deltas, d) })
 	if err != nil {
 		t.Fatal(err)
 	}

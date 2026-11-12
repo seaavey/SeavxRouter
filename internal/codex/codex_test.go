@@ -1,24 +1,28 @@
-package main
+package codex
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"seavxrouter/internal/auth"
+	"seavxrouter/internal/backend"
 )
 
 func TestCodexChatConversions(t *testing.T) {
 	t.Run("input", func(t *testing.T) {
-		msgs := []ChatMessage{
+		msgs := []backend.ChatMessage{
 			{Role: "system", Content: "be helpful"},
 			{Role: "user", Content: "hi"},
 			{Role: "assistant", Content: "thinking"},
-			{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
+			{Role: "assistant", ToolCalls: []backend.ToolCall{{ID: "call_1", Type: "function", Name: "f", Arguments: `{"x":1}`}}},
 			{Role: "tool", Name: "f", ToolCallID: "call_1", Content: "result"},
 		}
 		instructions, input := codexChatInput(msgs)
@@ -50,7 +54,7 @@ func TestCodexChatConversions(t *testing.T) {
 		}
 	})
 	t.Run("tools", func(t *testing.T) {
-		tools := []ToolDefinition{{Name: "f", Description: "d", Parameters: map[string]any{"type": "object"}}}
+		tools := []backend.ToolDefinition{{Name: "f", Description: "d", Parameters: map[string]any{"type": "object"}}}
 		got := codexChatTools(tools)
 		if len(got) != 1 {
 			t.Fatalf("tools len = %d, want 1", len(got))
@@ -70,6 +74,23 @@ func TestCodexChatConversions(t *testing.T) {
 	})
 }
 
+func TestCodexChatImages(t *testing.T) {
+	_, input := codexChatInput([]backend.ChatMessage{{Role: "user", Content: "look", Images: []backend.ImagePart{{MIMEType: "image/png", Data: "aGVsbG8="}}}})
+	if len(input) != 1 {
+		t.Fatalf("input len = %d, want 1: %v", len(input), input)
+	}
+	content := input[0]["content"].([]map[string]any)
+	if len(content) != 2 {
+		t.Fatalf("content = %v", content)
+	}
+	if content[0]["type"] != "input_text" || content[0]["text"] != "look" {
+		t.Fatalf("text part = %v", content[0])
+	}
+	if content[1]["type"] != "input_image" || content[1]["image_url"] != "data:image/png;base64,aGVsbG8=" {
+		t.Fatalf("image part = %v", content[1])
+	}
+}
+
 func TestCodexChatStreamFunctionCall(t *testing.T) {
 	var upstreamBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,19 +105,19 @@ func TestCodexChatStreamFunctionCall(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	e, err := NewCodexEngine(AuthStore{}, []*Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}})
+	e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.BaseURL = srv.URL
-	var deltas []ChatDelta
-	req := &ChatRequest{
+	var deltas []backend.ChatDelta
+	req := &backend.ChatRequest{
 		Model:    "gpt-5-codex",
-		Messages: []ChatMessage{{Role: "user", Content: "weather?"}},
-		Tools:    []ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
+		Messages: []backend.ChatMessage{{Role: "user", Content: "weather?"}},
+		Tools:    []backend.ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
 		Stream:   true,
 	}
-	res, err := e.Chat(context.Background(), req, func(d ChatDelta) { deltas = append(deltas, d) })
+	res, err := e.Chat(context.Background(), req, func(d backend.ChatDelta) { deltas = append(deltas, d) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,19 +163,19 @@ func TestCodexChatRequestRoundTrip(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	e, err := NewCodexEngine(AuthStore{}, []*Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}})
+	e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.BaseURL = srv.URL
-	req := &ChatRequest{
+	req := &backend.ChatRequest{
 		Model: "gpt-5-codex",
-		Messages: []ChatMessage{
+		Messages: []backend.ChatMessage{
 			{Role: "user", Content: "weather?"},
-			{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_abc", Type: "function", Name: "get_weather", Arguments: `{"city":"SF"}`}}},
+			{Role: "assistant", ToolCalls: []backend.ToolCall{{ID: "call_abc", Type: "function", Name: "get_weather", Arguments: `{"city":"SF"}`}}},
 			{Role: "tool", Name: "get_weather", ToolCallID: "call_abc", Content: "sunny"},
 		},
-		Tools: []ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
+		Tools: []backend.ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}},
 	}
 	if _, err := e.Chat(context.Background(), req, nil); err != nil {
 		t.Fatal(err)
@@ -176,5 +197,23 @@ func TestCodexChatRequestRoundTrip(t *testing.T) {
 	}
 	if !sawCall || !sawOutput {
 		t.Fatalf("round-trip input missing function_call/output: %s", upstreamBody)
+	}
+}
+
+func TestCodexQuotaTracking(t *testing.T) {
+	a := &auth.Auth{Email: "c@example.com", AccountID: "acc-1"}
+	e := &CodexEngine{auths: []*auth.Auth{a}, DefaultModel: "gpt-5.6-luna"}
+
+	q := e.Quota()
+	if q.Provider != "codex" || len(q.Accounts) != 1 {
+		t.Fatalf("quota = %+v", q)
+	}
+	if q.Accounts[0].AccountID != "acc-1" || q.Accounts[0].Status != "ready" || q.Accounts[0].AccessTokenExpiresAt != nil {
+		t.Fatalf("account = %+v", q.Accounts[0])
+	}
+
+	e.trackQuota(a, errors.New("usage_limit reached"))
+	if q = e.Quota(); q.Accounts[0].Status != "limited" {
+		t.Fatalf("expected limited account, got %+v", q.Accounts[0])
 	}
 }

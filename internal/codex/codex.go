@@ -1,4 +1,4 @@
-package main
+package codex
 
 import (
 	"bufio"
@@ -13,11 +13,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"seavxrouter/internal/auth"
+	"seavxrouter/internal/backend"
 )
 
 const (
@@ -32,16 +34,19 @@ const (
 )
 
 type CodexEngine struct {
-	Store        AuthStore
+	Store        auth.AuthStore
 	HTTP         *http.Client
 	DefaultModel string
 	BaseURL      string
 
 	mu       sync.Mutex
-	auths    []*Auth
+	auths    []*auth.Auth
 	next     int
-	models   []Model
+	models   []backend.Model
 	modelsAt time.Time
+
+	quotaMu  sync.Mutex
+	quotaErr map[*auth.Auth]time.Time
 }
 
 func (e *CodexEngine) apiBase() string {
@@ -51,7 +56,7 @@ func (e *CodexEngine) apiBase() string {
 	return codexAPIBase
 }
 
-func NewCodexEngine(store AuthStore, auths []*Auth) (*CodexEngine, error) {
+func NewCodexEngine(store auth.AuthStore, auths []*auth.Auth) (*CodexEngine, error) {
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no codex accounts")
 	}
@@ -66,12 +71,30 @@ func (e *CodexEngine) count() int {
 	return len(e.auths)
 }
 
-func (e *CodexEngine) pick() *Auth {
+func (e *CodexEngine) pick() *auth.Auth {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	a := e.auths[e.next%len(e.auths)]
 	e.next++
 	return a
+}
+
+// trackQuota records the latest request outcome per account so /v1/quota can
+// report accounts that recently hit a provider quota or rate limit.
+func (e *CodexEngine) trackQuota(a *auth.Auth, err error) {
+	e.quotaMu.Lock()
+	defer e.quotaMu.Unlock()
+	if err == nil {
+		delete(e.quotaErr, a)
+		return
+	}
+	if !backend.IsQuotaError(err) {
+		return
+	}
+	if e.quotaErr == nil {
+		e.quotaErr = map[*auth.Auth]time.Time{}
+	}
+	e.quotaErr[a] = time.Now()
 }
 
 func pkceChallenge(verifier string) string {
@@ -88,7 +111,7 @@ func (e *CodexEngine) Login(ctx context.Context) error {
 	var vb [48]byte
 	rand.Read(vb[:])
 	verifier := base64.RawURLEncoding.EncodeToString(vb[:])
-	state := uuid4()
+	state := backend.UUID()
 
 	type callback struct {
 		code string
@@ -130,9 +153,7 @@ func (e *CodexEngine) Login(ctx context.Context) error {
 	}
 	authURL := codexAuthURL + "?" + params.Encode()
 	fmt.Println("Open this URL to sign in to OpenAI:\n\n" + authURL + "\n")
-	if open, err := exec.LookPath("xdg-open"); err == nil {
-		exec.Command(open, authURL).Start()
-	}
+	auth.OpenBrowser(authURL)
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -156,19 +177,19 @@ func (e *CodexEngine) Login(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	auth := &Auth{
+	acct := &auth.Auth{
 		Provider:     "codex",
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
 		Expiry:       time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second),
 	}
-	if auth.RefreshToken == "" {
+	if acct.RefreshToken == "" {
 		return fmt.Errorf("openai did not return a refresh_token")
 	}
-	auth.Email, auth.AccountID, auth.Tier = codexIDTokenClaims(tok.IDToken)
+	acct.Email, acct.AccountID, acct.Tier = codexIDTokenClaims(tok.IDToken)
 
 	existing, _ := e.Store.Load()
-	own := make([]*Auth, 0, len(existing)+1)
+	own := make([]*auth.Auth, 0, len(existing)+1)
 	for _, a := range existing {
 		if a.Provider == "codex" {
 			own = append(own, a)
@@ -176,14 +197,14 @@ func (e *CodexEngine) Login(ctx context.Context) error {
 	}
 	merged := false
 	for i, a := range own {
-		if auth.Email != "" && strings.EqualFold(a.Email, auth.Email) {
-			own[i] = auth
+		if acct.Email != "" && strings.EqualFold(a.Email, acct.Email) {
+			own[i] = acct
 			merged = true
 			break
 		}
 	}
 	if !merged {
-		own = append(own, auth)
+		own = append(own, acct)
 	}
 	e.mu.Lock()
 	e.auths = own
@@ -191,7 +212,7 @@ func (e *CodexEngine) Login(ctx context.Context) error {
 	if err := e.Store.Save(own); err != nil {
 		return err
 	}
-	fmt.Printf("Logged in as %s (plan: %s)\n%d account(s) stored in %s\n", auth.Email, auth.Tier, len(own), e.Store.Path)
+	fmt.Printf("Logged in as %s (plan: %s)\n%d account(s) stored in %s\n", acct.Email, acct.Tier, len(own), e.Store.Path)
 	return nil
 }
 
@@ -248,7 +269,7 @@ func (e *CodexEngine) tokenRequest(ctx context.Context, form url.Values) (*codex
 	return &tok, nil
 }
 
-func (e *CodexEngine) token(ctx context.Context, a *Auth) (string, error) {
+func (e *CodexEngine) token(ctx context.Context, a *auth.Auth) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if a.Expiry.After(time.Now().Add(3 * time.Minute)) {
@@ -277,12 +298,12 @@ func (e *CodexEngine) token(ctx context.Context, a *Auth) (string, error) {
 	return a.AccessToken, nil
 }
 
-func (e *CodexEngine) setHeaders(req *http.Request, token string, a *Auth, stream bool) {
+func (e *CodexEngine) setHeaders(req *http.Request, token string, a *auth.Auth, stream bool) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Originator", codexOriginator)
 	req.Header.Set("User-Agent", codexUserAgent)
-	req.Header.Set("Session-Id", uuid4())
+	req.Header.Set("Session-Id", backend.UUID())
 	if a.AccountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", a.AccountID)
 	}
@@ -293,7 +314,7 @@ func (e *CodexEngine) setHeaders(req *http.Request, token string, a *Auth, strea
 	}
 }
 
-func (e *CodexEngine) Models(ctx context.Context) ([]Model, error) {
+func (e *CodexEngine) Models(ctx context.Context) ([]backend.Model, error) {
 	e.mu.Lock()
 	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
 		defer e.mu.Unlock()
@@ -305,6 +326,7 @@ func (e *CodexEngine) Models(ctx context.Context) ([]Model, error) {
 	for i, n := 0, e.count(); i < n; i++ {
 		a := e.pick()
 		models, err := e.modelsWith(ctx, a)
+		e.trackQuota(a, err)
 		if err == nil {
 			e.mu.Lock()
 			e.models = models
@@ -313,14 +335,14 @@ func (e *CodexEngine) Models(ctx context.Context) ([]Model, error) {
 			return models, nil
 		}
 		lastErr = err
-		if !isQuotaError(err) || ctx.Err() != nil {
+		if !backend.IsQuotaError(err) || ctx.Err() != nil {
 			return nil, err
 		}
 	}
 	return nil, lastErr
 }
 
-func (e *CodexEngine) modelsWith(ctx context.Context, a *Auth) ([]Model, error) {
+func (e *CodexEngine) modelsWith(ctx context.Context, a *auth.Auth) ([]backend.Model, error) {
 	token, err := e.token(ctx, a)
 	if err != nil {
 		return nil, err
@@ -336,7 +358,7 @@ func (e *CodexEngine) modelsWith(ctx context.Context, a *Auth) ([]Model, error) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, apiHTTPError(resp)
+		return nil, backend.APIHTTPError(resp)
 	}
 	var data struct {
 		Models []struct {
@@ -347,14 +369,14 @@ func (e *CodexEngine) modelsWith(ctx context.Context, a *Auth) ([]Model, error) 
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
-	models := make([]Model, 0, len(data.Models))
+	models := make([]backend.Model, 0, len(data.Models))
 	for _, m := range data.Models {
 		id := m.ID
 		if id == "" {
 			id = m.Slug
 		}
 		if id != "" {
-			models = append(models, Model{ID: id, Name: id})
+			models = append(models, backend.Model{ID: id, Name: id})
 		}
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
@@ -377,15 +399,15 @@ func (e *CodexEngine) HasModel(ctx context.Context, id string) bool {
 	return false
 }
 
-func (e *CodexEngine) Complete(ctx context.Context, model, prompt string) (*Result, error) {
+func (e *CodexEngine) Complete(ctx context.Context, model, prompt string) (*backend.Result, error) {
 	return e.generate(ctx, model, prompt, nil)
 }
 
-func (e *CodexEngine) Stream(ctx context.Context, model, prompt string, onDelta func(string)) (*Result, error) {
+func (e *CodexEngine) Stream(ctx context.Context, model, prompt string, onDelta func(string)) (*backend.Result, error) {
 	return e.generate(ctx, model, prompt, onDelta)
 }
 
-func (e *CodexEngine) Chat(ctx context.Context, req *ChatRequest, onDelta func(ChatDelta)) (*ChatResult, error) {
+func (e *CodexEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta func(backend.ChatDelta)) (*backend.ChatResult, error) {
 	model := req.Model
 	if model == "" {
 		model = e.DefaultModel
@@ -425,11 +447,12 @@ func (e *CodexEngine) Chat(ctx context.Context, req *ChatRequest, onDelta func(C
 	for i, n := 0, e.count(); i < n; i++ {
 		a := e.pick()
 		result, started, err := e.chatStreamOnce(ctx, a, data, onDelta)
+		e.trackQuota(a, err)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
-		if started || !isQuotaError(err) || ctx.Err() != nil {
+		if started || !backend.IsQuotaError(err) || ctx.Err() != nil {
 			return nil, err
 		}
 		slog.Warn("codex account quota exhausted, trying next", "email", a.Email)
@@ -439,7 +462,7 @@ func (e *CodexEngine) Chat(ctx context.Context, req *ChatRequest, onDelta func(C
 
 // codexChatInput translates unified messages into the Responses API instructions
 // string and input items (message / function_call / function_call_output).
-func codexChatInput(msgs []ChatMessage) (string, []map[string]any) {
+func codexChatInput(msgs []backend.ChatMessage) (string, []map[string]any) {
 	var instructions strings.Builder
 	input := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
@@ -466,9 +489,16 @@ func codexChatInput(msgs []ChatMessage) (string, []map[string]any) {
 				"type": "function_call_output", "call_id": m.ToolCallID, "output": m.Content,
 			})
 		default:
+			parts := make([]map[string]any, 0, 1+len(m.Images))
+			if m.Content != "" || len(m.Images) == 0 {
+				parts = append(parts, map[string]any{"type": "input_text", "text": m.Content})
+			}
+			for _, img := range m.Images {
+				parts = append(parts, map[string]any{"type": "input_image", "image_url": img.DataURL()})
+			}
 			input = append(input, map[string]any{
 				"type": "message", "role": "user",
-				"content": []map[string]any{{"type": "input_text", "text": m.Content}},
+				"content": parts,
 			})
 		}
 	}
@@ -477,7 +507,7 @@ func codexChatInput(msgs []ChatMessage) (string, []map[string]any) {
 
 // codexChatTools converts unified tool definitions into Responses API function
 // tools. Parameters stay as standard (lowercase) JSON Schema.
-func codexChatTools(tools []ToolDefinition) []map[string]any {
+func codexChatTools(tools []backend.ToolDefinition) []map[string]any {
 	if len(tools) == 0 {
 		return nil
 	}
@@ -531,10 +561,10 @@ type codexChatEvent struct {
 // chatStreamOnce streams one structured Responses API request, parsing text
 // deltas and completed function_call items. started reports whether any output
 // was already delivered (which makes retrying unsafe).
-func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, onDelta func(ChatDelta)) (*ChatResult, bool, error) {
+func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, onDelta func(backend.ChatDelta)) (*backend.ChatResult, bool, error) {
 	var full strings.Builder
-	var toolCalls []ToolCall
-	var usage Usage
+	var toolCalls []backend.ToolCall
+	var usage backend.Usage
 	started := false
 	for attempt := 0; ; attempt++ {
 		token, err := e.token(ctx, a)
@@ -559,7 +589,7 @@ func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, 
 		}
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
-			return nil, started, apiHTTPError(resp)
+			return nil, started, backend.APIHTTPError(resp)
 		}
 
 		full.Reset()
@@ -576,7 +606,7 @@ func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, 
 							full.WriteString(ev.Delta)
 							started = true
 							if onDelta != nil {
-								onDelta(ChatDelta{Content: ev.Delta})
+								onDelta(backend.ChatDelta{Content: ev.Delta})
 							}
 						}
 					case "response.output_item.done":
@@ -585,20 +615,20 @@ func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, 
 							if args == "" {
 								args = "{}"
 							}
-							tc := ToolCall{ID: ev.Item.CallID, Type: "function", Name: ev.Item.Name, Arguments: args}
+							tc := backend.ToolCall{ID: ev.Item.CallID, Type: "function", Name: ev.Item.Name, Arguments: args}
 							if tc.ID == "" {
-								tc.ID = newID("call_")
+								tc.ID = backend.NewID("call_")
 							}
 							toolCalls = append(toolCalls, tc)
 							started = true
 							if onDelta != nil {
-								onDelta(ChatDelta{ToolCalls: []ToolCall{tc}})
+								onDelta(backend.ChatDelta{ToolCalls: []backend.ToolCall{tc}})
 							}
 						}
 					case "response.completed", "response.done":
 						if ev.Response != nil && ev.Response.Usage != nil {
 							u := ev.Response.Usage
-							usage = Usage{
+							usage = backend.Usage{
 								InputTokens:     u.InputTokens,
 								OutputTokens:    u.OutputTokens,
 								ThinkingTokens:  u.OutputTokensDetails.ReasoningTokens,
@@ -630,7 +660,7 @@ func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *Auth, data []byte, 
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
-		return &ChatResult{Content: full.String(), ToolCalls: toolCalls, Usage: usage, FinishReason: finish}, started, nil
+		return &backend.ChatResult{Content: full.String(), ToolCalls: toolCalls, Usage: usage, FinishReason: finish}, started, nil
 	}
 }
 
@@ -656,7 +686,7 @@ type codexEvent struct {
 	Message string `json:"message"`
 }
 
-func (e *CodexEngine) generate(ctx context.Context, model, prompt string, onDelta func(string)) (*Result, error) {
+func (e *CodexEngine) generate(ctx context.Context, model, prompt string, onDelta func(string)) (*backend.Result, error) {
 	if model == "" {
 		model = e.DefaultModel
 	}
@@ -687,11 +717,12 @@ func (e *CodexEngine) generate(ctx context.Context, model, prompt string, onDelt
 	for i, n := 0, e.count(); i < n; i++ {
 		a := e.pick()
 		result, started, err := e.streamOnce(ctx, a, data, onDelta)
+		e.trackQuota(a, err)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
-		if started || !isQuotaError(err) || ctx.Err() != nil {
+		if started || !backend.IsQuotaError(err) || ctx.Err() != nil {
 			return nil, err
 		}
 		slog.Warn("codex account quota exhausted, trying next", "email", a.Email)
@@ -699,9 +730,9 @@ func (e *CodexEngine) generate(ctx context.Context, model, prompt string, onDelt
 	return nil, lastErr
 }
 
-func (e *CodexEngine) streamOnce(ctx context.Context, a *Auth, data []byte, onDelta func(string)) (result *Result, started bool, err error) {
+func (e *CodexEngine) streamOnce(ctx context.Context, a *auth.Auth, data []byte, onDelta func(string)) (result *backend.Result, started bool, err error) {
 	var full strings.Builder
-	var usage Usage
+	var usage backend.Usage
 	for attempt := 0; ; attempt++ {
 		token, err := e.token(ctx, a)
 		if err != nil {
@@ -725,7 +756,7 @@ func (e *CodexEngine) streamOnce(ctx context.Context, a *Auth, data []byte, onDe
 		}
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
-			return nil, started, apiHTTPError(resp)
+			return nil, started, backend.APIHTTPError(resp)
 		}
 
 		full.Reset()
@@ -747,7 +778,7 @@ func (e *CodexEngine) streamOnce(ctx context.Context, a *Auth, data []byte, onDe
 					case "response.completed", "response.done":
 						if ev.Response != nil && ev.Response.Usage != nil {
 							u := ev.Response.Usage
-							usage = Usage{
+							usage = backend.Usage{
 								InputTokens:    u.InputTokens,
 								OutputTokens:   u.OutputTokens,
 								ThinkingTokens: u.OutputTokensDetails.ReasoningTokens,
@@ -774,6 +805,6 @@ func (e *CodexEngine) streamOnce(ctx context.Context, a *Auth, data []byte, onDe
 		if ctx.Err() != nil {
 			return nil, started, ctx.Err()
 		}
-		return &Result{Status: "SUCCESS", Response: full.String(), Usage: usage}, started, nil
+		return &backend.Result{Status: "SUCCESS", Response: full.String(), Usage: usage}, started, nil
 	}
 }

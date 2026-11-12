@@ -1,4 +1,4 @@
-package main
+package httpapi
 
 import (
 	"encoding/json"
@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"seavxrouter/internal/backend"
 )
 
 // --- POST /v1/messages (Anthropic Messages API) ---
@@ -39,6 +41,35 @@ type anthropicBlock struct {
 	Input     json.RawMessage `json:"input"`
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"`
+	Source    *struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+		URL       string `json:"url"`
+	} `json:"source"`
+}
+
+func anthropicImage(bl anthropicBlock) (backend.ImagePart, error) {
+	if bl.Source == nil {
+		return backend.ImagePart{}, &apiError{http.StatusBadRequest, "image block is missing source", "invalid_request_error", "invalid_content"}
+	}
+	switch bl.Source.Type {
+	case "base64":
+		if bl.Source.MediaType == "" || bl.Source.Data == "" {
+			return backend.ImagePart{}, &apiError{http.StatusBadRequest, "base64 image source requires media_type and data", "invalid_request_error", "invalid_content"}
+		}
+		if !strings.HasPrefix(bl.Source.MediaType, "image/") {
+			return backend.ImagePart{}, &apiError{http.StatusBadRequest, "unsupported image media type: " + bl.Source.MediaType, "invalid_request_error", "unsupported_content"}
+		}
+		return backend.ImagePart{MIMEType: bl.Source.MediaType, Data: bl.Source.Data}, nil
+	case "url":
+		if bl.Source.URL == "" {
+			return backend.ImagePart{}, &apiError{http.StatusBadRequest, "url image source requires url", "invalid_request_error", "invalid_content"}
+		}
+		return backend.ImagePart{URL: bl.Source.URL}, nil
+	default:
+		return backend.ImagePart{}, &apiError{http.StatusBadRequest, "unsupported image source type: " + bl.Source.Type, "invalid_request_error", "unsupported_content"}
+	}
 }
 
 func parseAnthropicSystem(raw json.RawMessage) (string, error) {
@@ -62,37 +93,45 @@ func parseAnthropicSystem(raw json.RawMessage) (string, error) {
 	return b.String(), nil
 }
 
-func parseToolResultContent(raw json.RawMessage) string {
+func parseToolResultContent(raw json.RawMessage) (string, []backend.ImagePart, error) {
 	if len(raw) == 0 {
-		return ""
+		return "", nil, nil
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		return s
+		return s, nil, nil
 	}
 	var blocks []anthropicBlock
-	if json.Unmarshal(raw, &blocks) == nil {
-		var b strings.Builder
-		for _, bl := range blocks {
-			if bl.Type == "text" {
-				b.WriteString(bl.Text)
-			}
-		}
-		return b.String()
+	if json.Unmarshal(raw, &blocks) != nil {
+		return string(raw), nil, nil
 	}
-	return string(raw)
+	var b strings.Builder
+	var images []backend.ImagePart
+	for _, bl := range blocks {
+		switch bl.Type {
+		case "text":
+			b.WriteString(bl.Text)
+		case "image":
+			img, err := anthropicImage(bl)
+			if err != nil {
+				return "", nil, err
+			}
+			images = append(images, img)
+		}
+	}
+	return b.String(), images, nil
 }
 
 // anthropicToMessages converts Anthropic messages into unified chat messages,
 // mapping assistant tool_use blocks to ToolCalls and user tool_result blocks to
 // tool results (resolving the function name from the originating tool_use id).
-func anthropicToMessages(msgs []anthropicMessage) ([]ChatMessage, error) {
-	var out []ChatMessage
+func anthropicToMessages(msgs []anthropicMessage) ([]backend.ChatMessage, error) {
+	var out []backend.ChatMessage
 	toolNames := map[string]string{}
 	for _, m := range msgs {
 		var s string
 		if json.Unmarshal(m.Content, &s) == nil {
-			out = append(out, ChatMessage{Role: m.Role, Content: s})
+			out = append(out, backend.ChatMessage{Role: m.Role, Content: s})
 			continue
 		}
 		var blocks []anthropicBlock
@@ -100,7 +139,7 @@ func anthropicToMessages(msgs []anthropicMessage) ([]ChatMessage, error) {
 			return nil, &apiError{http.StatusBadRequest, "content must be a string or an array of content blocks", "invalid_request_error", "invalid_content"}
 		}
 		if m.Role == "assistant" {
-			cm := ChatMessage{Role: "assistant"}
+			cm := backend.ChatMessage{Role: "assistant"}
 			var text strings.Builder
 			for _, bl := range blocks {
 				switch bl.Type {
@@ -111,7 +150,7 @@ func anthropicToMessages(msgs []anthropicMessage) ([]ChatMessage, error) {
 					if len(bl.Input) > 0 {
 						args = string(bl.Input)
 					}
-					cm.ToolCalls = append(cm.ToolCalls, ToolCall{ID: bl.ID, Type: "function", Name: bl.Name, Arguments: args})
+					cm.ToolCalls = append(cm.ToolCalls, backend.ToolCall{ID: bl.ID, Type: "function", Name: bl.Name, Arguments: args})
 					toolNames[bl.ID] = bl.Name
 				}
 			}
@@ -120,36 +159,48 @@ func anthropicToMessages(msgs []anthropicMessage) ([]ChatMessage, error) {
 			continue
 		}
 		var text strings.Builder
-		var results []ChatMessage
+		var images []backend.ImagePart
+		var results []backend.ChatMessage
 		for _, bl := range blocks {
 			switch bl.Type {
 			case "text":
 				text.WriteString(bl.Text)
+			case "image":
+				img, err := anthropicImage(bl)
+				if err != nil {
+					return nil, err
+				}
+				images = append(images, img)
 			case "tool_result":
-				results = append(results, ChatMessage{
+				resultText, resultImages, err := parseToolResultContent(bl.Content)
+				if err != nil {
+					return nil, err
+				}
+				results = append(results, backend.ChatMessage{
 					Role:       "tool",
 					ToolCallID: bl.ToolUseID,
 					Name:       toolNames[bl.ToolUseID],
-					Content:    parseToolResultContent(bl.Content),
+					Content:    resultText,
 				})
+				images = append(images, resultImages...)
 			}
 		}
 		out = append(out, results...)
-		if text.Len() > 0 {
-			out = append(out, ChatMessage{Role: "user", Content: text.String()})
+		if text.Len() > 0 || len(images) > 0 {
+			out = append(out, backend.ChatMessage{Role: "user", Content: text.String(), Images: images})
 		}
 	}
 	return out, nil
 }
 
-func buildAnthropicChatRequest(req anthropicRequest, model string) (*ChatRequest, error) {
-	cr := &ChatRequest{Model: model, Stream: req.Stream, MaxTokens: req.MaxTokens, Temperature: req.Temperature}
+func buildAnthropicChatRequest(req anthropicRequest, model string) (*backend.ChatRequest, error) {
+	cr := &backend.ChatRequest{Model: model, Stream: req.Stream, MaxTokens: req.MaxTokens, Temperature: req.Temperature}
 	sys, err := parseAnthropicSystem(req.System)
 	if err != nil {
 		return nil, err
 	}
 	if sys != "" {
-		cr.Messages = append(cr.Messages, ChatMessage{Role: "system", Content: sys})
+		cr.Messages = append(cr.Messages, backend.ChatMessage{Role: "system", Content: sys})
 	}
 	msgs, err := anthropicToMessages(req.Messages)
 	if err != nil {
@@ -157,12 +208,12 @@ func buildAnthropicChatRequest(req anthropicRequest, model string) (*ChatRequest
 	}
 	cr.Messages = append(cr.Messages, msgs...)
 	for _, t := range req.Tools {
-		cr.Tools = append(cr.Tools, ToolDefinition{Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
+		cr.Tools = append(cr.Tools, backend.ToolDefinition{Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
 	}
 	return cr, nil
 }
 
-func anthropicStopReason(result *ChatResult) string {
+func anthropicStopReason(result *backend.ChatResult) string {
 	if len(result.ToolCalls) > 0 {
 		return "tool_use"
 	}
@@ -172,7 +223,7 @@ func anthropicStopReason(result *ChatResult) string {
 	return "end_turn"
 }
 
-func anthropicUsage(u Usage) map[string]any {
+func anthropicUsage(u backend.Usage) map[string]any {
 	return map[string]any{
 		"input_tokens":            u.InputTokens,
 		"output_tokens":           u.OutputTokens,
@@ -180,7 +231,7 @@ func anthropicUsage(u Usage) map[string]any {
 	}
 }
 
-func anthropicMessageObject(id, model string, result *ChatResult) map[string]any {
+func anthropicMessageObject(id, model string, result *backend.ChatResult) map[string]any {
 	content := []map[string]any{}
 	if result.Content != "" {
 		content = append(content, map[string]any{"type": "text", "text": result.Content})
@@ -223,7 +274,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeError(w, err)
 		return
 	}
-	id := newID("msg_")
+	id := backend.NewID("msg_")
 
 	if !req.Stream {
 		result, err := s.backend.Chat(r.Context(), cr, nil)
@@ -231,6 +282,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			writeError(w, err)
 			return
 		}
+		s.recordUsage(r, "messages", model, result.Usage)
 		writeJSON(w, anthropicMessageObject(id, model, result))
 		return
 	}
@@ -267,7 +319,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	result, err := s.backend.Chat(r.Context(), cr, func(d ChatDelta) {
+	result, err := s.backend.Chat(r.Context(), cr, func(d backend.ChatDelta) {
 		if d.Content != "" {
 			if !textOpen {
 				send("content_block_start", map[string]any{"index": blockIdx, "content_block": map[string]any{"type": "text", "text": ""}})
@@ -290,6 +342,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		send("error", map[string]any{"error": map[string]any{"type": "backend_error", "message": err.Error()}})
 		return
 	}
+	s.recordUsage(r, "messages", model, result.Usage)
 
 	closeText()
 	if blockIdx == 0 {

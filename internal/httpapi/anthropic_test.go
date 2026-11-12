@@ -1,19 +1,21 @@
-package main
+package httpapi
 
 import (
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"seavxrouter/internal/backend"
 )
 
 func TestAnthropicMessages(t *testing.T) {
 	t.Run("non-streaming tool_use", func(t *testing.T) {
-		stub := &chatStub{result: &ChatResult{
+		stub := &chatStub{result: &backend.ChatResult{
 			Content:      "Let me check.",
-			ToolCalls:    []ToolCall{{ID: "toolu_1", Type: "function", Name: "get_weather", Arguments: `{"city":"SF"}`}},
+			ToolCalls:    []backend.ToolCall{{ID: "toolu_1", Type: "function", Name: "get_weather", Arguments: `{"city":"SF"}`}},
 			FinishReason: "tool_calls",
-			Usage:        Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 7, TotalTokens: 15},
+			Usage:        backend.Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 7, TotalTokens: 15},
 		}}
 		s := &Server{backend: stub}
 		body := `{"model":"m","max_tokens":1024,"system":"You are helpful.","messages":[{"role":"user","content":"weather?"}],"tools":[{"name":"get_weather","description":"d","input_schema":{"type":"object"}}]}`
@@ -70,10 +72,10 @@ func TestAnthropicMessages(t *testing.T) {
 	})
 
 	t.Run("streaming sequence", func(t *testing.T) {
-		tc := ToolCall{ID: "toolu_1", Type: "function", Name: "f", Arguments: `{"x":1}`}
+		tc := backend.ToolCall{ID: "toolu_1", Type: "function", Name: "f", Arguments: `{"x":1}`}
 		stub := &chatStub{
-			result: &ChatResult{Content: "hi", ToolCalls: []ToolCall{tc}, FinishReason: "tool_calls", Usage: Usage{OutputTokens: 5}},
-			deltas: []ChatDelta{{Content: "hi"}, {ToolCalls: []ToolCall{tc}}},
+			result: &backend.ChatResult{Content: "hi", ToolCalls: []backend.ToolCall{tc}, FinishReason: "tool_calls", Usage: backend.Usage{OutputTokens: 5}},
+			deltas: []backend.ChatDelta{{Content: "hi"}, {ToolCalls: []backend.ToolCall{tc}}},
 		}
 		s := &Server{backend: stub}
 		body := `{"model":"m","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
@@ -147,8 +149,67 @@ func TestAnthropicMessages(t *testing.T) {
 		}
 	})
 
+	t.Run("image blocks", func(t *testing.T) {
+		stub := &chatStub{result: &backend.ChatResult{Content: "red", FinishReason: "stop"}}
+		s := &Server{backend: stub}
+		body := `{"model":"m","max_tokens":64,"messages":[{"role":"user","content":[` +
+			`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + testPNGB64 + `"}},` +
+			`{"type":"text","text":"what color?"}]}]}`
+		w := httptest.NewRecorder()
+		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		if w.Code != 200 {
+			t.Fatalf("code %d body %s", w.Code, w.Body.String())
+		}
+		if stub.gotReq == nil || len(stub.gotReq.Messages) != 1 {
+			t.Fatalf("messages not parsed: %+v", stub.gotReq)
+		}
+		msg := stub.gotReq.Messages[0]
+		if msg.Content != "what color?" || len(msg.Images) != 1 || msg.Images[0].MIMEType != "image/png" || msg.Images[0].Data != testPNGB64 {
+			t.Fatalf("image message = %+v", msg)
+		}
+	})
+
+	t.Run("tool_result images", func(t *testing.T) {
+		stub := &chatStub{result: &backend.ChatResult{Content: "done", FinishReason: "stop"}}
+		s := &Server{backend: stub}
+		body := `{"model":"m","max_tokens":64,"messages":[` +
+			`{"role":"user","content":"read the screenshot"},` +
+			`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{}}]},` +
+			`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}]}]}` +
+			`]}`
+		w := httptest.NewRecorder()
+		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		if w.Code != 200 {
+			t.Fatalf("code %d body %s", w.Code, w.Body.String())
+		}
+		if stub.gotReq == nil || len(stub.gotReq.Messages) != 4 {
+			t.Fatalf("messages not parsed: %+v", stub.gotReq)
+		}
+		if stub.gotReq.Messages[2].Role != "tool" || stub.gotReq.Messages[2].ToolCallID != "toolu_1" {
+			t.Fatalf("tool message = %+v", stub.gotReq.Messages[2])
+		}
+		after := stub.gotReq.Messages[3]
+		if after.Role != "user" || len(after.Images) != 1 || after.Images[0].URL != "https://example.com/x.png" {
+			t.Fatalf("tool_result image not carried: %+v", after)
+		}
+	})
+
+	t.Run("unsupported image source", func(t *testing.T) {
+		s := &Server{backend: &chatStub{result: &backend.ChatResult{Content: "x"}}}
+		body := `{"model":"m","max_tokens":64,"messages":[{"role":"user","content":[` +
+			`{"type":"image","source":{"type":"file","file_id":"f1"}}]}]}`
+		w := httptest.NewRecorder()
+		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		if w.Code != 400 {
+			t.Fatalf("code %d body %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "unsupported image source type") {
+			t.Fatalf("body = %s", w.Body.String())
+		}
+	})
+
 	t.Run("tool_result parsing", func(t *testing.T) {
-		stub := &chatStub{result: &ChatResult{Content: "done", FinishReason: "stop"}}
+		stub := &chatStub{result: &backend.ChatResult{Content: "done", FinishReason: "stop"}}
 		s := &Server{backend: stub}
 		body := `{"model":"m","max_tokens":100,"messages":[` +
 			`{"role":"user","content":"weather?"},` +
@@ -163,7 +224,7 @@ func TestAnthropicMessages(t *testing.T) {
 		if stub.gotReq == nil {
 			t.Fatal("no request captured")
 		}
-		var toolMsg *ChatMessage
+		var toolMsg *backend.ChatMessage
 		for i := range stub.gotReq.Messages {
 			if stub.gotReq.Messages[i].Role == "tool" {
 				toolMsg = &stub.gotReq.Messages[i]

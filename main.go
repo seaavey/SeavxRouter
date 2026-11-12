@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,21 +14,17 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"seavxrouter/internal/agy"
+	"seavxrouter/internal/antigravity"
+	"seavxrouter/internal/auth"
+	"seavxrouter/internal/backend"
+	"seavxrouter/internal/codebuddy"
+	"seavxrouter/internal/codex"
+	"seavxrouter/internal/httpapi"
+	"seavxrouter/internal/multi"
+	"seavxrouter/internal/qoder"
 )
-
-type BackendAPI interface {
-	Models(context.Context) ([]Model, error)
-	HasModel(context.Context, string) bool
-	Complete(context.Context, string, string) (*Result, error)
-	Stream(context.Context, string, string, func(string)) (*Result, error)
-	Chat(context.Context, *ChatRequest, func(ChatDelta)) (*ChatResult, error)
-	Default() string
-}
-
-type Server struct {
-	backend BackendAPI
-	apiKey  string
-}
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -41,6 +36,7 @@ func envOr(key, fallback string) string {
 func main() {
 	loginMode := len(os.Args) > 1 && os.Args[1] == "login"
 	loginProvider := "antigravity"
+	loginRegion := ""
 	args := os.Args[1:]
 	if loginMode {
 		args = os.Args[2:]
@@ -48,15 +44,20 @@ func main() {
 			loginProvider = args[0]
 			args = args[1:]
 		}
+		if loginProvider == "qoder" && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			loginRegion = args[0]
+			args = args[1:]
+		}
 	}
 	fs := flag.NewFlagSet("seavxrouter", flag.ExitOnError)
 	listen := fs.String("listen", envOr("SEAVX_LISTEN", "127.0.0.1:8080"), "listen address")
 	backendName := fs.String("backend", envOr("SEAVX_BACKEND", "native"), "backend: native (direct API) or binary (spawn agy)")
-	authFile := fs.String("auth-file", envOr("SEAVX_AUTH_FILE", defaultAuthPath()), "credentials file for the native backend")
-	apiBase := fs.String("api-base", envOr("SEAVX_API_BASE", defaultAPIBase), "Antigravity API base URL")
+	authFile := fs.String("auth-file", envOr("SEAVX_AUTH_FILE", auth.DefaultPath()), "credentials file for the native backend")
+	apiBase := fs.String("api-base", envOr("SEAVX_API_BASE", antigravity.DefaultAPIBase), "Antigravity API base URL")
 	binName := fs.String("agy", envOr("SEAVX_AGY_BIN", "agy"), "agy binary name or path (binary backend)")
 	apiKey := fs.String("api-key", os.Getenv("SEAVX_API_KEY"), "require this bearer token on /v1/* (empty = no auth)")
 	defaultModel := fs.String("default-model", envOr("SEAVX_DEFAULT_MODEL", ""), "model used when the request omits one")
+	usageDB := fs.String("usage-db", envOr("SEAVX_USAGE_DB", httpapi.DefaultUsageDBPath()), `SQLite file for token usage tracking (empty or "off" disables)`)
 	timeout := fs.Duration("timeout", 5*time.Minute, "per-request backend timeout (binary backend)")
 	workRoot := fs.String("workdir", envOr("SEAVX_WORKDIR", filepath.Join(os.TempDir(), "seavxrouter")), "scratch dir for backend workspaces (binary backend)")
 	fs.Parse(args)
@@ -65,17 +66,23 @@ func main() {
 	defer stop()
 
 	if loginMode {
-		store := AuthStore{Path: *authFile}
+		store := auth.AuthStore{Path: *authFile}
 		var err error
 		switch loginProvider {
 		case "antigravity":
-			engine := &Engine{Store: store, BaseURL: *apiBase, HTTP: &http.Client{}}
+			engine := &antigravity.Engine{Store: store, BaseURL: *apiBase, HTTP: &http.Client{}}
 			err = engine.Login(ctx)
 		case "codex":
-			engine := &CodexEngine{Store: store, HTTP: &http.Client{}}
+			engine := &codex.CodexEngine{Store: store, HTTP: &http.Client{}}
+			err = engine.Login(ctx)
+		case "codebuddy":
+			engine := &codebuddy.CodeBuddyEngine{Store: store, HTTP: &http.Client{}}
+			err = engine.Login(ctx)
+		case "qoder":
+			engine := &qoder.QoderEngine{Store: store, HTTP: &http.Client{}, Region: loginRegion}
 			err = engine.Login(ctx)
 		default:
-			slog.Error("unknown login provider (want antigravity or codex)", "provider", loginProvider)
+			slog.Error("unknown login provider (want antigravity, codex, codebuddy or qoder)", "provider", loginProvider)
 			os.Exit(1)
 		}
 		if err != nil {
@@ -85,26 +92,31 @@ func main() {
 		return
 	}
 
-	var backend BackendAPI
+	var provider backend.BackendAPI
 	switch *backendName {
 	case "native":
-		store := AuthStore{Path: *authFile}
+		store := auth.AuthStore{Path: *authFile}
 		auths, err := store.Load()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [codex]\n", err)
+			fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder]\n", err)
 			os.Exit(1)
 		}
-		var agyAuths, codexAuths []*Auth
+		var agyAuths, codexAuths, cbAuths, qAuths []*auth.Auth
 		for _, a := range auths {
-			if a.Provider == "codex" {
+			switch a.Provider {
+			case "codex":
 				codexAuths = append(codexAuths, a)
-			} else {
+			case "codebuddy":
+				cbAuths = append(cbAuths, a)
+			case "qoder":
+				qAuths = append(qAuths, a)
+			default:
 				agyAuths = append(agyAuths, a)
 			}
 		}
-		multi := &MultiBackend{}
+		multi := &multi.MultiBackend{}
 		if len(agyAuths) > 0 {
-			engine, err := NewEngine(store, *apiBase, agyAuths)
+			engine, err := antigravity.NewEngine(store, *apiBase, agyAuths)
 			if err != nil {
 				slog.Error("cannot start antigravity", "err", err)
 				os.Exit(1)
@@ -117,10 +129,10 @@ func main() {
 					slog.Warn("could not fetch default model", "provider", "antigravity", "err", err)
 				}
 			}
-			multi.antigravity = engine
+			multi.Antigravity = engine
 		}
 		if len(codexAuths) > 0 {
-			engine, err := NewCodexEngine(store, codexAuths)
+			engine, err := codex.NewCodexEngine(store, codexAuths)
 			if err != nil {
 				slog.Error("cannot start codex", "err", err)
 				os.Exit(1)
@@ -133,12 +145,36 @@ func main() {
 					slog.Warn("could not fetch default model", "provider", "codex", "err", err)
 				}
 			}
-			multi.codex = engine
+			multi.Codex = engine
 		}
-		slog.Info("providers ready", "antigravity", len(agyAuths), "codex", len(codexAuths))
-		backend = multi
+		if len(cbAuths) > 0 {
+			engine, err := codebuddy.NewCodeBuddyEngine(store, cbAuths)
+			if err != nil {
+				slog.Error("cannot start codebuddy", "err", err)
+				os.Exit(1)
+			}
+			engine.DefaultModel = *defaultModel
+			if engine.DefaultModel == "" {
+				engine.DefaultModel = engine.Default()
+			}
+			multi.CodeBuddy = engine
+		}
+		if len(qAuths) > 0 {
+			engine, err := qoder.NewQoderEngine(store, qAuths)
+			if err != nil {
+				slog.Error("cannot start qoder", "err", err)
+				os.Exit(1)
+			}
+			engine.DefaultModel = *defaultModel
+			if engine.DefaultModel == "" {
+				engine.DefaultModel = engine.Default()
+			}
+			multi.Qoder = engine
+		}
+		slog.Info("providers ready", "antigravity", len(agyAuths), "codex", len(codexAuths), "codebuddy", len(cbAuths), "qoder", len(qAuths))
+		provider = multi
 	case "binary":
-		bin, err := ResolveBinary(*binName)
+		bin, err := agy.ResolveBinary(*binName)
 		if err != nil {
 			slog.Error("cannot start", "err", err)
 			os.Exit(1)
@@ -147,26 +183,32 @@ func main() {
 			slog.Error("cannot create workdir", "err", err)
 			os.Exit(1)
 		}
-		backend = &Backend{Bin: bin, WorkRoot: *workRoot, Timeout: *timeout, DefaultModel: *defaultModel}
+		provider = &agy.Backend{Bin: bin, WorkRoot: *workRoot, Timeout: *timeout, DefaultModel: *defaultModel}
 	default:
 		slog.Error("unknown backend", "backend", *backendName)
 		os.Exit(1)
 	}
 
-	srv := &Server{backend: backend, apiKey: *apiKey}
+	var usageStore *httpapi.UsageStore
+	switch *usageDB {
+	case "", "off", "none":
+		slog.Info("usage tracking disabled")
+	default:
+		store, err := httpapi.OpenUsageStore(*usageDB)
+		if err != nil {
+			slog.Error("cannot open usage db", "err", err)
+			os.Exit(1)
+		}
+		defer store.Close()
+		usageStore = store
+		slog.Info("usage tracking enabled", "db", *usageDB)
+	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]string{"status": "ok"})
-	})
-	mux.HandleFunc("GET /v1/models", srv.auth(srv.handleModels))
-	mux.HandleFunc("POST /v1/chat/completions", srv.auth(srv.handleChat))
-	mux.HandleFunc("POST /v1/messages", srv.auth(srv.handleAnthropicMessages))
-	mux.HandleFunc("POST /v1/responses", srv.auth(srv.handleResponses))
+	srv := httpapi.NewServer(provider, *apiKey, usageStore)
 
 	httpSrv := &http.Server{
 		Addr:              *listen,
-		Handler:           mux,
+		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
@@ -184,19 +226,4 @@ func main() {
 	defer cancel()
 	httpSrv.Shutdown(shutdownCtx)
 	slog.Info("stopped")
-}
-
-func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.apiKey != "" {
-			token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(s.apiKey)) != 1 {
-				writeError(w, &apiError{http.StatusUnauthorized, "invalid or missing API key", "invalid_request_error", "invalid_api_key"})
-				return
-			}
-		}
-		start := time.Now()
-		next(w, r)
-		slog.Info("request", "method", r.Method, "path", r.URL.Path, "dur", time.Since(start).Round(time.Millisecond))
-	}
 }
