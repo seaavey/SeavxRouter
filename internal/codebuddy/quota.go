@@ -8,9 +8,7 @@ import (
 
 // Quota reports per-account availability for GET /v1/quota.
 func (e *CodeBuddyEngine) Quota() auth.ProviderQuota {
-	e.mu.Lock()
-	auths := append([]*auth.Auth(nil), e.auths...)
-	e.mu.Unlock()
+	auths := e.snapshotAuths()
 	e.quotaMu.Lock()
 	limited := make(map[*auth.Auth]time.Time, len(e.quotaErr))
 	for a, t := range e.quotaErr {

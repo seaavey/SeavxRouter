@@ -1,6 +1,9 @@
 package backend
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // BackendAPI is the provider-neutral contract every backend implements.
 type BackendAPI interface {
@@ -10,6 +13,21 @@ type BackendAPI interface {
 	Stream(context.Context, string, string, func(string)) (*Result, error)
 	Chat(context.Context, *ChatRequest, func(ChatDelta)) (*ChatResult, error)
 	Default() string
+}
+
+// AccountCheck is the outcome of one account's live credential and model
+// check. Err is nil when the account is usable.
+type AccountCheck struct {
+	Account   string
+	AccountID string
+	Models    []Model
+	Err       error
+	Latency   time.Duration
+}
+
+// Checker verifies every configured account against its upstream.
+type Checker interface {
+	Check(context.Context) []AccountCheck
 }
 
 // Usage is the token accounting reported by a backend for one request.

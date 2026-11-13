@@ -274,6 +274,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeError(w, err)
 		return
 	}
+	s.applyCompression(cr, "messages")
 	id := backend.NewID("msg_")
 
 	if !req.Stream {
@@ -282,7 +283,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			writeError(w, err)
 			return
 		}
-		s.recordUsage(r, "messages", model, result.Usage)
+		s.recordResult(r, "messages", model, result)
 		writeJSON(w, anthropicMessageObject(id, model, result))
 		return
 	}
@@ -342,7 +343,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		send("error", map[string]any{"error": map[string]any{"type": "backend_error", "message": err.Error()}})
 		return
 	}
-	s.recordUsage(r, "messages", model, result.Usage)
+	s.recordResult(r, "messages", model, result)
 
 	closeText()
 	if blockIdx == 0 {

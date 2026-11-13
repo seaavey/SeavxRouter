@@ -2,6 +2,7 @@ package multi
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"seavxrouter/internal/backend"
@@ -46,6 +47,9 @@ type fakeBackend struct {
 	models    map[string]bool
 	lastModel string
 	def       string
+	calls     int
+	errs      []error
+	deltas    []backend.ChatDelta
 }
 
 func (f *fakeBackend) Models(context.Context) ([]backend.Model, error) {
@@ -71,9 +75,15 @@ func (f *fakeBackend) Stream(_ context.Context, model, _ string, onDelta func(st
 	return &backend.Result{Status: "SUCCESS", Response: "hello"}, nil
 }
 func (f *fakeBackend) Chat(_ context.Context, req *backend.ChatRequest, onDelta func(backend.ChatDelta)) (*backend.ChatResult, error) {
+	f.calls++
 	f.lastModel = req.Model
-	if onDelta != nil {
-		onDelta(backend.ChatDelta{Content: "x"})
+	for _, d := range f.deltas {
+		if onDelta != nil {
+			onDelta(d)
+		}
+	}
+	if i := f.calls - 1; i < len(f.errs) && f.errs[i] != nil {
+		return nil, f.errs[i]
 	}
 	return &backend.ChatResult{Content: "ok", FinishReason: "stop"}, nil
 }
@@ -98,5 +108,93 @@ func TestMultiBackendResolveNormalizes(t *testing.T) {
 	}
 	if agy.lastModel != "gemini-3.8-flash-high" {
 		t.Fatalf("HasModel passed %q to backend, want normalized id", agy.lastModel)
+	}
+}
+
+func TestChatRetriesTransientFailure(t *testing.T) {
+	old := retryBackoff
+	retryBackoff = 0
+	defer func() { retryBackoff = old }()
+
+	agy := &fakeBackend{models: map[string]bool{"gemini-3.8-flash-high": true}, errs: []error{errors.New("503 Service Unavailable")}}
+	m := &MultiBackend{Antigravity: agy}
+	res, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "gemini-3.8-flash"}, nil)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if res.Content != "ok" || agy.calls != 2 {
+		t.Fatalf("calls = %d, result = %+v", agy.calls, res)
+	}
+	if agy.lastModel != "gemini-3.8-flash-high" {
+		t.Fatalf("model = %q", agy.lastModel)
+	}
+}
+
+func TestChatFailsOverOnQuotaError(t *testing.T) {
+	agy := &fakeBackend{models: map[string]bool{"claude-sonnet-4-6": true}, errs: []error{errors.New("429 rate limit exceeded")}}
+	codex := &fakeBackend{models: map[string]bool{"claude-sonnet-4-6": true}, deltas: []backend.ChatDelta{{Content: "hi"}}}
+	m := &MultiBackend{Antigravity: agy, Codex: codex}
+	var got []string
+	res, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "antigravity/claude-sonnet-4-6"}, func(d backend.ChatDelta) {
+		got = append(got, d.Content)
+	})
+	if err != nil {
+		t.Fatalf("failover failed: %v", err)
+	}
+	if res.Content != "ok" {
+		t.Fatalf("result = %+v", res)
+	}
+	if agy.calls != 1 || codex.calls != 1 {
+		t.Fatalf("calls: antigravity=%d codex=%d", agy.calls, codex.calls)
+	}
+	if codex.lastModel != "claude-sonnet-4-6" {
+		t.Fatalf("fallback model = %q", codex.lastModel)
+	}
+	if len(got) != 1 || got[0] != "hi" {
+		t.Fatalf("deltas = %v", got)
+	}
+}
+
+func TestChatNoRetryAfterOutput(t *testing.T) {
+	old := retryBackoff
+	retryBackoff = 0
+	defer func() { retryBackoff = old }()
+
+	agy := &fakeBackend{
+		models: map[string]bool{"gemini-3.8-flash-high": true},
+		errs:   []error{errors.New("503 Service Unavailable")},
+		deltas: []backend.ChatDelta{{Content: "partial"}},
+	}
+	codex := &fakeBackend{models: map[string]bool{"gemini-3.8-flash-high": true}}
+	m := &MultiBackend{Antigravity: agy, Codex: codex}
+	if _, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "antigravity/gemini-3.8-flash"}, nil); err == nil {
+		t.Fatal("expected error")
+	}
+	if agy.calls != 1 || codex.calls != 0 {
+		t.Fatalf("retried after output: antigravity=%d codex=%d", agy.calls, codex.calls)
+	}
+}
+
+func TestChatNoFallbackOnNonRetryableError(t *testing.T) {
+	agy := &fakeBackend{models: map[string]bool{"claude-sonnet-4-6": true}, errs: []error{errors.New("400 Bad Request: invalid model")}}
+	codex := &fakeBackend{models: map[string]bool{"claude-sonnet-4-6": true}}
+	m := &MultiBackend{Antigravity: agy, Codex: codex}
+	if _, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "antigravity/claude-sonnet-4-6"}, nil); err == nil {
+		t.Fatal("expected error")
+	}
+	if agy.calls != 1 || codex.calls != 0 {
+		t.Fatalf("fallback on non-retryable: antigravity=%d codex=%d", agy.calls, codex.calls)
+	}
+}
+
+func TestChatFallbackRequiresMatchingModel(t *testing.T) {
+	agy := &fakeBackend{models: map[string]bool{"claude-sonnet-4-6": true}, errs: []error{errors.New("429 rate limit exceeded")}}
+	codex := &fakeBackend{models: map[string]bool{}}
+	m := &MultiBackend{Antigravity: agy, Codex: codex}
+	if _, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "antigravity/claude-sonnet-4-6"}, nil); err == nil {
+		t.Fatal("expected error")
+	}
+	if codex.calls != 0 || codex.lastModel != "claude-sonnet-4-6" {
+		t.Fatalf("fallback called without model: calls=%d model=%q", codex.calls, codex.lastModel)
 	}
 }

@@ -400,6 +400,7 @@ type QoderEngine struct {
 
 	mu    sync.Mutex
 	auths []*auth.Auth
+	cache auth.AccountCache
 	next  int
 	acct  map[*auth.Auth]*qoderAccount
 
@@ -424,7 +425,7 @@ func NewQoderEngine(store auth.AuthStore, auths []*auth.Auth) (*QoderEngine, err
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no qoder accounts")
 	}
-	return &QoderEngine{Store: store, HTTP: &http.Client{}, auths: auths}, nil
+	return &QoderEngine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "qoder")}, nil
 }
 
 func (e *QoderEngine) client() *http.Client {
@@ -466,6 +467,7 @@ func (e *QoderEngine) accountFor(a *auth.Auth) *qoderAccount {
 func (e *QoderEngine) snapshotAuths() ([]*auth.Auth, int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
 	return append([]*auth.Auth(nil), e.auths...), e.next
 }
 
@@ -1004,7 +1006,7 @@ func (e *QoderEngine) catalogFor(ctx context.Context) *qoderCatalog {
 	}
 	e.modelsMu.Unlock()
 
-	cat := e.fetchCatalog(ctx)
+	cat, _ := e.fetchCatalog(ctx)
 	if cat == nil {
 		cat = qoderFallbackCatalog()
 	}
@@ -1015,42 +1017,74 @@ func (e *QoderEngine) catalogFor(ctx context.Context) *qoderCatalog {
 	return cat
 }
 
-func (e *QoderEngine) fetchCatalog(ctx context.Context) *qoderCatalog {
+func (e *QoderEngine) fetchCatalog(ctx context.Context) (*qoderCatalog, error) {
 	auths, _ := e.snapshotAuths()
+	var lastErr error
 	for _, a := range auths {
-		acct := e.accountFor(a)
-		sess, err := e.ensureSession(ctx, acct)
-		if err != nil {
-			slog.Warn("qoder model list auth failed", "err", err)
-			continue
+		cat, err := e.fetchCatalogWith(ctx, a)
+		if err == nil {
+			return cat, nil
 		}
-		urlStr := e.chatBase(acct.region) + "/algo/api/v2/model/list?Encode=1"
-		date := strconv.FormatInt(time.Now().Unix(), 10)
-		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, urlStr, nil)
-		if err != nil {
-			cancel()
-			continue
-		}
-		req.Header = qoderSessionHeaders(sess, date, sess.bearer(date, "", qoderSigPath(urlStr)), "application/json")
-		raw, err := e.doJSON(req)
-		cancel()
-		if err != nil {
-			slog.Warn("qoder model list failed", "err", err)
-			continue
-		}
-		if cat := qoderExtractCatalog(raw); cat != nil {
-			return cat
-		}
-		slog.Warn("qoder model list response shape unexpected; using fallback")
+		lastErr = err
+		slog.Warn("qoder model list failed", "err", err)
 	}
-	return nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no qoder accounts")
+	}
+	return nil, lastErr
 }
 
-func (e *QoderEngine) Models(ctx context.Context) ([]backend.Model, error) {
-	cat := e.catalogFor(ctx)
-	names := make([]string, 0, len(cat.keys))
-	for name := range cat.keys {
+func (e *QoderEngine) fetchCatalogWith(ctx context.Context, a *auth.Auth) (*qoderCatalog, error) {
+	acct := e.accountFor(a)
+	sess, err := e.ensureSession(ctx, acct)
+	if err != nil {
+		return nil, err
+	}
+	urlStr := e.chatBase(acct.region) + "/algo/api/v2/model/list?Encode=1"
+	date := strconv.FormatInt(time.Now().Unix(), 10)
+	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = qoderSessionHeaders(sess, date, sess.bearer(date, "", qoderSigPath(urlStr)), "application/json")
+	raw, err := e.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	cat := qoderExtractCatalog(raw)
+	if cat == nil {
+		return nil, fmt.Errorf("qoder model list response shape unexpected")
+	}
+	return cat, nil
+}
+
+// Check verifies each account against upstream.
+func (e *QoderEngine) Check(ctx context.Context) []backend.AccountCheck {
+	auths, _ := e.snapshotAuths()
+	out := make([]backend.AccountCheck, 0, len(auths))
+	for _, a := range auths {
+		start := time.Now()
+		cat, err := e.fetchCatalogWith(ctx, a)
+		var models []backend.Model
+		if err == nil {
+			models = cat.models()
+		}
+		out = append(out, backend.AccountCheck{
+			Account:   a.Email,
+			AccountID: a.AccountID,
+			Models:    models,
+			Err:       err,
+			Latency:   time.Since(start),
+		})
+	}
+	return out
+}
+
+func (c *qoderCatalog) models() []backend.Model {
+	names := make([]string, 0, len(c.keys))
+	for name := range c.keys {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -1058,7 +1092,11 @@ func (e *QoderEngine) Models(ctx context.Context) ([]backend.Model, error) {
 	for _, name := range names {
 		out = append(out, backend.Model{ID: name, Name: name})
 	}
-	return out, nil
+	return out
+}
+
+func (e *QoderEngine) Models(ctx context.Context) ([]backend.Model, error) {
+	return e.catalogFor(ctx).models(), nil
 }
 
 func (e *QoderEngine) HasModel(ctx context.Context, id string) bool {

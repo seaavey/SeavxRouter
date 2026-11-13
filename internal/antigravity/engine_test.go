@@ -249,3 +249,35 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 		t.Fatalf("round-trip upstream missing thoughtSignature: %s", upstreamBody)
 	}
 }
+
+func TestEngineCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1internal:fetchAvailableModels" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
+			t.Errorf("authorization = %q", got)
+		}
+		fmt.Fprint(w, `{"models":{"zeta":{},"alpha":{}}}`)
+	}))
+	defer srv.Close()
+
+	e := &Engine{
+		BaseURL: srv.URL,
+		HTTP:    srv.Client(),
+		auths:   []*auth.Auth{{Provider: "antigravity", AccessToken: "tok", Expiry: time.Now().Add(time.Hour)}},
+	}
+	checks := e.Check(context.Background())
+	if len(checks) != 1 {
+		t.Fatalf("checks = %+v", checks)
+	}
+	if checks[0].Err != nil {
+		t.Fatal(checks[0].Err)
+	}
+	models := checks[0].Models
+	if len(models) != 2 || models[0].ID != "alpha" || models[1].ID != "zeta" {
+		t.Fatalf("models = %+v", models)
+	}
+}

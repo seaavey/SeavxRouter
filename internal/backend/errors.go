@@ -20,6 +20,30 @@ func IsQuotaError(err error) bool {
 		strings.Contains(msg, "rate_limit") || strings.Contains(msg, "rate limit")
 }
 
+// IsRetryableError reports whether err is a transient upstream failure worth
+// retrying, either on the same provider or on a fallback provider. Quota and
+// auth failures qualify because another provider may serve the same model.
+func IsRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsQuotaError(err) || IsAuthError(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"internal server error", "bad gateway", "service unavailable",
+		"gateway timeout", "overloaded", "temporarily unavailable",
+		"timeout", "timed out", "connection reset", "connection refused",
+		"broken pipe", "unexpected eof", "stream error", "transport is closing",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return msg == "eof"
+}
+
 // IsAuthError reports whether err looks like an authentication failure.
 func IsAuthError(err error) bool {
 	if err == nil {

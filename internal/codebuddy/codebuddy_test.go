@@ -9,6 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -374,5 +378,146 @@ func TestCodeBuddyQuotaTracking(t *testing.T) {
 	e.trackQuota(a, nil)
 	if q := e.Quota(); q.Accounts[0].Status != "ready" {
 		t.Fatalf("recovered quota = %+v", q)
+	}
+}
+
+func TestCodeBuddyCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v3/config" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"code":0,"data":{"agents":[{"name":"cli","models":["glm-5.3"]}],`+
+			`"models":[{"id":"glm-5.3","name":"GLM-5.3"}]}}`)
+	}))
+	defer srv.Close()
+
+	e := &CodeBuddyEngine{HTTP: &http.Client{}, BaseURL: srv.URL, auths: []*auth.Auth{{Provider: "codebuddy", AccessToken: "tok"}}}
+	checks := e.Check(context.Background())
+	if len(checks) != 1 || checks[0].Err != nil {
+		t.Fatalf("checks = %+v", checks)
+	}
+	models := checks[0].Models
+	if len(models) != 1 || models[0].ID != "glm-5.3" {
+		t.Fatalf("models = %+v", models)
+	}
+}
+
+func TestCodeBuddyCheckReportsUpstreamFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"code":401,"msg":"invalid token"}`)
+	}))
+	defer srv.Close()
+
+	e := &CodeBuddyEngine{HTTP: &http.Client{}, BaseURL: srv.URL, auths: []*auth.Auth{{Provider: "codebuddy", AccessToken: "bad"}}}
+	checks := e.Check(context.Background())
+	if len(checks) != 1 || checks[0].Err == nil {
+		t.Fatalf("Check must report upstream failures instead of falling back to the built-in catalog: %+v", checks)
+	}
+}
+
+func TestCodeBuddyCheckIsolatesDeadAccount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"code":401,"msg":"invalid token"}`)
+			return
+		}
+		fmt.Fprint(w, `{"code":0,"data":{"agents":[{"name":"cli","models":["glm-5.3"]}],`+
+			`"models":[{"id":"glm-5.3","name":"GLM-5.3"}]}}`)
+	}))
+	defer srv.Close()
+
+	e := &CodeBuddyEngine{HTTP: &http.Client{}, BaseURL: srv.URL, auths: []*auth.Auth{
+		{Provider: "codebuddy", AccessToken: "good", Email: "ok@example.com"},
+		{Provider: "codebuddy", AccessToken: "bad", Email: "dead@example.com"},
+	}}
+	checks := e.Check(context.Background())
+	if len(checks) != 2 {
+		t.Fatalf("checks = %+v", checks)
+	}
+	if checks[0].Err != nil || len(checks[0].Models) != 1 {
+		t.Fatalf("healthy account should pass: %+v", checks[0])
+	}
+	if checks[1].Err == nil {
+		t.Fatalf("dead account should fail: %+v", checks[1])
+	}
+}
+
+// Accounts added to the credentials file while the engine is running must be
+// picked up without a restart, so a login performed against a live server
+// takes effect on the next request.
+func TestCodeBuddyHotReloadsAccounts(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		seen = append(seen, tok)
+		mu.Unlock()
+		if tok != "tok-new" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"code":6004,"msg":"usage exceeds frequency limit"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "auth.jsonc")
+	bump := time.Now()
+	writeFile := func(auths ...*auth.Auth) {
+		t.Helper()
+		data, err := json.Marshal(auths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		bump = bump.Add(time.Second)
+		if err := os.Chtimes(path, bump, bump); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(&auth.Auth{Provider: "codebuddy", Email: "old@example.com", AccessToken: "tok-old"})
+	store := auth.AuthStore{Path: path}
+	initial, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewCodeBuddyEngine(store, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.HTTP = &http.Client{}
+	e.BaseURL = srv.URL
+
+	req := &backend.ChatRequest{Model: "glm-5.3", Messages: []backend.ChatMessage{{Role: "user", Content: "hi"}}}
+	if _, err := e.Chat(context.Background(), req, nil); err == nil {
+		t.Fatalf("single limited account should fail")
+	}
+
+	writeFile(
+		&auth.Auth{Provider: "codebuddy", Email: "old@example.com", AccessToken: "tok-old"},
+		&auth.Auth{Provider: "codebuddy", Email: "new@example.com", AccessToken: "tok-new"},
+	)
+	if n := e.count(); n != 2 {
+		t.Fatalf("account count after reload = %d, want 2", n)
+	}
+	res, err := e.Chat(context.Background(), req, nil)
+	if err != nil {
+		t.Fatalf("chat after reload: %v", err)
+	}
+	if res.Content != "ok" {
+		t.Fatalf("content = %q, want ok", res.Content)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(strings.Join(seen, ","), "tok-old") || !strings.Contains(strings.Join(seen, ","), "tok-new") {
+		t.Fatalf("expected both accounts to be attempted, saw %v", seen)
 	}
 }

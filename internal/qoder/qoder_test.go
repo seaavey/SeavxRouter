@@ -911,3 +911,27 @@ func TestQoderQuota(t *testing.T) {
 		t.Fatalf("quota default model = %q", q.DefaultModel)
 	}
 }
+
+func TestQoderCheck(t *testing.T) {
+	mock := &qoderMock{statusTier: "personal_pro", catalog: qoderMockCatalog()}
+	e := qoderTestEngine(t, mock, &auth.Auth{Provider: "qoder", AccessToken: "pt-good", Region: "cn"})
+
+	checks := e.Check(context.Background())
+	if len(checks) != 1 || checks[0].Err != nil {
+		t.Fatalf("checks = %+v", checks)
+	}
+	models := checks[0].Models
+	if len(models) != 2 || models[0].ID != "Qwen-Unit" || models[1].ID != "Qwen-Unit-Flash" {
+		t.Fatalf("models = %+v", models)
+	}
+}
+
+func TestQoderCheckReportsFailure(t *testing.T) {
+	mock := &qoderMock{statusTier: "personal_pro", catalogFail: true}
+	e := qoderTestEngine(t, mock, &auth.Auth{Provider: "qoder", AccessToken: "pt-good", Region: "cn"})
+
+	checks := e.Check(context.Background())
+	if len(checks) != 1 || checks[0].Err == nil {
+		t.Fatalf("Check must report upstream failures instead of falling back to the built-in catalog: %+v", checks)
+	}
+}

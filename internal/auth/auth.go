@@ -23,6 +23,9 @@ type Auth struct {
 	Tier         string    `json:"tier,omitempty"`
 	Email        string    `json:"email,omitempty"`
 	Region       string    `json:"region,omitempty"`
+	ClientID     string    `json:"client_id,omitempty"`
+	ClientSecret string    `json:"client_secret,omitempty"`
+	ProfileARN   string    `json:"profile_arn,omitempty"`
 }
 
 // AuthStore reads and writes the JSONC credentials file.
@@ -128,6 +131,11 @@ func sameAccount(a, b *Auth) bool {
 	}
 	if a.Email != "" && b.Email != "" {
 		return strings.EqualFold(a.Email, b.Email)
+	}
+	// Kiro refresh tokens rotate on every use, so accounts are keyed by the
+	// stable AWS subject instead.
+	if a.Provider == "kiro" && a.AccountID != "" && b.AccountID != "" {
+		return a.AccountID == b.AccountID
 	}
 	if a.Provider == "codebuddy" || a.Provider == "qoder" {
 		return a.AccessToken != "" && a.AccessToken == b.AccessToken

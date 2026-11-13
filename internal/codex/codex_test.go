@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -200,6 +201,113 @@ func TestCodexChatRequestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCodexChatServiceTier(t *testing.T) {
+	cases := []struct {
+		name string
+		tier string
+		want string
+	}{
+		{"fast alias", "fast", "priority"},
+		{"priority", "priority", "priority"},
+		{"case and spaces", " Fast ", "priority"},
+		{"default fast", "", "priority"},
+		{"standard opt-out", "standard", ""},
+		{"unsupported", "flex", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+			}))
+			defer srv.Close()
+
+			e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.BaseURL = srv.URL
+			req := &backend.ChatRequest{
+				Model:       "gpt-6-luna",
+				Messages:    []backend.ChatMessage{{Role: "user", Content: "hi"}},
+				ServiceTier: tc.tier,
+			}
+			if _, err := e.Chat(context.Background(), req, nil); err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(upstreamBody, &payload); err != nil {
+				t.Fatal(err)
+			}
+			got, present := payload["service_tier"]
+			if tc.want == "" {
+				if present {
+					t.Fatalf("service_tier should be omitted, payload: %s", upstreamBody)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("service_tier = %v, want %q (payload %s)", got, tc.want, upstreamBody)
+			}
+		})
+	}
+}
+
+func TestCodexLiveUsageWindows(t *testing.T) {
+	resetPrimary := int64(1794467946)
+	resetSecondary := int64(1794854808)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/wham/usage" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
+			t.Errorf("authorization = %q", got)
+		}
+		if got := r.Header.Get("Chatgpt-Account-Id"); got != "acc-1" {
+			t.Errorf("chatgpt-account-id = %q", got)
+		}
+		calls.Add(1)
+		fmt.Fprintf(w, `{"rate_limit":{"allowed":true,"primary_window":{"used_percent":8,"limit_window_seconds":18000,"reset_at":%d},"secondary_window":{"used_percent":24,"limit_window_seconds":604800,"reset_at":%d}}}`, resetPrimary, resetSecondary)
+	}))
+	defer srv.Close()
+
+	a := &auth.Auth{AccessToken: "tok", AccountID: "acc-1", Expiry: time.Now().Add(time.Hour)}
+	e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.BaseURL = srv.URL
+	e.HTTP = srv.Client()
+
+	windows := e.Quota().Accounts[0].Windows
+	if len(windows) != 2 {
+		t.Fatalf("windows = %+v", windows)
+	}
+	if windows[0].Name != "5h" || windows[0].WindowMinutes != 300 || windows[0].UsedPercent == nil || *windows[0].UsedPercent != 8 {
+		t.Fatalf("primary window = %+v", windows[0])
+	}
+	if windows[0].ResetsAt == nil || !windows[0].ResetsAt.Equal(time.Unix(resetPrimary, 0).UTC()) {
+		t.Fatalf("primary resets_at = %v", windows[0].ResetsAt)
+	}
+	if windows[1].Name != "weekly" || windows[1].WindowMinutes != 10080 || windows[1].UsedPercent == nil || *windows[1].UsedPercent != 24 {
+		t.Fatalf("secondary window = %+v", windows[1])
+	}
+	if windows[1].ResetsAt == nil || !windows[1].ResetsAt.Equal(time.Unix(resetSecondary, 0).UTC()) {
+		t.Fatalf("secondary resets_at = %v", windows[1].ResetsAt)
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("usage calls = %d, want 1", calls.Load())
+	}
+	_ = e.Quota()
+	if calls.Load() != 1 {
+		t.Fatalf("cached quota should not refetch, calls = %d", calls.Load())
+	}
+}
+
 func TestCodexQuotaTracking(t *testing.T) {
 	a := &auth.Auth{Email: "c@example.com", AccountID: "acc-1"}
 	e := &CodexEngine{auths: []*auth.Auth{a}, DefaultModel: "gpt-5.6-luna"}
@@ -215,5 +323,87 @@ func TestCodexQuotaTracking(t *testing.T) {
 	e.trackQuota(a, errors.New("usage_limit reached"))
 	if q = e.Quota(); q.Accounts[0].Status != "limited" {
 		t.Fatalf("expected limited account, got %+v", q.Accounts[0])
+	}
+}
+
+func TestCodexQuotaRateLimitWindows(t *testing.T) {
+	resetPrimary := time.Unix(1770000000, 0).UTC()
+	resetSecondary := time.Unix(1770500000, 0).UTC()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-codex-primary-used-percent", "62.5")
+		w.Header().Set("x-codex-primary-window-minutes", "300")
+		w.Header().Set("x-codex-primary-reset-at", "1770000000")
+		w.Header().Set("x-codex-secondary-used-percent", "18")
+		w.Header().Set("x-codex-secondary-window-minutes", "10080")
+		w.Header().Set("x-codex-secondary-reset-at", "1770500000")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+	}))
+	defer srv.Close()
+
+	a := &auth.Auth{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}
+	e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.BaseURL = srv.URL
+	req := &backend.ChatRequest{Model: "gpt-5-codex", Messages: []backend.ChatMessage{{Role: "user", Content: "hi"}}}
+	if _, err := e.Chat(context.Background(), req, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	windows := e.Quota().Accounts[0].Windows
+	if len(windows) != 2 {
+		t.Fatalf("windows = %+v", windows)
+	}
+	primary, secondary := windows[0], windows[1]
+	if primary.Name != "5h" || primary.WindowMinutes != 300 || primary.UsedPercent == nil || *primary.UsedPercent != 62.5 {
+		t.Fatalf("primary window = %+v", primary)
+	}
+	if primary.ResetsAt == nil || !primary.ResetsAt.Equal(resetPrimary) {
+		t.Fatalf("primary resets_at = %v, want %v", primary.ResetsAt, resetPrimary)
+	}
+	if secondary.Name != "weekly" || secondary.WindowMinutes != 10080 || secondary.UsedPercent == nil || *secondary.UsedPercent != 18 {
+		t.Fatalf("secondary window = %+v", secondary)
+	}
+	if secondary.ResetsAt == nil || !secondary.ResetsAt.Equal(resetSecondary) {
+		t.Fatalf("secondary resets_at = %v, want %v", secondary.ResetsAt, resetSecondary)
+	}
+}
+
+func TestCodexCheck(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
+			t.Errorf("authorization = %q", got)
+		}
+		calls.Add(1)
+		fmt.Fprint(w, `{"models":[{"id":"gpt-b"},{"slug":"gpt-a"}]}`)
+	}))
+	defer srv.Close()
+
+	e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{{Provider: "codex", AccessToken: "tok", Expiry: time.Now().Add(time.Hour)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.BaseURL = srv.URL
+	e.HTTP = srv.Client()
+
+	if _, err := e.Models(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	checks := e.Check(context.Background())
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (Check must bypass the Models cache)", calls.Load())
+	}
+	if len(checks) != 1 || checks[0].Err != nil {
+		t.Fatalf("checks = %+v", checks)
+	}
+	models := checks[0].Models
+	if len(models) != 2 || models[0].ID != "gpt-a" || models[1].ID != "gpt-b" {
+		t.Fatalf("models = %+v", models)
 	}
 }

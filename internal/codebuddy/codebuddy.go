@@ -70,6 +70,7 @@ type CodeBuddyEngine struct {
 
 	mu       sync.Mutex
 	auths    []*auth.Auth
+	cache    auth.AccountCache
 	next     int
 	models   []backend.Model
 	modelsAt time.Time
@@ -89,7 +90,7 @@ func NewCodeBuddyEngine(store auth.AuthStore, auths []*auth.Auth) (*CodeBuddyEng
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no codebuddy accounts")
 	}
-	return &CodeBuddyEngine{Store: store, HTTP: &http.Client{}, auths: auths}, nil
+	return &CodeBuddyEngine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "codebuddy")}, nil
 }
 
 func (e *CodeBuddyEngine) Default() string {
@@ -102,15 +103,24 @@ func (e *CodeBuddyEngine) Default() string {
 func (e *CodeBuddyEngine) count() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
 	return len(e.auths)
 }
 
 func (e *CodeBuddyEngine) pick() *auth.Auth {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
 	a := e.auths[e.next%len(e.auths)]
 	e.next++
 	return a
+}
+
+func (e *CodeBuddyEngine) snapshotAuths() []*auth.Auth {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
+	return append([]*auth.Auth(nil), e.auths...)
 }
 
 func (e *CodeBuddyEngine) trackQuota(a *auth.Auth, err error) {
@@ -170,50 +180,69 @@ func (e *CodeBuddyEngine) Models(ctx context.Context) ([]backend.Model, error) {
 	return models, nil
 }
 
-func (e *CodeBuddyEngine) fetchModels(ctx context.Context) ([]backend.Model, error) {
-	if e.HTTP == nil {
-		return nil, fmt.Errorf("no http client")
+// Check verifies each account against upstream.
+func (e *CodeBuddyEngine) Check(ctx context.Context) []backend.AccountCheck {
+	auths := e.snapshotAuths()
+	out := make([]backend.AccountCheck, 0, len(auths))
+	for _, a := range auths {
+		start := time.Now()
+		models, err := e.fetchModelsWith(ctx, a)
+		out = append(out, backend.AccountCheck{
+			Account:   a.Email,
+			AccountID: a.AccountID,
+			Models:    models,
+			Err:       err,
+			Latency:   time.Since(start),
+		})
 	}
+	return out
+}
+
+func (e *CodeBuddyEngine) fetchModels(ctx context.Context) ([]backend.Model, error) {
 	var lastErr error
 	for i, n := 0, e.count(); i < n; i++ {
 		a := e.pick()
-		req, err := http.NewRequestWithContext(ctx, "GET", e.apiBase()+"/v3/config", nil)
-		if err != nil {
-			return nil, err
+		models, err := e.fetchModelsWith(ctx, a)
+		if err == nil {
+			return models, nil
 		}
-		e.setModelHeaders(req, a)
-		resp, err := e.HTTP.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			lastErr = backend.APIHTTPError(resp)
-			resp.Body.Close()
-			continue
-		}
-		var cfg codebuddyConfig
-		err = json.NewDecoder(resp.Body).Decode(&cfg)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if cfg.Code != 0 {
-			lastErr = fmt.Errorf("codebuddy config: code %d %s", cfg.Code, strings.TrimSpace(cfg.Msg))
-			continue
-		}
-		models := cfg.cliModels()
-		if len(models) == 0 {
-			lastErr = fmt.Errorf("codebuddy config: no cli models")
-			continue
-		}
-		return models, nil
+		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no codebuddy accounts")
 	}
 	return nil, lastErr
+}
+
+func (e *CodeBuddyEngine) fetchModelsWith(ctx context.Context, a *auth.Auth) ([]backend.Model, error) {
+	if e.HTTP == nil {
+		return nil, fmt.Errorf("no http client")
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", e.apiBase()+"/v3/config", nil)
+	if err != nil {
+		return nil, err
+	}
+	e.setModelHeaders(req, a)
+	resp, err := e.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, backend.APIHTTPError(resp)
+	}
+	var cfg codebuddyConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return nil, err
+	}
+	if cfg.Code != 0 {
+		return nil, fmt.Errorf("codebuddy config: code %d %s", cfg.Code, strings.TrimSpace(cfg.Msg))
+	}
+	models := cfg.cliModels()
+	if len(models) == 0 {
+		return nil, fmt.Errorf("codebuddy config: no cli models")
+	}
+	return models, nil
 }
 
 func (e *CodeBuddyEngine) setModelHeaders(req *http.Request, a *auth.Auth) {

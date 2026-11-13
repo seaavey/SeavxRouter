@@ -8,18 +8,44 @@ import (
 	"time"
 
 	"seavxrouter/internal/backend"
+	"seavxrouter/internal/compress"
 )
 
 // Server exposes OpenAI-, Anthropic- and Responses-compatible HTTP endpoints
 // backed by a single backend.
 type Server struct {
-	backend backend.BackendAPI
-	apiKey  string
-	usage   *UsageStore
+	backend    backend.BackendAPI
+	apiKey     string
+	usage      *UsageStore
+	logs       *logBroker
+	compressor *compress.Engine
+	pricing    *Pricing
 }
 
-func NewServer(b backend.BackendAPI, apiKey string, usage *UsageStore) *Server {
-	return &Server{backend: b, apiKey: apiKey, usage: usage}
+// ServerOption customizes a Server built by NewServer.
+type ServerOption func(*Server)
+
+// WithCompression installs the tool-output compression engine.
+func WithCompression(e *compress.Engine) ServerOption {
+	return func(s *Server) { s.compressor = e }
+}
+
+// WithoutCompression disables compression entirely.
+func WithoutCompression() ServerOption {
+	return func(s *Server) { s.compressor = nil }
+}
+
+// WithPricing overrides the model price table used for cost tracking.
+func WithPricing(p *Pricing) ServerOption {
+	return func(s *Server) { s.pricing = p }
+}
+
+func NewServer(b backend.BackendAPI, apiKey string, usage *UsageStore, opts ...ServerOption) *Server {
+	s := &Server{backend: b, apiKey: apiKey, usage: usage, logs: newLogBroker(), compressor: compress.NewDefault(), pricing: DefaultPricing()}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler returns the HTTP router with all /v1 routes and API-key auth.
@@ -32,9 +58,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models/{id...}", s.auth(s.handleModel))
 	mux.HandleFunc("GET /v1/quota", s.auth(s.handleQuota))
 	mux.HandleFunc("GET /v1/usage", s.auth(s.handleUsage))
-	mux.HandleFunc("POST /v1/chat/completions", s.auth(s.handleChat))
-	mux.HandleFunc("POST /v1/messages", s.auth(s.handleAnthropicMessages))
-	mux.HandleFunc("POST /v1/responses", s.auth(s.handleResponses))
+	mux.HandleFunc("GET /v1/compression", s.auth(s.handleCompression))
+	mux.HandleFunc("GET /v1/logging", s.auth(s.handleLogging))
+	mux.HandleFunc("GET /v1/logging/stream", s.auth(s.handleLogStream))
+	mux.HandleFunc("GET /v1/logging/{id}", s.auth(s.handleLog))
+	mux.HandleFunc("POST /v1/chat/completions", s.auth(s.logged("chat", s.handleChat)))
+	mux.HandleFunc("POST /v1/messages", s.auth(s.logged("messages", s.handleAnthropicMessages)))
+	mux.HandleFunc("POST /v1/responses", s.auth(s.logged("responses", s.handleResponses)))
 	return mux
 }
 

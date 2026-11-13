@@ -49,6 +49,7 @@ type Engine struct {
 
 	mu       sync.Mutex
 	auths    []*auth.Auth
+	cache    auth.AccountCache
 	next     int
 	models   []backend.Model
 	modelsAt time.Time
@@ -56,8 +57,9 @@ type Engine struct {
 	sigMu sync.Mutex
 	sigs  map[string]string
 
-	quotaMu  sync.Mutex
-	quotaErr map[*auth.Auth]time.Time
+	quotaMu   sync.Mutex
+	quotaErr  map[*auth.Auth]time.Time
+	quotaLive map[*auth.Auth]liveQuota
 }
 
 func (e *Engine) Default() string { return e.DefaultModel }
@@ -89,21 +91,30 @@ func NewEngine(store auth.AuthStore, baseURL string, auths []*auth.Auth) (*Engin
 	if baseURL == "" {
 		baseURL = DefaultAPIBase
 	}
-	return &Engine{Store: store, BaseURL: baseURL, HTTP: &http.Client{}, auths: auths}, nil
+	return &Engine{Store: store, BaseURL: baseURL, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "antigravity")}, nil
 }
 
 func (e *Engine) count() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
 	return len(e.auths)
 }
 
 func (e *Engine) pick() *auth.Auth {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
 	a := e.auths[e.next%len(e.auths)]
 	e.next++
 	return a
+}
+
+func (e *Engine) snapshotAuths() []*auth.Auth {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
+	return append([]*auth.Auth(nil), e.auths...)
 }
 
 // Login runs the loopback OAuth flow and adds the account to the store.
@@ -399,29 +410,71 @@ func (e *Engine) postWith(ctx context.Context, a *auth.Auth, method string, data
 func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
 	e.mu.Lock()
 	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
-		defer e.mu.Unlock()
-		return e.models, nil
+		models := e.models
+		e.mu.Unlock()
+		return models, nil
 	}
 	e.mu.Unlock()
 
-	var data struct {
-		Models map[string]json.RawMessage `json:"models"`
+	models, err := e.fetchModels(ctx)
+	if err != nil {
+		return nil, err
 	}
+	e.mu.Lock()
+	e.models = models
+	e.modelsAt = time.Now()
+	e.mu.Unlock()
+	return models, nil
+}
+
+// Check verifies each account against upstream, bypassing the Models cache.
+func (e *Engine) Check(ctx context.Context) []backend.AccountCheck {
+	auths := e.snapshotAuths()
+	out := make([]backend.AccountCheck, 0, len(auths))
+	for _, a := range auths {
+		start := time.Now()
+		models, err := e.modelsWith(ctx, a)
+		e.trackQuota(a, err)
+		out = append(out, backend.AccountCheck{
+			Account:   a.Email,
+			AccountID: a.AccountID,
+			Models:    models,
+			Err:       err,
+			Latency:   time.Since(start),
+		})
+	}
+	return out
+}
+
+func (e *Engine) fetchModels(ctx context.Context) ([]backend.Model, error) {
+	var data agyModels
 	if err := e.apiPost(ctx, "fetchAvailableModels", map[string]any{}, &data); err != nil {
 		return nil, err
 	}
-	models := make([]backend.Model, 0, len(data.Models))
-	for id := range data.Models {
+	return data.list()
+}
+
+func (e *Engine) modelsWith(ctx context.Context, a *auth.Auth) ([]backend.Model, error) {
+	var data agyModels
+	if err := e.postWith(ctx, a, "fetchAvailableModels", []byte("{}"), &data); err != nil {
+		return nil, err
+	}
+	return data.list()
+}
+
+type agyModels struct {
+	Models map[string]json.RawMessage `json:"models"`
+}
+
+func (m agyModels) list() ([]backend.Model, error) {
+	models := make([]backend.Model, 0, len(m.Models))
+	for id := range m.Models {
 		models = append(models, backend.Model{ID: id, Name: id})
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	if len(models) == 0 {
 		return nil, fmt.Errorf("fetchAvailableModels returned no models")
 	}
-	e.mu.Lock()
-	e.models = models
-	e.modelsAt = time.Now()
-	e.mu.Unlock()
 	return models, nil
 }
 

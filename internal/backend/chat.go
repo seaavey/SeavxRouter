@@ -69,6 +69,7 @@ type ChatRequest struct {
 	Stream      bool             `json:"stream"`
 	Temperature *float64         `json:"temperature,omitempty"`
 	MaxTokens   *int             `json:"max_tokens,omitempty"`
+	ServiceTier string           `json:"service_tier,omitempty"`
 }
 
 // ChatDelta is one incremental update emitted while streaming a chat response.

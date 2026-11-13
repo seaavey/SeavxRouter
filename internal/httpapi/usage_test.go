@@ -1,13 +1,17 @@
 package httpapi
 
 import (
+	"database/sql"
 	"encoding/json"
+	"math"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"seavxrouter/internal/backend"
+	"seavxrouter/internal/compress"
 )
 
 func newTestUsageStore(t *testing.T) *UsageStore {
@@ -167,6 +171,92 @@ func TestUsageUserAttribution(t *testing.T) {
 	}
 }
 
+func TestUsageStoreCostTotals(t *testing.T) {
+	store := newTestUsageStore(t)
+	entries := []UsageEntry{
+		{TS: "2026-11-12T09:00:00Z", Provider: "codex", Model: "gpt-x", Endpoint: "chat", User: "alice", PromptTokens: 1, TotalTokens: 1, CostUSD: 0.5},
+		{TS: "2026-11-12T10:00:00Z", Provider: "codex", Model: "gpt-x", Endpoint: "chat", User: "alice", PromptTokens: 1, TotalTokens: 1, CostUSD: 0.25},
+	}
+	for _, e := range entries {
+		if err := store.Record(e); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	totals, groups, err := store.Query(UsageFilter{GroupBy: "user"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !approx(totals.CostUSD, 0.75) {
+		t.Fatalf("totals cost = %v", totals.CostUSD)
+	}
+	if len(groups) != 1 || !approx(groups[0].CostUSD, 0.75) {
+		t.Fatalf("groups = %+v", groups)
+	}
+}
+
+func TestUsageStoreMigratesCostColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE usage (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts TEXT NOT NULL,
+		provider TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '',
+		endpoint TEXT NOT NULL DEFAULT '',
+		user TEXT NOT NULL DEFAULT '',
+		prompt_tokens INTEGER NOT NULL DEFAULT 0,
+		completion_tokens INTEGER NOT NULL DEFAULT 0,
+		thinking_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	store, err := OpenUsageStore(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.Record(UsageEntry{TS: "2026-11-12T10:00:00Z", CostUSD: 0.42}); err != nil {
+		t.Fatalf("Record after migration: %v", err)
+	}
+	totals, _, err := store.Query(UsageFilter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !approx(totals.CostUSD, 0.42) {
+		t.Fatalf("cost = %v", totals.CostUSD)
+	}
+}
+
+func TestUsageCostRecordedViaHandleChat(t *testing.T) {
+	store := newTestUsageStore(t)
+	stub := &chatStub{result: &backend.ChatResult{
+		Content:      "hi",
+		FinishReason: "stop",
+		Usage:        backend.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000, TotalTokens: 2_000_000},
+	}}
+	s := &Server{backend: stub, usage: store, pricing: DefaultPricing()}
+	body := `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`
+	w := httptest.NewRecorder()
+	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	totals, _, err := store.Query(UsageFilter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if math.Abs(totals.CostUSD-18) > 1e-9 {
+		t.Fatalf("cost = %v, want 18", totals.CostUSD)
+	}
+}
+
 func TestUsageRecordedViaStreamingChat(t *testing.T) {
 	store := newTestUsageStore(t)
 	stub := &chatStub{
@@ -195,5 +285,74 @@ func TestUsageRecordedViaStreamingChat(t *testing.T) {
 	}
 	if len(groups) != 1 || groups[0].Key != "chat" {
 		t.Fatalf("groups = %+v", groups)
+	}
+}
+
+func TestUsageStoreCompressionTotals(t *testing.T) {
+	store := newTestUsageStore(t)
+	entries := []CompressionEntry{
+		{TS: "2026-11-12T09:00:00Z", Endpoint: "chat", ToolResults: 3, Compressed: 2, BytesBefore: 1000, BytesAfter: 200},
+		{TS: "2026-11-13T09:00:00Z", Endpoint: "messages", ToolResults: 1, Compressed: 1, BytesBefore: 500, BytesAfter: 100},
+	}
+	for _, e := range entries {
+		if err := store.RecordCompression(e); err != nil {
+			t.Fatalf("RecordCompression: %v", err)
+		}
+	}
+
+	all, err := store.QueryCompressionTotals(nil)
+	if err != nil {
+		t.Fatalf("QueryCompressionTotals: %v", err)
+	}
+	if all.Events != 2 || all.ToolResults != 4 || all.Compressed != 3 {
+		t.Fatalf("counts = %+v", all)
+	}
+	if all.BytesBefore != 1500 || all.BytesAfter != 300 || all.BytesSaved != 1200 {
+		t.Fatalf("bytes = %+v", all)
+	}
+	if all.EstTokensSaved != 300 || !approx(all.SavedPercent, 80) {
+		t.Fatalf("derived = %+v", all)
+	}
+
+	start := time.Date(2026, 11, 13, 0, 0, 0, 0, time.UTC)
+	today, err := store.QueryCompressionTotals(&start)
+	if err != nil {
+		t.Fatalf("QueryCompressionTotals today: %v", err)
+	}
+	if today.Events != 1 || today.ToolResults != 1 || today.BytesBefore != 500 {
+		t.Fatalf("today = %+v", today)
+	}
+}
+
+func TestCompressionRecordedViaHandleChat(t *testing.T) {
+	store := newTestUsageStore(t)
+	stub := &chatStub{result: &backend.ChatResult{Content: "ok", FinishReason: "stop"}}
+	s := &Server{backend: stub, usage: store, compressor: compress.NewDefault()}
+
+	w := httptest.NewRecorder()
+	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(compressionChatBody()))))
+	if w.Code != 200 {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	totals, err := store.QueryCompressionTotals(nil)
+	if err != nil {
+		t.Fatalf("QueryCompressionTotals: %v", err)
+	}
+	if totals.Events != 1 || totals.Compressed != 1 || totals.BytesBefore == 0 || totals.BytesSaved <= 0 {
+		t.Fatalf("compression totals = %+v", totals)
+	}
+
+	// Requests without compressed tool results are not recorded.
+	w = httptest.NewRecorder()
+	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)))
+	if w.Code != 200 {
+		t.Fatalf("plain status = %d", w.Code)
+	}
+	after, err := store.QueryCompressionTotals(nil)
+	if err != nil {
+		t.Fatalf("QueryCompressionTotals: %v", err)
+	}
+	if after.Events != 1 {
+		t.Fatalf("unexpected compression event for plain request: %+v", after)
 	}
 }

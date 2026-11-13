@@ -265,6 +265,7 @@ type chatRequest struct {
 	Stream      bool         `json:"stream"`
 	Temperature *float64     `json:"temperature"`
 	MaxTokens   *int         `json:"max_tokens"`
+	ServiceTier string       `json:"service_tier"`
 
 	MaxCompletionTokens *int `json:"max_completion_tokens"`
 	StreamOptions       *struct {
@@ -284,6 +285,7 @@ func buildChatRequest(req chatRequest, model string) (*backend.ChatRequest, erro
 		ToolChoice:  req.ToolChoice,
 		Temperature: req.Temperature,
 		MaxTokens:   maxTokens,
+		ServiceTier: req.ServiceTier,
 	}
 	toolNames := map[string]string{}
 	for _, m := range req.Messages {
@@ -346,6 +348,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	s.applyCompression(cr, "chat")
 	created := time.Now().Unix()
 	id := backend.NewID("chatcmpl-")
 
@@ -355,7 +358,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
-		s.recordUsage(r, "chat", model, result.Usage)
+		s.recordResult(r, "chat", model, result)
 		var content any = strings.TrimRight(result.Content, "\n")
 		finish := result.FinishReason
 		if finish == "" {
@@ -438,7 +441,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	s.recordUsage(r, "chat", model, result.Usage)
+	s.recordResult(r, "chat", model, result)
 	finish := result.FinishReason
 	if finish == "" {
 		finish = "stop"
@@ -460,7 +463,42 @@ type responsesRequest struct {
 	Model        string          `json:"model"`
 	Input        json.RawMessage `json:"input"`
 	Instructions string          `json:"instructions"`
+	ServiceTier  string          `json:"service_tier"`
 	Stream       bool            `json:"stream"`
+}
+
+type responsesInputItem struct {
+	Type      string          `json:"type"`
+	Role      string          `json:"role"`
+	Content   json.RawMessage `json:"content"`
+	CallID    string          `json:"call_id"`
+	Name      string          `json:"name"`
+	Arguments string          `json:"arguments"`
+	Output    json.RawMessage `json:"output"`
+}
+
+// parseResponsesOutput renders a function_call_output payload as text. The
+// common form is a string; content-part arrays are concatenated.
+func parseResponsesOutput(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return string(raw)
 }
 
 func parseResponsesInput(raw json.RawMessage) ([]backend.ChatMessage, error) {
@@ -471,24 +509,37 @@ func parseResponsesInput(raw json.RawMessage) ([]backend.ChatMessage, error) {
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return []backend.ChatMessage{{Role: "user", Content: s}}, nil
 	}
-	var items []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}
+	var items []responsesInputItem
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, &apiError{http.StatusBadRequest, "input must be a string or an array of messages", "invalid_request_error", "invalid_input"}
 	}
 	msgs := make([]backend.ChatMessage, 0, len(items))
 	for _, it := range items {
-		text, images, err := parseContent(it.Content)
-		if err != nil {
-			return nil, err
+		switch it.Type {
+		case "function_call":
+			args := it.Arguments
+			if args == "" {
+				args = "{}"
+			}
+			call := backend.ToolCall{ID: it.CallID, Type: "function", Name: it.Name, Arguments: args}
+			if n := len(msgs); n > 0 && msgs[n-1].Role == "assistant" && len(msgs[n-1].Images) == 0 {
+				msgs[n-1].ToolCalls = append(msgs[n-1].ToolCalls, call)
+				continue
+			}
+			msgs = append(msgs, backend.ChatMessage{Role: "assistant", ToolCalls: []backend.ToolCall{call}})
+		case "function_call_output":
+			msgs = append(msgs, backend.ChatMessage{Role: "tool", ToolCallID: it.CallID, Content: parseResponsesOutput(it.Output)})
+		default:
+			text, images, err := parseContent(it.Content)
+			if err != nil {
+				return nil, err
+			}
+			role := it.Role
+			if role == "" {
+				role = "user"
+			}
+			msgs = append(msgs, backend.ChatMessage{Role: role, Content: text, Images: images})
 		}
-		role := it.Role
-		if role == "" {
-			role = "user"
-		}
-		msgs = append(msgs, backend.ChatMessage{Role: role, Content: text, Images: images})
 	}
 	return msgs, nil
 }
@@ -547,7 +598,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if req.Instructions != "" {
 		msgs = append([]backend.ChatMessage{{Role: "system", Content: req.Instructions}}, msgs...)
 	}
-	cr := &backend.ChatRequest{Model: model, Messages: msgs, Stream: req.Stream}
+	cr := &backend.ChatRequest{Model: model, Messages: msgs, Stream: req.Stream, ServiceTier: req.ServiceTier}
+	s.applyCompression(cr, "responses")
 	id := backend.NewID("resp_")
 
 	if !req.Stream {
@@ -556,7 +608,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
-		s.recordUsage(r, "responses", model, result.Usage)
+		s.recordResult(r, "responses", model, result)
 		text := strings.TrimRight(result.Content, "\n")
 		writeJSON(w, responseObject(id, model, "completed", []responsesOutput{newResponsesOutput(text, "completed")}, responsesUsage(result.Usage)))
 		return
@@ -596,7 +648,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		send("response.failed", map[string]any{"response": responseObject(id, model, "failed", []responsesOutput{}, nil)})
 		return
 	}
-	s.recordUsage(r, "responses", model, result.Usage)
+	s.recordResult(r, "responses", model, result)
 
 	text := strings.TrimRight(full.String(), "\n")
 	done := newResponsesOutput(text, "completed")

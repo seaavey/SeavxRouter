@@ -283,6 +283,35 @@ func TestStreamUsageOptIn(t *testing.T) {
 	}
 }
 
+func TestBuildChatRequestServiceTier(t *testing.T) {
+	var req chatRequest
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"service_tier":"fast"}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatal(err)
+	}
+	cr, err := buildChatRequest(req, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cr.ServiceTier != "fast" {
+		t.Fatalf("service_tier = %q", cr.ServiceTier)
+	}
+}
+
+func TestResponsesServiceTier(t *testing.T) {
+	stub := &chatStub{result: &backend.ChatResult{Content: "ok", FinishReason: "stop"}}
+	s := &Server{backend: stub}
+	body := `{"model":"m","input":"hi","service_tier":"priority"}`
+	w := httptest.NewRecorder()
+	s.handleResponses(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("code %d body %s", w.Code, w.Body.String())
+	}
+	if stub.gotReq == nil || stub.gotReq.ServiceTier != "priority" {
+		t.Fatalf("service_tier not forwarded: %+v", stub.gotReq)
+	}
+}
+
 func TestHandleModel(t *testing.T) {
 	s := &Server{backend: &chatStub{hasNoModel: "missing"}}
 

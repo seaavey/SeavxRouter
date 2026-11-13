@@ -41,12 +41,14 @@ type CodexEngine struct {
 
 	mu       sync.Mutex
 	auths    []*auth.Auth
+	cache    auth.AccountCache
 	next     int
 	models   []backend.Model
 	modelsAt time.Time
 
-	quotaMu  sync.Mutex
-	quotaErr map[*auth.Auth]time.Time
+	quotaMu    sync.Mutex
+	quotaErr   map[*auth.Auth]time.Time
+	rateLimits map[*auth.Auth]*rateLimitSnapshot
 }
 
 func (e *CodexEngine) apiBase() string {
@@ -60,7 +62,7 @@ func NewCodexEngine(store auth.AuthStore, auths []*auth.Auth) (*CodexEngine, err
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no codex accounts")
 	}
-	return &CodexEngine{Store: store, HTTP: &http.Client{}, auths: auths}, nil
+	return &CodexEngine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "codex")}, nil
 }
 
 func (e *CodexEngine) Default() string { return e.DefaultModel }
@@ -68,15 +70,24 @@ func (e *CodexEngine) Default() string { return e.DefaultModel }
 func (e *CodexEngine) count() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
 	return len(e.auths)
 }
 
 func (e *CodexEngine) pick() *auth.Auth {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
 	a := e.auths[e.next%len(e.auths)]
 	e.next++
 	return a
+}
+
+func (e *CodexEngine) snapshotAuths() []*auth.Auth {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.auths = e.cache.Refresh(e.auths)
+	return append([]*auth.Auth(nil), e.auths...)
 }
 
 // trackQuota records the latest request outcome per account so /v1/quota can
@@ -317,21 +328,49 @@ func (e *CodexEngine) setHeaders(req *http.Request, token string, a *auth.Auth, 
 func (e *CodexEngine) Models(ctx context.Context) ([]backend.Model, error) {
 	e.mu.Lock()
 	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
-		defer e.mu.Unlock()
-		return e.models, nil
+		models := e.models
+		e.mu.Unlock()
+		return models, nil
 	}
 	e.mu.Unlock()
 
+	models, err := e.fetchModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	e.models = models
+	e.modelsAt = time.Now()
+	e.mu.Unlock()
+	return models, nil
+}
+
+// Check verifies each account against upstream, bypassing the Models cache.
+func (e *CodexEngine) Check(ctx context.Context) []backend.AccountCheck {
+	auths := e.snapshotAuths()
+	out := make([]backend.AccountCheck, 0, len(auths))
+	for _, a := range auths {
+		start := time.Now()
+		models, err := e.modelsWith(ctx, a)
+		e.trackQuota(a, err)
+		out = append(out, backend.AccountCheck{
+			Account:   a.Email,
+			AccountID: a.AccountID,
+			Models:    models,
+			Err:       err,
+			Latency:   time.Since(start),
+		})
+	}
+	return out
+}
+
+func (e *CodexEngine) fetchModels(ctx context.Context) ([]backend.Model, error) {
 	var lastErr error
 	for i, n := 0, e.count(); i < n; i++ {
 		a := e.pick()
 		models, err := e.modelsWith(ctx, a)
 		e.trackQuota(a, err)
 		if err == nil {
-			e.mu.Lock()
-			e.models = models
-			e.modelsAt = time.Now()
-			e.mu.Unlock()
 			return models, nil
 		}
 		lastErr = err
@@ -347,7 +386,7 @@ func (e *CodexEngine) modelsWith(ctx context.Context, a *auth.Auth) ([]backend.M
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", codexAPIBase+"/models?client_version="+codexVersion, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", e.apiBase()+"/models?client_version="+codexVersion, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -357,6 +396,7 @@ func (e *CodexEngine) modelsWith(ctx context.Context, a *auth.Auth) ([]backend.M
 		return nil, err
 	}
 	defer resp.Body.Close()
+	e.recordRateLimits(a, resp.Header)
 	if resp.StatusCode != http.StatusOK {
 		return nil, backend.APIHTTPError(resp)
 	}
@@ -439,6 +479,9 @@ func (e *CodexEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelt
 	if req.MaxTokens != nil {
 		payload["max_output_tokens"] = *req.MaxTokens
 	}
+	if tier := codexServiceTier(req.ServiceTier); tier != "" {
+		payload["service_tier"] = tier
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -458,6 +501,17 @@ func (e *CodexEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelt
 		slog.Warn("codex account quota exhausted, trying next", "email", a.Email)
 	}
 	return nil, lastErr
+}
+
+// codexServiceTier maps request tier aliases to the service tier IDs accepted
+// by the Codex backend; "fast" is the Codex CLI's label for the priority tier
+// and is the default when the request does not pick a tier.
+func codexServiceTier(tier string) string {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "", "fast", "priority":
+		return "priority"
+	}
+	return ""
 }
 
 // codexChatInput translates unified messages into the Responses API instructions
@@ -580,6 +634,7 @@ func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []b
 		if err != nil {
 			return nil, started, err
 		}
+		e.recordRateLimits(a, resp.Header)
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
 			resp.Body.Close()
 			e.mu.Lock()
@@ -747,6 +802,7 @@ func (e *CodexEngine) streamOnce(ctx context.Context, a *auth.Auth, data []byte,
 		if err != nil {
 			return nil, started, err
 		}
+		e.recordRateLimits(a, resp.Header)
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
 			resp.Body.Close()
 			e.mu.Lock()
