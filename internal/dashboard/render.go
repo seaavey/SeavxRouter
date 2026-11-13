@@ -422,16 +422,16 @@ func humanCount(n int64) string {
 	case n < 1000:
 		return strconv.FormatInt(n, 10)
 	case n < 1_000_000:
-		return scaledCount(n, 1e3) + "k"
+		return scaledCount(n, 1e3) + "K"
 	case n < 1_000_000_000:
-		return scaledCount(n, 1e6) + "m"
+		return scaledCount(n, 1e6) + "M"
 	default:
-		return scaledCount(n, 1e9) + "b"
+		return scaledCount(n, 1e9) + "B"
 	}
 }
 
 // scaledCount renders n/div with three decimals and a comma separator,
-// e.g. 2700 -> "2,700k".
+// e.g. 2700 -> "2,700K".
 func scaledCount(n int64, div float64) string {
 	return strings.Replace(strconv.FormatFloat(float64(n)/div, 'f', 3, 64), ".", ",", 1)
 }
