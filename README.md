@@ -138,8 +138,35 @@ ID, and the `completions` package converts between wire formats.
 ## Requirements
 
 - Go **1.27** or newer to build from source.
-- Linux, macOS, or Windows.
+- Linux (including Termux on Android), macOS, Windows, or FreeBSD.
 - Provider accounts and credentials that you are authorized to use.
+
+## Install a prebuilt binary
+
+Every release ships static binaries (`CGO_ENABLED=0`) with a
+`checksums.txt` file:
+
+| Platform | Architectures |
+| --- | --- |
+| Linux / Termux | amd64, arm64, armv7, 386, riscv64 |
+| macOS | amd64, arm64 |
+| Windows | amd64, arm64, 386 |
+| FreeBSD | amd64, arm64 |
+
+Download the file for your platform from
+[Releases](https://github.com/seaavey/SeavxRouter/releases/latest):
+
+```bash
+# Linux x86_64
+curl -fsSL -o seavxrouter \
+  https://github.com/seaavey/SeavxRouter/releases/latest/download/seavxrouter-linux-amd64
+chmod +x seavxrouter
+./seavxrouter -h
+```
+
+Termux on Android arm64 uses `seavxrouter-linux-arm64`; older 32-bit ARM
+devices use `seavxrouter-linux-armv7`. On Windows, download
+`seavxrouter-windows-amd64.exe` (or the arm64/386 variant).
 
 ## Quick start
 

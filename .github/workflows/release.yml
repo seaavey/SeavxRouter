@@ -13,8 +13,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
+        include:
+          - { goos: linux,   goarch: amd64,   suffix: linux-amd64 }
+          - { goos: linux,   goarch: arm64,   suffix: linux-arm64 }
+          - { goos: linux,   goarch: arm,     goarm: "7", suffix: linux-armv7 }
+          - { goos: linux,   goarch: "386",   suffix: linux-386 }
+          - { goos: linux,   goarch: riscv64, suffix: linux-riscv64 }
+          - { goos: darwin,  goarch: amd64,   suffix: darwin-amd64 }
+          - { goos: darwin,  goarch: arm64,   suffix: darwin-arm64 }
+          - { goos: windows, goarch: amd64,   suffix: windows-amd64 }
+          - { goos: windows, goarch: arm64,   suffix: windows-arm64 }
+          - { goos: windows, goarch: "386",   suffix: windows-386 }
+          - { goos: freebsd, goarch: amd64,   suffix: freebsd-amd64 }
+          - { goos: freebsd, goarch: arm64,   suffix: freebsd-arm64 }
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -31,15 +42,18 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
+          if [ -n "${{ matrix.goarm }}" ]; then
+            export GOARM="${{ matrix.goarm }}"
+          fi
           ext=""
           if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/seavxrouter-${GOOS}-${GOARCH}${ext}" .
+          go build -trimpath -ldflags="-s -w" -o "dist/seavxrouter-${{ matrix.suffix }}${ext}" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: seavxrouter-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: seavxrouter-${{ matrix.suffix }}
           path: dist/*
           if-no-files-found: error
 
@@ -66,6 +80,7 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
