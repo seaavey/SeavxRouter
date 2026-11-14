@@ -6,6 +6,7 @@ SeavxRouter is a single Go binary that authenticates against the providers you
 already use, exposes their models through standard API shapes, rotates across
 accounts, tracks token usage and cost, and ships with a live terminal dashboard.
 
+[![CI](https://github.com/seaavey/SeavxRouter/actions/workflows/ci.yml/badge.svg)](https://github.com/seaavey/SeavxRouter/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Status](https://img.shields.io/badge/status-experimental-orange)

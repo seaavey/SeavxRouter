@@ -103,6 +103,13 @@ per commit.
 - [ ] No credentials, personal data, or generated binaries included.
 - [ ] The PR description explains the problem and the approach.
 
+## CI and releases
+
+Every push to `main` and every pull request runs `gofmt`, `go vet`, the test
+suite with the race detector, and a cross-build for Linux, macOS, and Windows.
+Pushing a tag that matches `v*` builds release binaries for amd64 and arm64,
+generates SHA-256 checksums, and publishes a GitHub Release.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the
