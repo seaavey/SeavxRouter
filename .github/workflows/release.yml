@@ -17,10 +17,10 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -37,7 +37,7 @@ jobs:
           go build -trimpath -ldflags="-s -w" -o "dist/seavxrouter-${GOOS}-${GOARCH}${ext}" .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: seavxrouter-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
@@ -55,7 +55,7 @@ jobs:
           fi
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
