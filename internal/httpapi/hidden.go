@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"seavxrouter/internal/backend"
+	"seavxrouter/internal/completions"
 )
 
 // hiddenModelsFile returns the path of the hidden-model list, next to the
@@ -187,4 +188,14 @@ func (h *hiddenBackend) HasModel(ctx context.Context, id string) bool {
 		return false
 	}
 	return h.BackendAPI.HasModel(ctx, id)
+}
+
+// Provider preserves provider attribution: embedding the BackendAPI interface
+// does not promote Provider, and without this the HTTP layer falls back to the
+// default owner for every model.
+func (h *hiddenBackend) Provider(ctx context.Context, model string) string {
+	if pn, ok := h.BackendAPI.(completions.ProviderNamer); ok {
+		return pn.Provider(ctx, model)
+	}
+	return ""
 }

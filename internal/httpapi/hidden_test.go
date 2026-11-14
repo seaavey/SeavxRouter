@@ -92,3 +92,22 @@ type catalogStub struct {
 }
 
 func (c *catalogStub) Models(context.Context) ([]backend.Model, error) { return c.models, nil }
+
+// providerStub also names the provider serving each model.
+type providerStub struct{ catalogStub }
+
+func (p *providerStub) Provider(context.Context, string) string { return "codex" }
+
+func TestHiddenWrapperPreservesProviderAttribution(t *testing.T) {
+	h := NewHiddenModels(filepath.Join(t.TempDir(), "nope.txt"))
+	wrapped := WithHiddenModels(&providerStub{}, h)
+	pn, ok := wrapped.(interface {
+		Provider(context.Context, string) string
+	})
+	if !ok {
+		t.Fatal("wrapping dropped provider attribution")
+	}
+	if got := pn.Provider(context.Background(), "gpt-6-sol"); got != "codex" {
+		t.Fatalf("provider = %q, want codex", got)
+	}
+}
