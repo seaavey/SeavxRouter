@@ -155,6 +155,81 @@ func TestChatFailsOverOnQuotaError(t *testing.T) {
 	}
 }
 
+func TestChatFailsOverOnBillingCap(t *testing.T) {
+	qoder := &fakeBackend{
+		models: map[string]bool{"DeepSeek-Flash": true},
+		errs:   []error{errors.New("qoder HTTP 403: Billing daily count exceeded")},
+	}
+	verboo := &fakeBackend{models: map[string]bool{"DeepSeek-Flash": true}}
+	m := &MultiBackend{Qoder: qoder, Verboo: verboo}
+	res, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "qoder/DeepSeek-Flash"}, nil)
+	if err != nil {
+		t.Fatalf("failover failed: %v", err)
+	}
+	if res.Content != "ok" {
+		t.Fatalf("result = %+v", res)
+	}
+	if qoder.calls != 1 || verboo.calls != 1 {
+		t.Fatalf("calls: qoder=%d verboo=%d", qoder.calls, verboo.calls)
+	}
+	if verboo.lastModel != "DeepSeek-Flash" {
+		t.Fatalf("fallback model = %q", verboo.lastModel)
+	}
+}
+
+func TestChatFallsBackToProviderDefaultOnQuota(t *testing.T) {
+	qoder := &fakeBackend{
+		models: map[string]bool{"DeepSeek-Flash": true},
+		errs:   []error{errors.New("qoder HTTP 403: Billing daily count exceeded")},
+	}
+	// verboo names its DeepSeek model differently, so the same-ID pass finds
+	// nothing; the last-resort pass must use verboo's default model instead.
+	verboo := &fakeBackend{models: map[string]bool{"deepseek-v4.1-flash": true}, def: "deepseek-v4.1-flash"}
+	m := &MultiBackend{Qoder: qoder, Verboo: verboo}
+	res, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "qoder/DeepSeek-Flash"}, nil)
+	if err != nil {
+		t.Fatalf("last-resort fallback failed: %v", err)
+	}
+	if res.Content != "ok" {
+		t.Fatalf("result = %+v", res)
+	}
+	if qoder.calls != 1 || verboo.calls != 1 {
+		t.Fatalf("calls: qoder=%d verboo=%d", qoder.calls, verboo.calls)
+	}
+	if verboo.lastModel != "deepseek-v4.1-flash" {
+		t.Fatalf("fallback model = %q", verboo.lastModel)
+	}
+}
+
+func TestChatLastResortRetriesProviderThatRejectedModel(t *testing.T) {
+	// antigravity's HasModel is fail-open, so it claims DeepSeek-Flash and then
+	// rejects it with a non-retryable 400; the last-resort pass must still try
+	// its own default model.
+	agy := &fakeBackend{
+		models: map[string]bool{"DeepSeek-Flash": true},
+		def:    "gemini-3.8-flash-high",
+		errs:   []error{errors.New("400 Bad Request: Request contains an invalid argument.")},
+	}
+	qoder := &fakeBackend{
+		models: map[string]bool{"DeepSeek-Flash": true},
+		errs:   []error{errors.New("qoder HTTP 403: Billing daily count exceeded")},
+	}
+	m := &MultiBackend{Antigravity: agy, Qoder: qoder}
+	res, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "qoder/DeepSeek-Flash"}, nil)
+	if err != nil {
+		t.Fatalf("last-resort fallback failed: %v", err)
+	}
+	if res.Content != "ok" {
+		t.Fatalf("result = %+v", res)
+	}
+	if agy.calls != 2 || qoder.calls != 1 {
+		t.Fatalf("calls: antigravity=%d qoder=%d", agy.calls, qoder.calls)
+	}
+	if agy.lastModel != "gemini-3.8-flash-high" {
+		t.Fatalf("default model = %q", agy.lastModel)
+	}
+}
+
 func TestChatNoRetryAfterOutput(t *testing.T) {
 	old := retryBackoff
 	retryBackoff = 0
@@ -188,8 +263,17 @@ func TestChatNoFallbackOnNonRetryableError(t *testing.T) {
 }
 
 func TestChatFallbackRequiresMatchingModel(t *testing.T) {
-	agy := &fakeBackend{models: map[string]bool{"claude-sonnet-4-6": true}, errs: []error{errors.New("429 rate limit exceeded")}}
-	codex := &fakeBackend{models: map[string]bool{}}
+	old := retryBackoff
+	retryBackoff = 0
+	defer func() { retryBackoff = old }()
+
+	// Transient failures only fail over to a provider serving the same model;
+	// the last-resort default model is reserved for quota/auth-dead providers.
+	agy := &fakeBackend{
+		models: map[string]bool{"claude-sonnet-4-6": true},
+		errs:   []error{errors.New("503 Service Unavailable"), errors.New("503 Service Unavailable")},
+	}
+	codex := &fakeBackend{models: map[string]bool{}, def: "gpt-5.1-codex"}
 	m := &MultiBackend{Antigravity: agy, Codex: codex}
 	if _, err := m.Chat(context.Background(), &backend.ChatRequest{Model: "antigravity/claude-sonnet-4-6"}, nil); err == nil {
 		t.Fatal("expected error")

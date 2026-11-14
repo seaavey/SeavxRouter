@@ -1,4 +1,4 @@
-package httpapi
+package completions
 
 import (
 	"encoding/json"
@@ -20,7 +20,7 @@ func TestAnthropicMessages(t *testing.T) {
 		s := &Server{backend: stub}
 		body := `{"model":"m","max_tokens":1024,"system":"You are helpful.","messages":[{"role":"user","content":"weather?"}],"tools":[{"name":"get_weather","description":"d","input_schema":{"type":"object"}}]}`
 		w := httptest.NewRecorder()
-		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		s.HandleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -80,7 +80,7 @@ func TestAnthropicMessages(t *testing.T) {
 		s := &Server{backend: stub}
 		body := `{"model":"m","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
 		w := httptest.NewRecorder()
-		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		s.HandleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
 
 		var events, blockStartTypes []string
 		var sawTextDelta, sawInputJSONDelta bool
@@ -156,7 +156,7 @@ func TestAnthropicMessages(t *testing.T) {
 			`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + testPNGB64 + `"}},` +
 			`{"type":"text","text":"what color?"}]}]}`
 		w := httptest.NewRecorder()
-		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		s.HandleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -178,7 +178,7 @@ func TestAnthropicMessages(t *testing.T) {
 			`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}]}]}` +
 			`]}`
 		w := httptest.NewRecorder()
-		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		s.HandleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -199,7 +199,7 @@ func TestAnthropicMessages(t *testing.T) {
 		body := `{"model":"m","max_tokens":64,"messages":[{"role":"user","content":[` +
 			`{"type":"image","source":{"type":"file","file_id":"f1"}}]}]}`
 		w := httptest.NewRecorder()
-		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		s.HandleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
 		if w.Code != 400 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -217,7 +217,7 @@ func TestAnthropicMessages(t *testing.T) {
 			`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"}]}` +
 			`]}`
 		w := httptest.NewRecorder()
-		s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		s.HandleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}

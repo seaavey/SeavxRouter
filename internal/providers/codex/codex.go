@@ -309,12 +309,15 @@ func (e *CodexEngine) token(ctx context.Context, a *auth.Auth) (string, error) {
 	return a.AccessToken, nil
 }
 
-func (e *CodexEngine) setHeaders(req *http.Request, token string, a *auth.Auth, stream bool) {
+func (e *CodexEngine) setHeaders(req *http.Request, token string, a *auth.Auth, stream bool, sessionID string) {
+	if sessionID == "" {
+		sessionID = backend.UUID()
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Originator", codexOriginator)
 	req.Header.Set("User-Agent", codexUserAgent)
-	req.Header.Set("Session-Id", backend.UUID())
+	req.Header.Set("Session-Id", sessionID)
 	if a.AccountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", a.AccountID)
 	}
@@ -390,7 +393,7 @@ func (e *CodexEngine) modelsWith(ctx context.Context, a *auth.Auth) ([]backend.M
 	if err != nil {
 		return nil, err
 	}
-	e.setHeaders(req, token, a, false)
+	e.setHeaders(req, token, a, false, "")
 	resp, err := e.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -460,6 +463,13 @@ func (e *CodexEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelt
 		model = models[0].ID
 	}
 	instructions, input := codexChatInput(req.Messages)
+	opening := ""
+	if len(input) > 0 {
+		if b, err := json.Marshal(input[0]); err == nil {
+			opening = string(b)
+		}
+	}
+	sessionID := promptSessionID(model, instructions, opening)
 	payload := map[string]any{
 		"model":        model,
 		"instructions": instructions,
@@ -489,7 +499,7 @@ func (e *CodexEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelt
 	var lastErr error
 	for i, n := 0, e.count(); i < n; i++ {
 		a := e.pick()
-		result, started, err := e.chatStreamOnce(ctx, a, data, onDelta)
+		result, started, err := e.chatStreamOnce(ctx, a, data, sessionID, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
 			return result, nil
@@ -512,6 +522,19 @@ func codexServiceTier(tier string) string {
 		return "priority"
 	}
 	return ""
+}
+
+// promptSessionID derives a stable cache-affinity session id from the prompt
+// opening. The Codex backend routes prompt-cache hits by the Session-Id header,
+// so a fresh UUID per request scatters turns across cache shards and misses.
+func promptSessionID(seed ...string) string {
+	h := sha256.New()
+	for _, s := range seed {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
+	}
+	sum := h.Sum(nil)[:16]
+	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
 // codexChatInput translates unified messages into the Responses API instructions
@@ -615,7 +638,7 @@ type codexChatEvent struct {
 // chatStreamOnce streams one structured Responses API request, parsing text
 // deltas and completed function_call items. started reports whether any output
 // was already delivered (which makes retrying unsafe).
-func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, onDelta func(backend.ChatDelta)) (*backend.ChatResult, bool, error) {
+func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, sessionID string, onDelta func(backend.ChatDelta)) (*backend.ChatResult, bool, error) {
 	var full strings.Builder
 	var toolCalls []backend.ToolCall
 	var usage backend.Usage
@@ -629,7 +652,7 @@ func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []b
 		if err != nil {
 			return nil, started, err
 		}
-		e.setHeaders(req, token, a, true)
+		e.setHeaders(req, token, a, true, sessionID)
 		resp, err := e.HTTP.Do(req)
 		if err != nil {
 			return nil, started, err
@@ -724,9 +747,12 @@ type codexEvent struct {
 	Delta    string `json:"delta"`
 	Response *struct {
 		Usage *struct {
-			InputTokens         int `json:"input_tokens"`
-			OutputTokens        int `json:"output_tokens"`
-			TotalTokens         int `json:"total_tokens"`
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			TotalTokens        int `json:"total_tokens"`
+			InputTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
 			OutputTokensDetails struct {
 				ReasoningTokens int `json:"reasoning_tokens"`
 			} `json:"output_tokens_details"`
@@ -763,6 +789,7 @@ func (e *CodexEngine) generate(ctx context.Context, model, prompt string, onDelt
 		"stream": true,
 		"store":  false,
 	}
+	sessionID := promptSessionID(model, prompt)
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -771,7 +798,7 @@ func (e *CodexEngine) generate(ctx context.Context, model, prompt string, onDelt
 	var lastErr error
 	for i, n := 0, e.count(); i < n; i++ {
 		a := e.pick()
-		result, started, err := e.streamOnce(ctx, a, data, onDelta)
+		result, started, err := e.streamOnce(ctx, a, data, sessionID, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
 			return result, nil
@@ -785,7 +812,7 @@ func (e *CodexEngine) generate(ctx context.Context, model, prompt string, onDelt
 	return nil, lastErr
 }
 
-func (e *CodexEngine) streamOnce(ctx context.Context, a *auth.Auth, data []byte, onDelta func(string)) (result *backend.Result, started bool, err error) {
+func (e *CodexEngine) streamOnce(ctx context.Context, a *auth.Auth, data []byte, sessionID string, onDelta func(string)) (result *backend.Result, started bool, err error) {
 	var full strings.Builder
 	var usage backend.Usage
 	for attempt := 0; ; attempt++ {
@@ -793,11 +820,11 @@ func (e *CodexEngine) streamOnce(ctx context.Context, a *auth.Auth, data []byte,
 		if err != nil {
 			return nil, started, err
 		}
-		req, err := http.NewRequestWithContext(ctx, "POST", codexAPIBase+"/responses", bytes.NewReader(data))
+		req, err := http.NewRequestWithContext(ctx, "POST", e.apiBase()+"/responses", bytes.NewReader(data))
 		if err != nil {
 			return nil, started, err
 		}
-		e.setHeaders(req, token, a, true)
+		e.setHeaders(req, token, a, true, sessionID)
 		resp, err := e.HTTP.Do(req)
 		if err != nil {
 			return nil, started, err
@@ -835,10 +862,11 @@ func (e *CodexEngine) streamOnce(ctx context.Context, a *auth.Auth, data []byte,
 						if ev.Response != nil && ev.Response.Usage != nil {
 							u := ev.Response.Usage
 							usage = backend.Usage{
-								InputTokens:    u.InputTokens,
-								OutputTokens:   u.OutputTokens,
-								ThinkingTokens: u.OutputTokensDetails.ReasoningTokens,
-								TotalTokens:    u.TotalTokens,
+								InputTokens:     u.InputTokens,
+								OutputTokens:    u.OutputTokens,
+								ThinkingTokens:  u.OutputTokensDetails.ReasoningTokens,
+								CacheReadTokens: u.InputTokensDetails.CachedTokens,
+								TotalTokens:     u.TotalTokens,
 							}
 						}
 					case "response.failed", "error":

@@ -466,9 +466,33 @@ type agyModels struct {
 	Models map[string]json.RawMessage `json:"models"`
 }
 
+// unadvertisedModel filters catalog entries the chat endpoint cannot use:
+// internal chat/tab placeholders and disabled previews.
+func unadvertisedModel(id string) bool {
+	return strings.HasPrefix(id, "chat_") || strings.HasPrefix(id, "tab_") || strings.HasSuffix(id, "-disabled")
+}
+
+// PreferredDefault picks the catalog's default chat model. The catalog is
+// sorted by ID, so the first entry alone would land on Claude; the standard
+// Gemini flash is the intended default.
+func PreferredDefault(models []backend.Model) string {
+	for _, m := range models {
+		if m.ID == "gemini-3.8-flash-high" {
+			return m.ID
+		}
+	}
+	if len(models) > 0 {
+		return models[0].ID
+	}
+	return ""
+}
+
 func (m agyModels) list() ([]backend.Model, error) {
 	models := make([]backend.Model, 0, len(m.Models))
 	for id := range m.Models {
+		if unadvertisedModel(id) {
+			continue
+		}
 		models = append(models, backend.Model{ID: id, Name: id})
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
@@ -509,7 +533,7 @@ func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta fun
 		if err != nil {
 			return nil, err
 		}
-		model = models[0].ID
+		model = PreferredDefault(models)
 	}
 
 	var sb [8]byte
@@ -890,7 +914,7 @@ func (e *Engine) generate(ctx context.Context, model, prompt string, onDelta fun
 		if err != nil {
 			return nil, err
 		}
-		model = models[0].ID
+		model = PreferredDefault(models)
 	}
 
 	sessionID := func() string {

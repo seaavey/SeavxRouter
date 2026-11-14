@@ -52,6 +52,17 @@ func TestUsageStoreRecordAndQuery(t *testing.T) {
 		t.Fatalf("day group[1] = %+v", groups[1])
 	}
 
+	_, groups, err = store.Query(UsageFilter{GroupBy: "hour"})
+	if err != nil {
+		t.Fatalf("Query hour: %v", err)
+	}
+	if len(groups) != 3 || groups[0].Key != "2026-11-11T10" || groups[2].Key != "2026-11-12T10" {
+		t.Fatalf("hour groups = %+v", groups)
+	}
+	if groups[2].Requests != 1 || groups[2].TotalTokens != 3 {
+		t.Fatalf("hour group[2] = %+v", groups[2])
+	}
+
 	_, groups, err = store.Query(UsageFilter{GroupBy: "provider"})
 	if err != nil {
 		t.Fatalf("Query provider: %v", err)
@@ -74,7 +85,7 @@ func TestUsageHandler(t *testing.T) {
 	if err := store.Record(UsageEntry{TS: "2026-11-12T10:00:00Z", Provider: "codex", Model: "m", Endpoint: "chat", User: "alice", PromptTokens: 4, CompletionTokens: 6, TotalTokens: 10}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	s := &Server{usage: store}
+	s := NewServer(nil, "", store)
 
 	w := httptest.NewRecorder()
 	s.handleUsage(w, httptest.NewRequest("GET", "/v1/usage?group_by=user", nil))
@@ -123,13 +134,15 @@ func TestUsageRecordedViaHandleChat(t *testing.T) {
 		FinishReason: "stop",
 		Usage:        backend.Usage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
 	}}
-	s := &Server{backend: stub, usage: store}
+	s := NewServer(stub, "", store)
 
 	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("X-Seavx-User", "alice")
 	w := httptest.NewRecorder()
-	s.handleChat(w, req)
+	// Route through Handler so the logging middleware attributes the user;
+	// calling the wire handler directly would skip middleware.
+	s.Handler().ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Fatalf("handleChat status = %d body=%s", w.Code, w.Body.String())
 	}
@@ -241,10 +254,12 @@ func TestUsageCostRecordedViaHandleChat(t *testing.T) {
 		FinishReason: "stop",
 		Usage:        backend.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000, TotalTokens: 2_000_000},
 	}}
-	s := &Server{backend: stub, usage: store, pricing: DefaultPricing()}
+	s := NewServer(stub, "", store,
+		WithPricing(DefaultPricing()),
+		WithHiddenModelsFile(filepath.Join(t.TempDir(), "hidden-models.txt")))
 	body := `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`
 	w := httptest.NewRecorder()
-	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	s.wire.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 	if w.Code != 200 {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
@@ -267,12 +282,12 @@ func TestUsageRecordedViaStreamingChat(t *testing.T) {
 		},
 		deltas: []backend.ChatDelta{{Content: "hel"}, {Content: "lo"}},
 	}
-	s := &Server{backend: stub, usage: store}
+	s := NewServer(stub, "", store)
 	body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer key-abc")
 	w := httptest.NewRecorder()
-	s.handleChat(w, req)
+	s.wire.HandleChat(w, req)
 	if w.Code != 200 {
 		t.Fatalf("handleChat status = %d", w.Code)
 	}
@@ -327,10 +342,10 @@ func TestUsageStoreCompressionTotals(t *testing.T) {
 func TestCompressionRecordedViaHandleChat(t *testing.T) {
 	store := newTestUsageStore(t)
 	stub := &chatStub{result: &backend.ChatResult{Content: "ok", FinishReason: "stop"}}
-	s := &Server{backend: stub, usage: store, compressor: compress.NewDefault()}
+	s := NewServer(stub, "", store, WithCompression(compress.NewDefault()))
 
 	w := httptest.NewRecorder()
-	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(compressionChatBody()))))
+	s.wire.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(compressionChatBody()))))
 	if w.Code != 200 {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
@@ -344,7 +359,7 @@ func TestCompressionRecordedViaHandleChat(t *testing.T) {
 
 	// Requests without compressed tool results are not recorded.
 	w = httptest.NewRecorder()
-	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)))
+	s.wire.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)))
 	if w.Code != 200 {
 		t.Fatalf("plain status = %d", w.Code)
 	}

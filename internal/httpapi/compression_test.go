@@ -52,10 +52,10 @@ func compressionChatBody() []byte {
 
 func TestCompressionChat(t *testing.T) {
 	stub := &chatStub{result: &backend.ChatResult{Content: "ok", FinishReason: "stop"}}
-	s := &Server{backend: stub, compressor: compress.NewDefault()}
+	s := NewServer(stub, "", nil, WithCompression(compress.NewDefault()))
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(compressionChatBody())))
-	s.handleChat(w, req)
+	s.wire.HandleChat(w, req)
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
@@ -85,7 +85,7 @@ func TestCompressionChat(t *testing.T) {
 
 func TestCompressionAnthropicMessages(t *testing.T) {
 	stub := &chatStub{result: &backend.ChatResult{Content: "done", FinishReason: "stop"}}
-	s := &Server{backend: stub, compressor: compress.NewDefault()}
+	s := NewServer(stub, "", nil, WithCompression(compress.NewDefault()))
 	body := map[string]any{
 		"model":      "m",
 		"max_tokens": 128,
@@ -105,7 +105,7 @@ func TestCompressionAnthropicMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	s.handleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(string(raw))))
+	s.wire.HandleAnthropicMessages(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(string(raw))))
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
@@ -182,7 +182,7 @@ func TestCompressionDisabled(t *testing.T) {
 	stub := &chatStub{result: &backend.ChatResult{Content: "ok", FinishReason: "stop"}}
 	s := NewServer(stub, "", nil, WithoutCompression())
 	w := httptest.NewRecorder()
-	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(compressionChatBody()))))
+	s.wire.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(compressionChatBody()))))
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
@@ -206,7 +206,7 @@ func TestCompressionDisabled(t *testing.T) {
 
 func TestCompressionResponses(t *testing.T) {
 	stub := &chatStub{result: &backend.ChatResult{Content: "done", FinishReason: "stop"}}
-	s := &Server{backend: stub, compressor: compress.NewDefault()}
+	s := NewServer(stub, "", nil, WithCompression(compress.NewDefault()))
 	body := map[string]any{
 		"model": "m",
 		"input": []any{
@@ -220,7 +220,7 @@ func TestCompressionResponses(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	s.handleResponses(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(string(raw))))
+	s.wire.HandleResponses(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(string(raw))))
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}

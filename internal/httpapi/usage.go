@@ -251,6 +251,8 @@ func usageGroupExpr(groupBy string) (string, bool) {
 	switch groupBy {
 	case "", "day":
 		return "substr(ts, 1, 10)", true
+	case "hour":
+		return "substr(ts, 1, 13)", true
 	case "provider":
 		return "provider", true
 	case "model":
@@ -450,7 +452,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := usageGroupExpr(f.GroupBy); !ok {
-		writeError(w, &apiError{http.StatusBadRequest, `invalid group_by (want day, provider, model, user or endpoint)`, "invalid_request_error", "invalid_group_by"})
+		writeError(w, &apiError{http.StatusBadRequest, `invalid group_by (want day, hour, provider, model, user or endpoint)`, "invalid_request_error", "invalid_group_by"})
 		return
 	}
 	totals, groups, err := s.usage.Query(f)

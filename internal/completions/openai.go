@@ -1,9 +1,7 @@
-package httpapi
+package completions
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,32 +10,6 @@ import (
 
 	"seavxrouter/internal/backend"
 )
-
-type apiError struct {
-	status int
-	msg    string
-	typ    string
-	code   string
-}
-
-func (e *apiError) Error() string { return e.msg }
-
-func writeError(w http.ResponseWriter, err error) {
-	var ae *apiError
-	if !errors.As(err, &ae) {
-		ae = &apiError{http.StatusBadGateway, err.Error(), "backend_error", "backend_error"}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(ae.status)
-	json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"message": ae.msg, "type": ae.typ, "code": ae.code},
-	})
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
-}
 
 // --- shared request parsing ---
 
@@ -175,36 +147,9 @@ func mapUsage(u backend.Usage) openAIUsage {
 	return ou
 }
 
-func (s *Server) resolveModel(w http.ResponseWriter, r *http.Request, requested string) (string, bool) {
-	model := requested
-	if model == "" || model == "auto" || model == "default" {
-		model = s.backend.Default()
-	}
-	if model != "" && !s.backend.HasModel(r.Context(), model) {
-		writeError(w, &apiError{http.StatusNotFound, "model not found: " + model, "invalid_request_error", "model_not_found"})
-		return "", false
-	}
-	return model, true
-}
-
 // --- GET /v1/models ---
 
-type providerNamer interface {
-	Provider(context.Context, string) string
-}
-
-// ownerOf reports which provider serves a model ID, including provider-prefixed
-// IDs; bare IDs default to antigravity.
-func (s *Server) ownerOf(ctx context.Context, id string) string {
-	if pn, ok := s.backend.(providerNamer); ok {
-		if name := pn.Provider(ctx, id); name != "" {
-			return name
-		}
-	}
-	return "antigravity"
-}
-
-func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
 	models, err := s.backend.Models(r.Context())
 	if err != nil {
 		writeError(w, err)
@@ -220,7 +165,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"object": "list", "data": data})
 }
 
-func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
+func (s *Server) HandleModel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.backend.HasModel(r.Context(), id) {
 		writeError(w, &apiError{http.StatusNotFound, "model not found: " + id, "invalid_request_error", "model_not_found"})
@@ -329,7 +274,7 @@ func openAIToolCalls(calls []backend.ToolCall) []map[string]any {
 	return out
 }
 
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+func (s *Server) HandleChat(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 10<<20)).Decode(&req); err != nil {
 		writeError(w, &apiError{http.StatusBadRequest, "invalid JSON body: " + err.Error(), "invalid_request_error", "invalid_json"})
@@ -348,7 +293,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	s.applyCompression(cr, "chat")
+	s.applyCompression(r, cr, "chat")
 	created := time.Now().Unix()
 	id := backend.NewID("chatcmpl-")
 
@@ -433,6 +378,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Warn("chat stream failed", "err", err)
+		s.logFailure(r, backend.StatusCode(err), err)
 		data, _ := json.Marshal(map[string]any{
 			"error": map[string]any{"message": err.Error(), "type": "backend_error", "code": "backend_error"},
 		})
@@ -580,7 +526,7 @@ func responsesUsage(u backend.Usage) map[string]any {
 	}
 }
 
-func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	var req responsesRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 10<<20)).Decode(&req); err != nil {
 		writeError(w, &apiError{http.StatusBadRequest, "invalid JSON body: " + err.Error(), "invalid_request_error", "invalid_json"})
@@ -599,7 +545,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		msgs = append([]backend.ChatMessage{{Role: "system", Content: req.Instructions}}, msgs...)
 	}
 	cr := &backend.ChatRequest{Model: model, Messages: msgs, Stream: req.Stream, ServiceTier: req.ServiceTier}
-	s.applyCompression(cr, "responses")
+	s.applyCompression(r, cr, "responses")
 	id := backend.NewID("resp_")
 
 	if !req.Stream {
@@ -645,6 +591,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Warn("responses stream failed", "err", err)
+		s.logFailure(r, backend.StatusCode(err), err)
 		send("response.failed", map[string]any{"response": responseObject(id, model, "failed", []responsesOutput{}, nil)})
 		return
 	}

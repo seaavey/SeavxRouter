@@ -19,9 +19,10 @@ const (
 	recentLimit = 100
 	groupLimit  = 12
 	dayLimit    = 14
+	hourLimit   = 24
 )
 
-var groupBys = []string{"day", "provider", "model", "user", "endpoint"}
+var groupBys = []string{"day", "provider", "model", "user", "endpoint", "hour"}
 
 // Options configures a Dashboard.
 type Options struct {
@@ -37,6 +38,7 @@ type Options struct {
 type Snapshot struct {
 	Generated        time.Time
 	DBPath           string
+	DBSize           int64
 	GroupBy          string
 	Today            httpapi.UsageTotals
 	Week             httpapi.UsageTotals
@@ -64,7 +66,7 @@ func Open(opts Options) (*Dashboard, error) {
 		opts.GroupBy = "day"
 	}
 	if !ValidGroupBy(opts.GroupBy) {
-		return nil, fmt.Errorf("invalid group-by %q (want day, provider, model, user or endpoint)", opts.GroupBy)
+		return nil, fmt.Errorf("invalid group-by %q (want day, hour, provider, model, user or endpoint)", opts.GroupBy)
 	}
 	if opts.Refresh <= 0 {
 		opts.Refresh = 2 * time.Second
@@ -81,6 +83,12 @@ func Open(opts Options) (*Dashboard, error) {
 }
 
 func (d *Dashboard) Close() error { return d.store.Close() }
+
+// RequestLog returns one logged request with its bodies; nil when the ID is
+// unknown to the usage database.
+func (d *Dashboard) RequestLog(id string) (*httpapi.RequestLog, error) {
+	return d.store.QueryLog(id)
+}
 
 // ValidGroupBy reports whether g is a supported usage grouping.
 func ValidGroupBy(g string) bool {
@@ -107,6 +115,7 @@ func (d *Dashboard) Load() (Snapshot, error) {
 	snap := Snapshot{
 		Generated: now,
 		DBPath:    d.opts.UsageDB,
+		DBSize:    dbSize(d.opts.UsageDB),
 		GroupBy:   d.groupBy,
 		LiveNote:  "db poll",
 	}
@@ -134,11 +143,27 @@ func (d *Dashboard) Load() (Snapshot, error) {
 	return snap, nil
 }
 
+// dbSize reports the database footprint on disk. SQLite keeps recent writes in
+// the WAL file, so counting only the main file would understate the real size.
+func dbSize(path string) int64 {
+	var total int64
+	for _, p := range []string{path, path + "-wal"} {
+		if st, err := os.Stat(p); err == nil {
+			total += st.Size()
+		}
+	}
+	return total
+}
+
 func trimGroups(groupBy string, groups []httpapi.UsageGroup) []httpapi.UsageGroup {
 	out := slices.Clone(groups)
-	if groupBy == "day" {
-		if len(out) > dayLimit {
-			out = out[len(out)-dayLimit:]
+	if groupBy == "day" || groupBy == "hour" {
+		limit := dayLimit
+		if groupBy == "hour" {
+			limit = hourLimit
+		}
+		if len(out) > limit {
+			out = out[len(out)-limit:]
 		}
 		return out
 	}

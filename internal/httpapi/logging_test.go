@@ -63,7 +63,7 @@ func TestRequestLogging(t *testing.T) {
 	if raw["id"] == "" || raw["endpoint"] != "chat" || raw["provider"] != "antigravity" || raw["model"] != "m" || raw["status"] != float64(200) {
 		t.Fatalf("entry = %v", raw)
 	}
-	if raw["request_bytes"].(float64) != float64(len(body)) || raw["response_bytes"].(float64) == 0 {
+	if raw["request_bytes"].(float64) != 0 || raw["response_bytes"].(float64) == 0 {
 		t.Fatalf("body sizes = %v / %v", raw["request_bytes"], raw["response_bytes"])
 	}
 	usage := raw["usage"].(map[string]any)
@@ -81,19 +81,18 @@ func TestRequestLogging(t *testing.T) {
 	}
 	var fullList struct {
 		Data []struct {
-			Request struct {
-				Messages []struct {
-					Content string `json:"content"`
-				} `json:"messages"`
-			} `json:"request"`
+			Request  json.RawMessage `json:"request"`
+			Response struct {
+				Content string `json:"content"`
+			} `json:"response"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &fullList); err != nil {
 		t.Fatal(err)
 	}
-	if len(fullList.Data) != 1 || len(fullList.Data[0].Request.Messages) != 1 ||
-		fullList.Data[0].Request.Messages[0].Content != "hello" {
-		t.Fatalf("include=all missing request body: %s", w.Body.String())
+	if len(fullList.Data) != 1 || string(fullList.Data[0].Request) != `""` ||
+		fullList.Data[0].Response.Content != "hi there" {
+		t.Fatalf("include=all request body must be omitted: %s", w.Body.String())
 	}
 
 	w = httptest.NewRecorder()
@@ -102,15 +101,9 @@ func TestRequestLogging(t *testing.T) {
 		t.Fatalf("detail code %d body %s", w.Code, w.Body.String())
 	}
 	var detail struct {
-		ID       string `json:"id"`
-		Endpoint string `json:"endpoint"`
-		Request  struct {
-			Model    string `json:"model"`
-			Messages []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
-		} `json:"request"`
+		ID       string          `json:"id"`
+		Endpoint string          `json:"endpoint"`
+		Request  json.RawMessage `json:"request"`
 		Response struct {
 			Content      string `json:"content"`
 			FinishReason string `json:"finish_reason"`
@@ -122,8 +115,8 @@ func TestRequestLogging(t *testing.T) {
 	if detail.ID != id || detail.Endpoint != "chat" {
 		t.Fatalf("detail = %s", w.Body.String())
 	}
-	if detail.Request.Model != "m" || len(detail.Request.Messages) != 1 || detail.Request.Messages[0].Content != "hello" {
-		t.Fatalf("detail request = %+v", detail.Request)
+	if string(detail.Request) != `""` {
+		t.Fatalf("detail request body must be omitted: %s", w.Body.String())
 	}
 	if detail.Response.Content != "hi there" || detail.Response.FinishReason != "stop" {
 		t.Fatalf("detail response = %+v", detail.Response)
@@ -194,7 +187,7 @@ func TestRequestLoggingStream(t *testing.T) {
 	if err := json.Unmarshal([]byte(data), &e); err != nil {
 		t.Fatal(err)
 	}
-	if e.Endpoint != "chat" || e.Model != "m" || e.Status != 200 || e.RequestBytes != len(body) {
+	if e.Endpoint != "chat" || e.Model != "m" || e.Status != 200 || e.RequestBytes != 0 {
 		t.Fatalf("streamed log = %s", data)
 	}
 	if e.Usage.PromptTokens != 3 || e.Usage.TotalTokens != 5 {
@@ -237,8 +230,37 @@ func TestRequestLoggingCapturesErrors(t *testing.T) {
 	if len(logs) != 1 || logs[0].Status != 400 {
 		t.Fatalf("logs = %+v", logs)
 	}
-	if !strings.Contains(logs[0].Request, `"messages":[]`) || !strings.Contains(logs[0].Response, "messages must not be empty") {
-		t.Fatalf("request/response not captured: %+v", logs[0])
+	if logs[0].Request != "" || !strings.Contains(logs[0].Response, "messages must not be empty") {
+		t.Fatalf("response not captured or request body stored: %+v", logs[0])
+	}
+}
+
+// TestStreamFailureLogsUpstreamStatus guards that a stream that died after the
+// 200 header was sent still logs the real upstream status, not a fake success.
+func TestStreamFailureLogsUpstreamStatus(t *testing.T) {
+	stub := &chatStub{err: &backend.HTTPError{Status: 492, Message: "492 status code 492: quota exceeded"}}
+	s, path := newLoggingServer(t, stub)
+	h := s.Handler()
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("stream code %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "backend_error") {
+		t.Fatalf("stream body missing error: %s", w.Body.String())
+	}
+
+	logs, err := s.usage.QueryLogs(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Status != 492 {
+		t.Fatalf("logs = %+v", logs)
+	}
+	if !strings.Contains(logs[0].Response, "quota exceeded") {
+		t.Fatalf("error body not logged: %q", logs[0].Response)
 	}
 }
 

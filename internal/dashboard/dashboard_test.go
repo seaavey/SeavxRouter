@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,18 +16,19 @@ import (
 	"seavxrouter/internal/httpapi"
 )
 
-func newTestStore(t *testing.T) *httpapi.UsageStore {
+func newTestStore(t *testing.T) (*httpapi.UsageStore, string) {
 	t.Helper()
-	store, err := httpapi.OpenUsageStore(filepath.Join(t.TempDir(), "usage.db"))
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := httpapi.OpenUsageStore(path)
 	if err != nil {
 		t.Fatalf("OpenUsageStore: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	return store
+	return store, path
 }
 
 func TestLoad(t *testing.T) {
-	store := newTestStore(t)
+	store, path := newTestStore(t)
 	now := time.Now().UTC()
 	today := now.Format("2006-01-02T15:04:05Z")
 	older := now.AddDate(0, 0, -2).Format("2006-01-02T15:04:05Z")
@@ -50,10 +52,13 @@ func TestLoad(t *testing.T) {
 		t.Fatalf("RecordLog: %v", err)
 	}
 
-	d := &Dashboard{opts: Options{UsageDB: "test.db"}, store: store, groupBy: "day"}
+	d := &Dashboard{opts: Options{UsageDB: path}, store: store, groupBy: "day"}
 	snap, err := d.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
+	}
+	if snap.DBSize <= 0 {
+		t.Fatalf("db size = %d, want > 0", snap.DBSize)
 	}
 	if snap.Today.Requests != 1 || snap.Today.TotalTokens != 100 {
 		t.Fatalf("today = %+v", snap.Today)
@@ -78,6 +83,28 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestLoadHourGroupsKeepLatest(t *testing.T) {
+	store, path := newTestStore(t)
+	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < hourLimit+6; i++ {
+		ts := base.Add(time.Duration(i) * time.Hour).Format("2006-01-02T15:04:05Z")
+		if err := store.Record(httpapi.UsageEntry{TS: ts, Provider: "codex", Model: "m", Endpoint: "chat", TotalTokens: 1}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	d := &Dashboard{opts: Options{UsageDB: path}, store: store, groupBy: "hour"}
+	snap, err := d.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(snap.Groups) != hourLimit {
+		t.Fatalf("groups = %d, want %d", len(snap.Groups), hourLimit)
+	}
+	if first, last := snap.Groups[0].Key, snap.Groups[len(snap.Groups)-1].Key; first != "2026-11-10T06" || last != "2026-11-11T05" {
+		t.Fatalf("hour range = %s..%s", first, last)
+	}
+}
+
 func TestOpenValidatesGroupBy(t *testing.T) {
 	_, err := Open(Options{UsageDB: filepath.Join(t.TempDir(), "missing.db"), GroupBy: "bogus"})
 	if err == nil || !strings.Contains(err.Error(), "invalid group-by") {
@@ -97,12 +124,32 @@ func TestSetGroupBy(t *testing.T) {
 	if !d.SetGroupBy("provider") || d.GroupBy() != "provider" {
 		t.Fatalf("group-by = %q", d.GroupBy())
 	}
+	if !d.SetGroupBy("hour") || d.GroupBy() != "hour" {
+		t.Fatalf("group-by = %q", d.GroupBy())
+	}
+}
+
+func TestDBSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	if err := os.WriteFile(path, make([]byte, 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", make([]byte, 50), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := dbSize(path); got != 150 {
+		t.Fatalf("dbSize = %d, want 150", got)
+	}
+	if got := dbSize(filepath.Join(t.TempDir(), "missing.db")); got != 0 {
+		t.Fatalf("dbSize missing = %d, want 0", got)
+	}
 }
 
 func testSnapshot() Snapshot {
 	return Snapshot{
 		Generated: time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC),
 		DBPath:    "/home/x/.seavx/usage.db",
+		DBSize:    12_582_912,
 		GroupBy:   "day",
 		Today: httpapi.UsageTotals{
 			Requests: 12, PromptTokens: 1234, CompletionTokens: 345,
@@ -146,7 +193,7 @@ func testSnapshot() Snapshot {
 func TestRender(t *testing.T) {
 	out := render(View{Snapshot: testSnapshot(), Width: 110, Height: 40})
 	for _, want := range []string{
-		"seavxrouter tui", "sse live", "TOTALS", "COMPRESSION", "USAGE BY DAY",
+		"seavxrouter tui", "sse live", "size 12 MB", "TOTALS", "COMPRESSION", "USAGE BY DAY",
 		"RECENT REQUESTS", "claude-sonnet-4-6", "alice", "$0.021", "93.3%",
 	} {
 		if !strings.Contains(out, want) {
@@ -176,7 +223,7 @@ func TestRenderCompact(t *testing.T) {
 	if lines := strings.Count(out, "\n") + 1; lines > 24 {
 		t.Fatalf("rendered %d lines, want <= 24", lines)
 	}
-	if !strings.Contains(out, "q quit · 1-5 group") {
+	if !strings.Contains(out, "q quit · ↑↓ select · enter · 1-6 group") {
 		t.Errorf("compact footer missing:\n%s", out)
 	}
 }
@@ -204,7 +251,8 @@ func TestHumanHelpers(t *testing.T) {
 		in   int64
 		want string
 	}{
-		{0, "0"}, {-5, "0"}, {999, "999"}, {1500, "1,500K"}, {1_200_000, "1,200M"},
+		{0, "0"}, {-5, "0"}, {999, "999"}, {1500, "1500"}, {10_000, "10000"},
+		{10_001, "10,001K"}, {1_200_000, "1,200M"},
 		{2_000_000_000, "2,000B"}, {1_004_673_294, "1,005B"}, {536_500_000, "536,500M"},
 	}
 	for _, tc := range counts {
@@ -239,8 +287,9 @@ func TestHumanHelpers(t *testing.T) {
 			t.Errorf("humanDuration(%d) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
-	if got := shortTime("2026-11-13T10:09:08Z"); got != "10:09:08" {
-		t.Errorf("shortTime = %q", got)
+	wantShort := time.Date(2026, 11, 13, 10, 9, 8, 0, time.UTC).Local().Format("15:04:05")
+	if got := shortTime("2026-11-13T10:09:08Z"); got != wantShort {
+		t.Errorf("shortTime = %q, want %q", got, wantShort)
 	}
 }
 

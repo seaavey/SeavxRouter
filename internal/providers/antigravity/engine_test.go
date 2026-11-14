@@ -3,6 +3,7 @@ package antigravity
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -247,6 +248,43 @@ func TestEngineChatStreamFunctionCall(t *testing.T) {
 	}
 	if !bytes.Contains(upstreamBody, []byte(`"thoughtSignature":"SIG123"`)) {
 		t.Fatalf("round-trip upstream missing thoughtSignature: %s", upstreamBody)
+	}
+}
+
+func TestModelListFiltersUnusableEntries(t *testing.T) {
+	var cat agyModels
+	err := json.Unmarshal([]byte(`{"models":{
+		"chat_20706":{},"chat_23310":{},"tab_flash_lite_preview":{},
+		"gemini-4-carbon-disabled":{},
+		"claude-opus-4-6-thinking":{},"gemini-3.8-flash-high":{},
+		"gemini-2.5-flash":{}
+	}}`), &cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := cat.list()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"claude-opus-4-6-thinking", "gemini-2.5-flash", "gemini-3.8-flash-high"}
+	if len(models) != len(want) {
+		t.Fatalf("models = %+v", models)
+	}
+	for i, id := range want {
+		if models[i].ID != id {
+			t.Fatalf("models = %+v, want %v", models, want)
+		}
+	}
+	if got := PreferredDefault(models); got != "gemini-3.8-flash-high" {
+		t.Fatalf("PreferredDefault = %q", got)
+	}
+
+	// Without the standard flash, the first surviving entry is the fallback.
+	if got := PreferredDefault(models[:1]); got != "claude-opus-4-6-thinking" {
+		t.Fatalf("PreferredDefault fallback = %q", got)
+	}
+	if got := PreferredDefault(nil); got != "" {
+		t.Fatalf("PreferredDefault(nil) = %q", got)
 	}
 }
 

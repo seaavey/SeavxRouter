@@ -280,7 +280,7 @@ func (p *Pricing) Cost(model string, u backend.Usage) float64 {
 }
 
 var priceProviderPrefixes = []string{
-	"codex/", "antigravity/", "codebuddy/", "qoder/", "kiro/",
+	"codex/", "antigravity/", "codebuddy/", "qoder/", "kiro/", "verboo/",
 }
 
 func (p *Pricing) lookup(model string) (Price, bool) {

@@ -11,44 +11,25 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
-	"seavxrouter/internal/agy"
-	"seavxrouter/internal/antigravity"
 	"seavxrouter/internal/auth"
 	"seavxrouter/internal/backend"
-	"seavxrouter/internal/codebuddy"
-	"seavxrouter/internal/codex"
 	"seavxrouter/internal/compress"
 	"seavxrouter/internal/dashboard"
 	"seavxrouter/internal/httpapi"
-	"seavxrouter/internal/kiro"
 	"seavxrouter/internal/multi"
-	"seavxrouter/internal/qoder"
+	"seavxrouter/internal/providers/antigravity"
+	"seavxrouter/internal/providers/codebuddy"
+	"seavxrouter/internal/providers/codex"
+	"seavxrouter/internal/providers/kiro"
+	"seavxrouter/internal/providers/qoder"
+	"seavxrouter/internal/providers/upstream"
+	"seavxrouter/internal/providers/verboo"
 )
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envInt(key string, fallback int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return fallback
-	}
-	return n
-}
 
 func compressionEnabled(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
@@ -117,9 +98,9 @@ func clearServerState(url string) {
 // defaultTUIServer is where the tui looks when no server URL was recorded.
 const defaultTUIServer = "http://localhost:20128"
 
-// resolveServer picks where the tui dials: an explicit -server flag (or
-// SEAVX_SERVER) wins, then the live URL recorded by a running server, then
-// the preferred default, then the address derived from -listen.
+// resolveServer picks where the tui dials: an explicit -server flag wins,
+// then the live URL recorded by a running server, then the preferred default,
+// then the address derived from -listen.
 func resolveServer(listen, flagValue, statePath, preferred string) string {
 	if flagValue != "" {
 		return flagValue
@@ -167,23 +148,19 @@ func main() {
 		args = os.Args[2:]
 	}
 	fs := flag.NewFlagSet("seavxrouter", flag.ExitOnError)
-	listen := fs.String("listen", envOr("SEAVX_LISTEN", "127.0.0.1:8080"), "listen address")
-	backendName := fs.String("backend", envOr("SEAVX_BACKEND", "native"), "backend: native (direct API) or binary (spawn agy)")
-	authFile := fs.String("auth-file", envOr("SEAVX_AUTH_FILE", auth.DefaultPath()), "credentials file for the native backend")
-	apiBase := fs.String("api-base", envOr("SEAVX_API_BASE", antigravity.DefaultAPIBase), "Antigravity API base URL")
-	binName := fs.String("agy", envOr("SEAVX_AGY_BIN", "agy"), "agy binary name or path (binary backend)")
-	apiKey := fs.String("api-key", os.Getenv("SEAVX_API_KEY"), "require this bearer token on /v1/* (empty = no auth)")
-	defaultModel := fs.String("default-model", envOr("SEAVX_DEFAULT_MODEL", ""), "model used when the request omits one")
-	usageDB := fs.String("usage-db", envOr("SEAVX_USAGE_DB", httpapi.DefaultUsageDBPath()), `SQLite file for token usage tracking (empty or "off" disables)`)
-	compressFlag := fs.String("compress", envOr("SEAVX_COMPRESS", "on"), "compress large tool-result output: on|off")
-	compressMinBytes := fs.Int("compress-min-bytes", envInt("SEAVX_COMPRESS_MIN_BYTES", 2000), "minimum tool-result bytes to compress")
-	pricingFile := fs.String("pricing", os.Getenv("SEAVX_PRICING"), "JSON file with model prices in USD per 1M tokens (empty = models.dev catalog)")
+	listen := fs.String("listen", "127.0.0.1:20128", "listen address")
+	authFile := fs.String("auth-file", auth.DefaultPath(), "credentials file")
+	apiBase := fs.String("api-base", antigravity.DefaultAPIBase, "Antigravity API base URL")
+	apiKey := fs.String("api-key", "", "require this bearer token on /v1/* (empty = no auth)")
+	defaultModel := fs.String("default-model", "", "model used when the request omits one")
+	usageDB := fs.String("usage-db", httpapi.DefaultUsageDBPath(), `SQLite file for token usage tracking (empty or "off" disables)`)
+	compressFlag := fs.String("compress", "on", "compress large tool-result output: on|off")
+	compressMinBytes := fs.Int("compress-min-bytes", 2000, "minimum tool-result bytes to compress")
+	pricingFile := fs.String("pricing", "", "JSON file with model prices in USD per 1M tokens (empty = models.dev catalog)")
 	refresh := fs.Duration("refresh", 2*time.Second, "tui auto-refresh interval")
-	groupBy := fs.String("group-by", "day", "tui grouping: day, provider, model, user or endpoint")
+	groupBy := fs.String("group-by", "day", "tui grouping: day, hour, provider, model, user or endpoint")
 	once := fs.Bool("once", false, "tui: print one snapshot and exit")
-	serverURL := fs.String("server", os.Getenv("SEAVX_SERVER"), "tui: running server URL for SSE live logs (empty = auto-detect, then "+defaultTUIServer+"; off = disable)")
-	timeout := fs.Duration("timeout", 5*time.Minute, "per-request backend timeout (binary backend)")
-	workRoot := fs.String("workdir", envOr("SEAVX_WORKDIR", filepath.Join(os.TempDir(), "seavxrouter")), "scratch dir for backend workspaces (binary backend)")
+	serverURL := fs.String("server", "", "tui: running server URL for SSE live logs (empty = auto-detect, then "+defaultTUIServer+"; off = disable)")
 	fs.Parse(args)
 	if checkMode {
 		checkProviders = append(checkProviders, fs.Args()...)
@@ -238,8 +215,14 @@ func main() {
 		case "kiro":
 			engine := &kiro.Engine{Store: store, HTTP: &http.Client{}, Region: loginRegion}
 			err = engine.Login(ctx)
+		case "verboo":
+			engine := &verboo.Engine{Store: store, HTTP: &http.Client{}}
+			err = engine.Login(ctx)
+		case "nvidia", "groq", "cloudflare":
+			p := upstream.Providers[loginProvider]
+			err = upstream.Login(ctx, p, store, os.Stdin, os.Stdout, "")
 		default:
-			slog.Error("unknown login provider (want antigravity, codex, codebuddy, qoder or kiro)", "provider", loginProvider)
+			slog.Error("unknown login provider (want antigravity, codex, codebuddy, qoder, kiro, verboo, nvidia, groq or cloudflare)", "provider", loginProvider)
 			os.Exit(1)
 		}
 		if err != nil {
@@ -250,101 +233,129 @@ func main() {
 	}
 
 	var provider backend.BackendAPI
-	switch *backendName {
-	case "native":
-		store := auth.AuthStore{Path: *authFile}
-		auths, err := store.Load()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro]\n", err)
-			os.Exit(1)
-		}
-		accounts := groupAuths(auths)
-		multi := &multi.MultiBackend{}
-		if len(accounts.antigravity) > 0 {
-			engine, err := antigravity.NewEngine(store, *apiBase, accounts.antigravity)
-			if err != nil {
-				slog.Error("cannot start antigravity", "err", err)
-				os.Exit(1)
-			}
-			engine.DefaultModel = *defaultModel
-			if engine.DefaultModel == "" {
-				if models, err := engine.Models(ctx); err == nil {
-					engine.DefaultModel = models[0].ID
-				} else {
-					slog.Warn("could not fetch default model", "provider", "antigravity", "err", err)
-				}
-			}
-			multi.Antigravity = engine
-		}
-		if len(accounts.codex) > 0 {
-			engine, err := codex.NewCodexEngine(store, accounts.codex)
-			if err != nil {
-				slog.Error("cannot start codex", "err", err)
-				os.Exit(1)
-			}
-			engine.DefaultModel = *defaultModel
-			if engine.DefaultModel == "" {
-				if models, err := engine.Models(ctx); err == nil {
-					engine.DefaultModel = models[0].ID
-				} else {
-					slog.Warn("could not fetch default model", "provider", "codex", "err", err)
-				}
-			}
-			multi.Codex = engine
-		}
-		if len(accounts.codebuddy) > 0 {
-			engine, err := codebuddy.NewCodeBuddyEngine(store, accounts.codebuddy)
-			if err != nil {
-				slog.Error("cannot start codebuddy", "err", err)
-				os.Exit(1)
-			}
-			engine.DefaultModel = *defaultModel
-			if engine.DefaultModel == "" {
-				engine.DefaultModel = engine.Default()
-			}
-			multi.CodeBuddy = engine
-		}
-		if len(accounts.qoder) > 0 {
-			engine, err := qoder.NewQoderEngine(store, accounts.qoder)
-			if err != nil {
-				slog.Error("cannot start qoder", "err", err)
-				os.Exit(1)
-			}
-			engine.DefaultModel = *defaultModel
-			if engine.DefaultModel == "" {
-				engine.DefaultModel = engine.Default()
-			}
-			multi.Qoder = engine
-		}
-		if len(accounts.kiro) > 0 {
-			engine, err := kiro.NewKiroEngine(store, accounts.kiro)
-			if err != nil {
-				slog.Error("cannot start kiro", "err", err)
-				os.Exit(1)
-			}
-			engine.DefaultModel = *defaultModel
-			if engine.DefaultModel == "" {
-				engine.DefaultModel = engine.Default()
-			}
-			multi.Kiro = engine
-		}
-		slog.Info("providers ready", "antigravity", len(accounts.antigravity), "codex", len(accounts.codex), "codebuddy", len(accounts.codebuddy), "qoder", len(accounts.qoder), "kiro", len(accounts.kiro))
-		provider = multi
-	case "binary":
-		bin, err := agy.ResolveBinary(*binName)
-		if err != nil {
-			slog.Error("cannot start", "err", err)
-			os.Exit(1)
-		}
-		if err := os.MkdirAll(*workRoot, 0o700); err != nil {
-			slog.Error("cannot create workdir", "err", err)
-			os.Exit(1)
-		}
-		provider = &agy.Backend{Bin: bin, WorkRoot: *workRoot, Timeout: *timeout, DefaultModel: *defaultModel}
-	default:
-		slog.Error("unknown backend", "backend", *backendName)
+	store := auth.AuthStore{Path: *authFile}
+	auths, err := store.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare]\n", err)
 		os.Exit(1)
 	}
+	accounts := groupAuths(auths)
+	multi := &multi.MultiBackend{}
+	if len(accounts.antigravity) > 0 {
+		engine, err := antigravity.NewEngine(store, *apiBase, accounts.antigravity)
+		if err != nil {
+			slog.Error("cannot start antigravity", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = *defaultModel
+		if engine.DefaultModel == "" {
+			if models, err := engine.Models(ctx); err == nil {
+				engine.DefaultModel = antigravity.PreferredDefault(models)
+			} else {
+				slog.Warn("could not fetch default model", "provider", "antigravity", "err", err)
+			}
+		}
+		multi.Antigravity = engine
+	}
+	if len(accounts.codex) > 0 {
+		engine, err := codex.NewCodexEngine(store, accounts.codex)
+		if err != nil {
+			slog.Error("cannot start codex", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = *defaultModel
+		if engine.DefaultModel == "" {
+			if models, err := engine.Models(ctx); err == nil {
+				engine.DefaultModel = models[0].ID
+			} else {
+				slog.Warn("could not fetch default model", "provider", "codex", "err", err)
+			}
+		}
+		multi.Codex = engine
+	}
+	if len(accounts.codebuddy) > 0 {
+		engine, err := codebuddy.NewCodeBuddyEngine(store, accounts.codebuddy)
+		if err != nil {
+			slog.Error("cannot start codebuddy", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = *defaultModel
+		if engine.DefaultModel == "" {
+			engine.DefaultModel = engine.Default()
+		}
+		multi.CodeBuddy = engine
+	}
+	if len(accounts.qoder) > 0 {
+		engine, err := qoder.NewQoderEngine(store, accounts.qoder)
+		if err != nil {
+			slog.Error("cannot start qoder", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = *defaultModel
+		if engine.DefaultModel == "" {
+			engine.DefaultModel = engine.Default()
+		}
+		multi.Qoder = engine
+	}
+	if len(accounts.kiro) > 0 {
+		engine, err := kiro.NewKiroEngine(store, accounts.kiro)
+		if err != nil {
+			slog.Error("cannot start kiro", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = *defaultModel
+		if engine.DefaultModel == "" {
+			engine.DefaultModel = engine.Default()
+		}
+		multi.Kiro = engine
+	}
+	if len(accounts.verboo) > 0 {
+		engine, err := verboo.NewEngine(store, accounts.verboo)
+		if err != nil {
+			slog.Error("cannot start verboo", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = *defaultModel
+		if engine.DefaultModel == "" {
+			if models, err := engine.Models(ctx); err == nil && len(models) > 0 {
+				engine.DefaultModel = models[0].ID
+			} else if err != nil {
+				slog.Warn("could not fetch default model", "provider", "verboo", "err", err)
+			}
+		}
+		multi.Verboo = engine
+	}
+	if len(accounts.nvidia) > 0 {
+		engine, err := upstream.NewEngine("nvidia", upstream.Providers["nvidia"].ResolveBaseURL(), store, accounts.nvidia)
+		if err != nil {
+			slog.Error("cannot start nvidia", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = pickDefault(*defaultModel, upstream.Providers["nvidia"].DefaultModel)
+		multi.NVIDIA = engine
+	}
+	if len(accounts.groq) > 0 {
+		engine, err := upstream.NewEngine("groq", upstream.Providers["groq"].ResolveBaseURL(), store, accounts.groq)
+		if err != nil {
+			slog.Error("cannot start groq", "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = pickDefault(*defaultModel, upstream.Providers["groq"].DefaultModel)
+		multi.Groq = engine
+	}
+	if len(accounts.cloudflare) > 0 {
+		engine, err := upstream.NewEngine("cloudflare", upstream.Providers["cloudflare"].ResolveBaseURL(), store, accounts.cloudflare)
+		if err != nil {
+			slog.Error("cannot start cloudflare", "err", err)
+			os.Exit(1)
+		}
+		engine.ModelsPath = "accounts/%s/ai/models/search"
+		engine.ChatPath = "accounts/%s/ai/v1/chat/completions"
+		engine.DefaultModel = pickDefault(*defaultModel, upstream.Providers["cloudflare"].DefaultModel)
+		multi.Cloudflare = engine
+	}
+	slog.Info("providers ready", "antigravity", len(accounts.antigravity), "codex", len(accounts.codex), "codebuddy", len(accounts.codebuddy), "qoder", len(accounts.qoder), "kiro", len(accounts.kiro), "verboo", len(accounts.verboo), "nvidia", len(accounts.nvidia), "groq", len(accounts.groq), "cloudflare", len(accounts.cloudflare))
+	provider = multi
 
 	var usageStore *httpapi.UsageStore
 	switch *usageDB {
@@ -398,7 +409,7 @@ func main() {
 	defer clearServerState(servedAt)
 
 	go func() {
-		slog.Info("seavxrouter listening", "addr", *listen, "backend", *backendName, "auth", *apiKey != "")
+		slog.Info("seavxrouter listening", "addr", *listen, "auth", *apiKey != "")
 		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server failed", "err", err)
 			stop()
@@ -412,7 +423,16 @@ func main() {
 	slog.Info("stopped")
 }
 
-var providerNames = []string{"antigravity", "codex", "codebuddy", "qoder", "kiro"}
+// pickDefault returns the configured override when set, otherwise the
+// provider's built-in default model.
+func pickDefault(override, fallback string) string {
+	if override != "" {
+		return override
+	}
+	return fallback
+}
+
+var providerNames = []string{"antigravity", "codex", "codebuddy", "qoder", "kiro", "verboo", "nvidia", "groq", "cloudflare"}
 
 type providerAccounts struct {
 	antigravity []*auth.Auth
@@ -420,6 +440,10 @@ type providerAccounts struct {
 	codebuddy   []*auth.Auth
 	qoder       []*auth.Auth
 	kiro        []*auth.Auth
+	verboo      []*auth.Auth
+	nvidia      []*auth.Auth
+	groq        []*auth.Auth
+	cloudflare  []*auth.Auth
 }
 
 func groupAuths(auths []*auth.Auth) providerAccounts {
@@ -434,6 +458,14 @@ func groupAuths(auths []*auth.Auth) providerAccounts {
 			accounts.qoder = append(accounts.qoder, a)
 		case "kiro":
 			accounts.kiro = append(accounts.kiro, a)
+		case "verboo":
+			accounts.verboo = append(accounts.verboo, a)
+		case "nvidia":
+			accounts.nvidia = append(accounts.nvidia, a)
+		case "groq":
+			accounts.groq = append(accounts.groq, a)
+		case "cloudflare":
+			accounts.cloudflare = append(accounts.cloudflare, a)
 		default:
 			accounts.antigravity = append(accounts.antigravity, a)
 		}
@@ -453,6 +485,8 @@ func (p providerAccounts) count(name string) int {
 		return len(p.qoder)
 	case "kiro":
 		return len(p.kiro)
+	case "verboo":
+		return len(p.verboo)
 	}
 	return 0
 }
@@ -478,6 +512,8 @@ func newChecker(name string, accounts providerAccounts, store auth.AuthStore, ap
 		return qoder.NewQoderEngine(store, accounts.qoder)
 	case "kiro":
 		return kiro.NewKiroEngine(store, accounts.kiro)
+	case "verboo":
+		return verboo.NewEngine(store, accounts.verboo)
 	}
 	return nil, fmt.Errorf("unknown provider %q", name)
 }
@@ -489,7 +525,7 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 	store := auth.AuthStore{Path: authFile}
 	auths, err := store.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro]\n", err)
+		fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare]\n", err)
 		return 1
 	}
 	accounts := groupAuths(auths)
@@ -510,7 +546,7 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 		}
 	}
 	if len(selected) == 0 {
-		fmt.Fprintln(os.Stderr, "no providers configured; run: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro]")
+		fmt.Fprintln(os.Stderr, "no providers configured; run: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo]")
 		return 1
 	}
 
@@ -526,7 +562,7 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 
 	for _, name := range selected {
 		if !isProvider(name) {
-			failProvider(name, "unknown provider (want antigravity, codex, codebuddy, qoder or kiro)")
+			failProvider(name, "unknown provider (want antigravity, codex, codebuddy, qoder, kiro or verboo)")
 			continue
 		}
 		if accounts.count(name) == 0 {

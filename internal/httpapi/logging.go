@@ -21,7 +21,8 @@ import (
 const (
 	// logRetention bounds the request log table to the newest entries.
 	logRetention = 1000
-	// maxLogBody caps captured request bodies and error response bodies.
+	// maxLogBody caps captured response bodies and the request body read limit.
+	// Request bodies are never persisted: they dwarf everything else in the DB.
 	maxLogBody = 10 << 20
 )
 
@@ -169,14 +170,84 @@ func (s *UsageStore) QueryLog(id string) (*RequestLog, error) {
 // logEntry is the in-flight log record attached to a request context.
 type logEntry struct {
 	RequestLog
-	started time.Time
+	started        time.Time
+	statusOverride int
 }
 
 type logKey struct{}
 
+// userKey carries the request used for caller attribution into contexts that
+// only expose a context (the completions package).
+type userKey struct{}
+
+// withUser stores the request so usage attribution can read its headers.
+func withUser(ctx context.Context, r *http.Request) context.Context {
+	return context.WithValue(ctx, userKey{}, r)
+}
+
 func logFromContext(ctx context.Context) *logEntry {
 	entry, _ := ctx.Value(logKey{}).(*logEntry)
 	return entry
+}
+
+// logFailure records a backend failure on the in-flight request log. Streaming
+// handlers call it after the 200 header was already sent, so the log and the
+// live feed report the real upstream status instead of a fake success.
+func logFailure(r *http.Request, status int, err error) {
+	entry := logFromContext(r.Context())
+	if entry == nil {
+		return
+	}
+	entry.statusOverride = status
+	if entry.Response != "" {
+		return
+	}
+	data, mErr := json.Marshal(map[string]any{
+		"error": map[string]any{"message": err.Error(), "type": "backend_error"},
+	})
+	if mErr == nil {
+		entry.Response = string(data)
+	}
+}
+
+// SetModel records which model and provider served the request.
+func (e *logEntry) SetModel(model, provider string) {
+	e.Model = model
+	e.Provider = provider
+}
+
+// SetUsage stores the token accounting reported for the request.
+func (e *logEntry) SetUsage(u backend.Usage) {
+	e.Usage = u
+}
+
+// SetResult stores the response body captured from the completed chat result.
+func (e *logEntry) SetResult(content string, toolCalls []backend.ToolCall, finishReason string) {
+	if e.Response != "" {
+		return
+	}
+	resp := struct {
+		Content      string             `json:"content,omitempty"`
+		ToolCalls    []backend.ToolCall `json:"tool_calls,omitempty"`
+		FinishReason string             `json:"finish_reason,omitempty"`
+	}{Content: content, ToolCalls: toolCalls, FinishReason: finishReason}
+	if b, err := json.Marshal(resp); err == nil {
+		e.Response = string(b)
+	}
+}
+
+// SetError marks the log entry failed with the upstream status and message.
+func (e *logEntry) SetError(status int, message string) {
+	e.statusOverride = status
+	if e.Response != "" {
+		return
+	}
+	data, err := json.Marshal(map[string]any{
+		"error": map[string]any{"message": message, "type": "backend_error"},
+	})
+	if err == nil {
+		e.Response = string(data)
+	}
 }
 
 // logResponseWriter records status and buffered body (non-stream only).
@@ -215,8 +286,9 @@ func (w *logResponseWriter) Flush() {
 	}
 }
 
-// logged captures the request body, the final status and, for completion
-// endpoints, the structured result recorded by the handler.
+// logged captures the final status and, for completion endpoints, the
+// structured result recorded by the handler. Request bodies are read for
+// model/stream hints but not persisted.
 func (s *Server) logged(endpoint string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		entry := &logEntry{
@@ -225,7 +297,6 @@ func (s *Server) logged(endpoint string, next http.HandlerFunc) http.HandlerFunc
 		}
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxLogBody))
 		r.Body = io.NopCloser(bytes.NewReader(raw))
-		entry.Request = string(raw)
 		var head struct {
 			Model  string `json:"model"`
 			Stream bool   `json:"stream"`
@@ -239,8 +310,11 @@ func (s *Server) logged(endpoint string, next http.HandlerFunc) http.HandlerFunc
 			writeError(w, &apiError{http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error", "body_too_large"})
 			entry.Status = http.StatusRequestEntityTooLarge
 		} else {
-			next(lw, r.WithContext(context.WithValue(r.Context(), logKey{}, entry)))
+			next(lw, r.WithContext(withUser(context.WithValue(r.Context(), logKey{}, entry), r)))
 			entry.Status = lw.status
+			if entry.statusOverride != 0 {
+				entry.Status = entry.statusOverride
+			}
 			if entry.Response == "" && lw.body.Len() > 0 {
 				entry.Response = lw.body.String()
 			}

@@ -6,19 +6,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"seavxrouter/internal/httpapi"
 )
 
 const (
-	ansiReset  = "\x1b[0m"
-	ansiBold   = "\x1b[1m"
-	ansiDim    = "\x1b[2m"
-	ansiRed    = "\x1b[31m"
-	ansiGreen  = "\x1b[32m"
-	ansiYellow = "\x1b[33m"
-	ansiCyan   = "\x1b[36m"
+	ansiReset   = "\x1b[0m"
+	ansiBold    = "\x1b[1m"
+	ansiDim     = "\x1b[2m"
+	ansiReverse = "\x1b[7m"
+	ansiRed     = "\x1b[31m"
+	ansiGreen   = "\x1b[32m"
+	ansiYellow  = "\x1b[33m"
+	ansiCyan    = "\x1b[36m"
 )
 
 // View is one dashboard frame.
@@ -28,6 +30,8 @@ type View struct {
 	Height   int
 	Color    bool
 	Paused   bool
+	Selected int
+	Detail   *httpapi.RequestLog
 }
 
 type renderer struct {
@@ -49,6 +53,9 @@ func render(v View) string {
 	}
 	snap := v.Snapshot
 	r := renderer{width: width, color: v.Color}
+	if v.Detail != nil {
+		return r.detail(v, height)
+	}
 
 	avail := height - 18
 	if avail < 0 {
@@ -77,7 +84,7 @@ func render(v View) string {
 	lines = append(lines, "")
 	lines = append(lines, r.groups(snap, groupRows)...)
 	lines = append(lines, "")
-	lines = append(lines, r.recent(snap, recentRows)...)
+	lines = append(lines, r.recent(snap, recentRows, v.Selected)...)
 
 	if len(lines) > height-1 {
 		lines = lines[:height-1]
@@ -85,7 +92,11 @@ func render(v View) string {
 	for len(lines) < height-1 {
 		lines = append(lines, "")
 	}
-	lines = append(lines, r.footer(width < 90))
+	hint := "q quit  ·  ↑/↓ select  ·  enter detail  ·  1-6 group  ·  r refresh  ·  p pause"
+	if width < 90 {
+		hint = "q quit · ↑↓ select · enter · 1-6 group · r · p"
+	}
+	lines = append(lines, r.footer(hint))
 	return strings.Join(lines, "\n")
 }
 
@@ -94,6 +105,77 @@ func (r renderer) paint(code, s string) string {
 		return s
 	}
 	return code + s + ansiReset
+}
+
+func (r renderer) detail(v View, height int) string {
+	e := v.Detail
+	statusStyle := ansiGreen
+	switch {
+	case e.Status >= 500 || e.Status == 0:
+		statusStyle = ansiRed
+	case e.Status >= 400:
+		statusStyle = ansiYellow
+	}
+	cachePct := "-"
+	if e.InputTokens > 0 {
+		cachePct = fmt.Sprintf("%.1f%%", float64(e.CacheReadTokens)*100/float64(e.InputTokens))
+	}
+	id := e.ID
+	if len(id) > 8 {
+		id = id[:8]
+	}
+
+	fields := []struct {
+		label string
+		value string
+		style string
+	}{
+		{"DATE", localStamp(e.TS), ""},
+		{"MODEL", e.Model, ""},
+		{"PROVIDER", e.Provider, ""},
+		{"STATUS", strconv.Itoa(e.Status), statusStyle},
+		{"STREAM", strconv.FormatBool(e.Stream), ""},
+		{"INPUT", humanCount(int64(e.InputTokens)) + " tokens", ""},
+		{"OUTPUT", humanCount(int64(e.OutputTokens)) + " tokens", ""},
+		{"CACHE READ", humanCount(int64(e.CacheReadTokens)) + " tokens · " + cachePct + " of input", ""},
+		{"TOTAL", humanCount(int64(e.TotalTokens)) + " tokens", ""},
+	}
+
+	lines := make([]string, 0, height)
+	lines = append(lines, r.paint(ansiBold+ansiCyan, "seavxrouter tui · request "+id))
+	lines = append(lines, "")
+	for _, f := range fields {
+		label := r.paint(ansiDim, fmt.Sprintf("%-12s", f.label))
+		value := clip(f.value, max(1, r.width-12))
+		if f.style != "" {
+			value = r.paint(f.style, value)
+		}
+		lines = append(lines, label+value)
+	}
+	for len(lines) < height-1 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, r.footer("q quit  ·  esc back"))
+	return strings.Join(lines, "\n")
+}
+
+// localHour renders a stored UTC "YYYY-MM-DDTHH" bucket key in the laptop's
+// timezone, matching the clock the user actually reads.
+func localHour(key string) string {
+	t, err := time.Parse("2006-01-02T15", key)
+	if err != nil {
+		return key
+	}
+	return t.Local().Format("2006-01-02T15")
+}
+
+// localStamp renders a stored UTC timestamp in the laptop's timezone.
+func localStamp(ts string) string {
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ts
+	}
+	return t.Local().Format("2006-01-02 15:04:05 MST")
 }
 
 func (r renderer) title(snap Snapshot) string {
@@ -118,11 +200,15 @@ func (r renderer) title(snap Snapshot) string {
 }
 
 func (r renderer) subtitle(snap Snapshot, paused bool) string {
-	parts := []string{"db " + displayPath(snap.DBPath), "group " + snap.GroupBy}
+	parts := []string{"db " + displayPath(snap.DBPath)}
+	if snap.DBSize > 0 {
+		parts = append(parts, "size "+humanBytes(snap.DBSize))
+	}
+	parts = append(parts, "group "+snap.GroupBy)
 	if paused {
 		parts = append(parts, "paused")
 	}
-	parts = append(parts, "updated "+snap.Generated.UTC().Format("15:04:05")+" UTC")
+	parts = append(parts, "updated "+snap.Generated.Local().Format("15:04:05 MST"))
 	line := strings.Join(parts, "  ·  ")
 	if snap.Err != "" {
 		line += "  ·  error: " + snap.Err
@@ -155,11 +241,11 @@ func (r renderer) totals(snap Snapshot) []string {
 	var widths []int
 	var headerCells []string
 	if full {
-		widths = []int{10, 8, 9, 10, 8, 9, 10, 10}
-		headerCells = []string{"TOTALS", "REQ", "PROMPT", "COMPL", "THINK", "CACHED", "TOTAL", "COST"}
+		widths = []int{10, 8, 9, 10, 8, 10, 10, 10}
+		headerCells = []string{"TOTALS", "REQ", "INPUT", "OUTPUT", "THINK", "CACHE READ", "TOTAL", "COST"}
 	} else {
 		widths = []int{8, 7, 8, 9, 9, 9}
-		headerCells = []string{"TOTALS", "REQ", "PROMPT", "COMPL", "TOTAL", "COST"}
+		headerCells = []string{"TOTALS", "REQ", "INPUT", "OUTPUT", "TOTAL", "COST"}
 	}
 	widths = r.fitWidths(widths, 0)
 	aligns := rightAligned(len(widths))
@@ -232,7 +318,7 @@ func (r renderer) compression(snap Snapshot) []string {
 }
 
 func (r renderer) groups(snap Snapshot, limit int) []string {
-	keyWidth := map[string]int{"day": 10, "provider": 14, "model": 24, "user": 16, "endpoint": 12}[snap.GroupBy]
+	keyWidth := map[string]int{"day": 10, "hour": 13, "provider": 14, "model": 24, "user": 16, "endpoint": 12}[snap.GroupBy]
 	if maxKey := r.width - 51; keyWidth > maxKey {
 		keyWidth = maxKey
 	}
@@ -243,19 +329,23 @@ func (r renderer) groups(snap Snapshot, limit int) []string {
 	widths = r.fitWidths(widths, 0)
 	aligns := rightAligned(len(widths))
 	lines := []string{r.paint(ansiBold+ansiCyan, "USAGE BY "+strings.ToUpper(snap.GroupBy))}
-	lines = append(lines, r.paint(ansiDim, joinCells([]string{"KEY", "REQ", "PROMPT", "COMPL", "TOTAL", "COST"}, widths, aligns)))
+	lines = append(lines, r.paint(ansiDim, joinCells([]string{"KEY", "REQ", "INPUT", "OUTPUT", "TOTAL", "COST"}, widths, aligns)))
 	if len(snap.Groups) == 0 {
 		return append(lines, r.paint(ansiDim, "  no usage recorded yet"))
 	}
 	rows := snap.Groups
-	if snap.GroupBy == "day" && len(rows) > limit {
+	if (snap.GroupBy == "day" || snap.GroupBy == "hour") && len(rows) > limit {
 		rows = rows[len(rows)-limit:]
 	} else if len(rows) > limit {
 		rows = rows[:limit]
 	}
 	for _, g := range rows {
+		key := g.Key
+		if snap.GroupBy == "hour" {
+			key = localHour(key)
+		}
 		cells := []string{
-			g.Key,
+			key,
 			humanCount(int64(g.Requests)),
 			humanCount(int64(g.PromptTokens)),
 			humanCount(int64(g.CompletionTokens)),
@@ -267,7 +357,7 @@ func (r renderer) groups(snap Snapshot, limit int) []string {
 	return lines
 }
 
-func (r renderer) recent(snap Snapshot, limit int) []string {
+func (r renderer) recent(snap Snapshot, limit, selected int) []string {
 	lines := []string{r.paint(ansiBold+ansiCyan, "RECENT REQUESTS")}
 	full := r.width >= 96
 	var widths []int
@@ -291,10 +381,12 @@ func (r renderer) recent(snap Snapshot, limit int) []string {
 	if len(snap.Recent) == 0 {
 		return append(lines, r.paint(ansiDim, "  no requests logged yet"))
 	}
-	for i, e := range snap.Recent {
-		if i >= limit {
-			break
-		}
+	start := 0
+	if limit > 0 && selected >= limit {
+		start = selected - limit + 1
+	}
+	for i := start; i < len(snap.Recent) && i-start < limit; i++ {
+		e := snap.Recent[i]
 		statusStyle := ansiGreen
 		switch {
 		case e.Status >= 500 || e.Status == 0:
@@ -303,23 +395,25 @@ func (r renderer) recent(snap Snapshot, limit int) []string {
 			statusStyle = ansiYellow
 		}
 		cells := []string{shortTime(e.TS), e.Endpoint, e.Model}
-		styles := make([]string, len(widths))
+		var styles []string
 		if full {
 			cells = append(cells, e.User)
 		}
 		cells = append(cells, strconv.Itoa(e.Status), humanDuration(e.DurationMS), humanCount(int64(e.TotalTokens)))
-		statusIdx := len(cells) - 3
-		styles[statusIdx] = statusStyle
-		lines = append(lines, r.row(cells, widths, aligns, styles))
+		if i != selected {
+			styles = make([]string, len(widths))
+			styles[len(cells)-3] = statusStyle
+		}
+		line := r.row(cells, widths, aligns, styles)
+		if i == selected {
+			line = r.paint(ansiReverse, line)
+		}
+		lines = append(lines, line)
 	}
 	return lines
 }
 
-func (r renderer) footer(narrow bool) string {
-	hint := "q quit  ·  1 day  2 provider  3 model  4 user  5 endpoint  ·  r refresh  ·  p pause"
-	if narrow {
-		hint = "q quit · 1-5 group · r refresh · p pause"
-	}
+func (r renderer) footer(hint string) string {
 	return r.paint(ansiDim, clip(hint, r.width))
 }
 
@@ -419,7 +513,7 @@ func humanCount(n int64) string {
 	switch {
 	case n <= 0:
 		return "0"
-	case n < 1000:
+	case n <= 10_000:
 		return strconv.FormatInt(n, 10)
 	case n < 1_000_000:
 		return scaledCount(n, 1e3) + "K"
@@ -431,7 +525,7 @@ func humanCount(n int64) string {
 }
 
 // scaledCount renders n/div with three decimals and a comma separator,
-// e.g. 2700 -> "2,700K".
+// e.g. 10400 -> "10,400K".
 func scaledCount(n int64, div float64) string {
 	return strings.Replace(strconv.FormatFloat(float64(n)/div, 'f', 3, 64), ".", ",", 1)
 }
@@ -480,9 +574,15 @@ func humanDuration(ms int64) string {
 	}
 }
 
+// shortTime renders a stored UTC timestamp as wall-clock time in the laptop's
+// timezone.
 func shortTime(ts string) string {
-	if len(ts) >= 19 {
-		return ts[11:19]
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		if len(ts) >= 19 {
+			return ts[11:19]
+		}
+		return ts
 	}
-	return ts
+	return t.Local().Format("15:04:05")
 }

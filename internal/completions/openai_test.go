@@ -1,4 +1,4 @@
-package httpapi
+package completions
 
 import (
 	"context"
@@ -7,9 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"seavxrouter/internal/auth"
 	"seavxrouter/internal/backend"
-	"seavxrouter/internal/multi"
 )
 
 type chatStub struct {
@@ -17,6 +15,7 @@ type chatStub struct {
 	result     *backend.ChatResult
 	deltas     []backend.ChatDelta
 	hasNoModel string
+	err        error
 }
 
 func (c *chatStub) Models(context.Context) ([]backend.Model, error) {
@@ -38,7 +37,7 @@ func (c *chatStub) Chat(_ context.Context, req *backend.ChatRequest, onDelta fun
 			onDelta(d)
 		}
 	}
-	return c.result, nil
+	return c.result, c.err
 }
 func (c *chatStub) Default() string { return "m" }
 
@@ -52,7 +51,7 @@ func TestOpenAIToolCalls(t *testing.T) {
 		s := &Server{backend: stub}
 		body := `{"model":"m","messages":[{"role":"user","content":"weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object"}}}]}`
 		w := httptest.NewRecorder()
-		s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -117,7 +116,7 @@ func TestOpenAIToolCalls(t *testing.T) {
 		s := &Server{backend: stub}
 		body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 		w := httptest.NewRecorder()
-		s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 		var toolChunkFound bool
 		var finalFinish string
 		for _, line := range strings.Split(w.Body.String(), "\n") {
@@ -173,7 +172,7 @@ func TestOpenAIToolCalls(t *testing.T) {
 			`{"role":"tool","tool_call_id":"call_1","name":"get_weather","content":"sunny"}` +
 			`]}`
 		w := httptest.NewRecorder()
-		s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -199,7 +198,7 @@ func TestOpenAIToolCalls(t *testing.T) {
 			`{"role":"tool","tool_call_id":"call_1","content":"sunny"}` +
 			`]}`
 		w := httptest.NewRecorder()
-		s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -238,7 +237,7 @@ func TestStreamUsageOptIn(t *testing.T) {
 	streamChunks := func(body string) []map[string]any {
 		w := httptest.NewRecorder()
 		s := newServer()
-		s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("code %d body %s", w.Code, w.Body.String())
 		}
@@ -303,7 +302,7 @@ func TestResponsesServiceTier(t *testing.T) {
 	s := &Server{backend: stub}
 	body := `{"model":"m","input":"hi","service_tier":"priority"}`
 	w := httptest.NewRecorder()
-	s.handleResponses(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+	s.HandleResponses(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
@@ -318,7 +317,7 @@ func TestHandleModel(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/v1/models/m", nil)
 	req.SetPathValue("id", "m")
-	s.handleModel(w, req)
+	s.HandleModel(w, req)
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
@@ -330,27 +329,40 @@ func TestHandleModel(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &model); err != nil {
 		t.Fatal(err)
 	}
-	if model.ID != "m" || model.Object != "model" || model.OwnedBy == "" {
+	// chatStub cannot name a provider, so owned_by stays empty here; the
+	// provider-attribution path is covered by TestOwnerOf.
+	if model.ID != "m" || model.Object != "model" {
 		t.Fatalf("model = %+v", model)
 	}
 
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest("GET", "/v1/models/missing", nil)
 	req.SetPathValue("id", "missing")
-	s.handleModel(w, req)
+	s.HandleModel(w, req)
 	if w.Code != 404 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
 }
 
+// namingStub reports a provider for one model ID, as multi.MultiBackend does.
+type namingStub struct {
+	chatStub
+	provider string
+}
+
+func (n *namingStub) Provider(context.Context, string) string { return n.provider }
+
 func TestOwnerOf(t *testing.T) {
-	mb := &multi.MultiBackend{Antigravity: &chatStub{}, Codex: &chatStub{hasNoModel: "gemini-2.5-flash"}}
-	s := &Server{backend: mb}
+	s := &Server{backend: &namingStub{provider: "codex"}}
 	if got := s.ownerOf(context.Background(), "codex/gpt-5.6-luna"); got != "codex" {
 		t.Fatalf("prefixed codex owner = %q", got)
 	}
-	if got := s.ownerOf(context.Background(), "gemini-2.5-flash"); got != "antigravity" {
-		t.Fatalf("antigravity owner = %q", got)
+	if got := s.ownerOf(context.Background(), "plain"); got != "codex" {
+		t.Fatalf("owner = %q", got)
+	}
+	// Backends that cannot name a provider fall back to the default label.
+	if got := (&Server{backend: &chatStub{}}).ownerOf(context.Background(), "x"); got != "antigravity" {
+		t.Fatalf("non-naming owner = %q", got)
 	}
 }
 
@@ -365,7 +377,7 @@ func TestChatImageContent(t *testing.T) {
 		`{"type":"image_url","image_url":{"url":"https://example.com/b.jpg"}}` +
 		`]}]}`
 	w := httptest.NewRecorder()
-	s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
@@ -402,7 +414,7 @@ func TestChatRejectsUnsupportedContent(t *testing.T) {
 			s := &Server{backend: &chatStub{result: &backend.ChatResult{Content: "x"}}}
 			body := `{"model":"m","messages":[{"role":"user","content":[` + tc.part + `]}]}`
 			w := httptest.NewRecorder()
-			s.handleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+			s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 			if w.Code != 400 {
 				t.Fatalf("code %d body %s", w.Code, w.Body.String())
 			}
@@ -421,7 +433,7 @@ func TestResponsesImageInput(t *testing.T) {
 		`{"type":"input_image","image_url":"data:image/png;base64,` + testPNGB64 + `"}` +
 		`]}]}`
 	w := httptest.NewRecorder()
-	s.handleResponses(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+	s.HandleResponses(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
 	if w.Code != 200 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
 	}
@@ -449,133 +461,5 @@ func TestResponsesImageInput(t *testing.T) {
 	user := stub.gotReq.Messages[1]
 	if user.Content != "describe" || len(user.Images) != 1 || user.Images[0].Data != testPNGB64 {
 		t.Fatalf("user message = %+v", user)
-	}
-}
-
-type providerQuotaStub struct{ chatStub }
-
-func (providerQuotaStub) Quota() auth.ProviderQuota {
-	return auth.ProviderQuota{Provider: "qoder", DefaultModel: "m"}
-}
-
-type quotaStub struct{ chatStub }
-
-func (quotaStub) Quota() []auth.ProviderQuota {
-	return []auth.ProviderQuota{{
-		Provider:     "antigravity",
-		DefaultModel: "m",
-		Accounts:     []auth.AccountQuota{{Provider: "antigravity", Email: "a@example.com", Status: "ready"}},
-	}}
-}
-
-func TestHandleQuota(t *testing.T) {
-	s := &Server{backend: &quotaStub{}}
-	w := httptest.NewRecorder()
-	s.handleQuota(w, httptest.NewRequest("GET", "/v1/quota", nil))
-	if w.Code != 200 {
-		t.Fatalf("code %d body %s", w.Code, w.Body.String())
-	}
-	var resp struct {
-		Object string `json:"object"`
-		Data   []struct {
-			Provider string `json:"provider"`
-			Accounts []struct {
-				Email  string `json:"email"`
-				Status string `json:"status"`
-			} `json:"accounts"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp.Object != "quota" || len(resp.Data) != 1 || resp.Data[0].Provider != "antigravity" {
-		t.Fatalf("resp = %s", w.Body.String())
-	}
-	if len(resp.Data[0].Accounts) != 1 || resp.Data[0].Accounts[0].Email != "a@example.com" || resp.Data[0].Accounts[0].Status != "ready" {
-		t.Fatalf("accounts = %+v", resp.Data[0].Accounts)
-	}
-}
-
-func TestMultiBackendCodeBuddyRouting(t *testing.T) {
-	agy := &chatStub{result: &backend.ChatResult{Content: "a"}}
-	cb := &chatStub{result: &backend.ChatResult{Content: "c"}}
-	mb := &multi.MultiBackend{Antigravity: agy, CodeBuddy: cb}
-	ctx := context.Background()
-
-	if _, err := mb.Chat(ctx, &backend.ChatRequest{Model: "codebuddy/glm5.1"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if cb.gotReq == nil || cb.gotReq.Model != "glm-5.1" || agy.gotReq != nil {
-		t.Fatalf("prefixed codebuddy not routed: cb=%+v agy=%+v", cb.gotReq, agy.gotReq)
-	}
-	// Bare IDs keep their historical routing to antigravity.
-	if _, err := mb.Chat(ctx, &backend.ChatRequest{Model: "claude-4.0"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if agy.gotReq == nil || agy.gotReq.Model != "claude-4.0" {
-		t.Fatalf("bare id not routed to antigravity: %+v", agy.gotReq)
-	}
-	models, err := mb.Models(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var prefixed bool
-	for _, m := range models {
-		if strings.HasPrefix(m.ID, "codebuddy/") {
-			prefixed = true
-		}
-	}
-	if !prefixed {
-		t.Fatalf("codebuddy models not prefixed: %+v", models)
-	}
-	s := &Server{backend: mb}
-	if got := s.ownerOf(ctx, "codebuddy/auto-chat"); got != "codebuddy" {
-		t.Fatalf("owner = %q", got)
-	}
-	if !mb.HasModel(ctx, "codebuddy/auto-chat") {
-		t.Fatal("HasModel should accept prefixed codebuddy model")
-	}
-}
-
-func TestMultiBackendQoderRouting(t *testing.T) {
-	q := &providerQuotaStub{}
-	mb := &multi.MultiBackend{Qoder: q}
-	ctx := context.Background()
-
-	if _, err := mb.Chat(ctx, &backend.ChatRequest{Model: "qoder/Qwen3.7-Max"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if q.gotReq == nil || q.gotReq.Model != "Qwen3.7-Max" {
-		t.Fatalf("prefixed qoder not routed: %+v", q.gotReq)
-	}
-	// Bare IDs fall back to qoder when it is the only provider.
-	if _, err := mb.Chat(ctx, &backend.ChatRequest{Model: "Qwen3.7-Max"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if q.gotReq.Model != "Qwen3.7-Max" {
-		t.Fatalf("bare id not routed to qoder: %+v", q.gotReq)
-	}
-	if mb.Default() != "m" {
-		t.Fatalf("MultiBackend default = %q", mb.Default())
-	}
-	if qs := mb.Quota(); len(qs) != 1 || qs[0].Provider != "qoder" {
-		t.Fatalf("quota = %+v", qs)
-	}
-	s := &Server{backend: mb}
-	if owner := s.ownerOf(ctx, "qoder/Qwen3.7-Max"); owner != "qoder" {
-		t.Fatalf("ownerOf = %q, want qoder", owner)
-	}
-	models, err := mb.Models(ctx)
-	if err != nil {
-		t.Fatalf("models: %v", err)
-	}
-	found := false
-	for _, mo := range models {
-		if mo.ID == "qoder/m" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("qoder models should be prefixed, got %+v", models)
 	}
 }

@@ -63,9 +63,9 @@ func (s AuthStore) Load() ([]*Auth, error) {
 		if a.Provider == "" {
 			a.Provider = "antigravity"
 		}
-		// CodeBuddy and Qoder accounts are bearer-only; the other providers
-		// rotate tokens through a refresh_token.
-		if a.RefreshToken == "" && a.Provider != "codebuddy" && a.Provider != "qoder" {
+		// Bearer-only providers hold a long-lived API key and never refresh;
+		// the rest rotate tokens through a refresh_token.
+		if a.RefreshToken == "" && !bearerOnlyProviders[a.Provider] {
 			return nil, fmt.Errorf("%s: an account has no refresh_token; run login again", s.Path)
 		}
 	}
@@ -73,6 +73,17 @@ func (s AuthStore) Load() ([]*Auth, error) {
 		return nil, fmt.Errorf("%s contains no accounts", s.Path)
 	}
 	return auths, nil
+}
+
+// bearerOnlyProviders lists providers whose credential is an API key that is
+// presented as-is, with no refresh cycle.
+var bearerOnlyProviders = map[string]bool{
+	"codebuddy":  true,
+	"qoder":      true,
+	"verboo":     true,
+	"nvidia":     true,
+	"groq":       true,
+	"cloudflare": true,
 }
 
 var storeMu sync.Mutex
@@ -137,7 +148,7 @@ func sameAccount(a, b *Auth) bool {
 	if a.Provider == "kiro" && a.AccountID != "" && b.AccountID != "" {
 		return a.AccountID == b.AccountID
 	}
-	if a.Provider == "codebuddy" || a.Provider == "qoder" {
+	if a.Provider == "codebuddy" || a.Provider == "qoder" || a.Provider == "verboo" {
 		return a.AccessToken != "" && a.AccessToken == b.AccessToken
 	}
 	return a.RefreshToken == b.RefreshToken

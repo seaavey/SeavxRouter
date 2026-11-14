@@ -9,20 +9,24 @@ import (
 
 	"seavxrouter/internal/auth"
 	"seavxrouter/internal/backend"
-	"seavxrouter/internal/codebuddy"
-	"seavxrouter/internal/kiro"
+	"seavxrouter/internal/providers/codebuddy"
+	"seavxrouter/internal/providers/kiro"
 )
 
 // MultiBackend routes requests across providers. backend.Model IDs may carry an
-// explicit "codex/", "antigravity/", "codebuddy/", "qoder/" or "kiro/" prefix;
-// bare IDs go to codex only when codex lists that model, otherwise to
-// antigravity.
+// explicit "codex/", "antigravity/", "codebuddy/", "qoder/", "kiro/" or
+// "verboo/", "nvidia/", "groq/" or "cloudflare/" prefix; bare IDs go to codex only when codex lists that model,
+// otherwise to antigravity.
 type MultiBackend struct {
 	Antigravity backend.BackendAPI
 	Codex       backend.BackendAPI
 	CodeBuddy   backend.BackendAPI
 	Qoder       backend.BackendAPI
 	Kiro        backend.BackendAPI
+	Verboo      backend.BackendAPI
+	NVIDIA      backend.BackendAPI
+	Groq        backend.BackendAPI
+	Cloudflare  backend.BackendAPI
 }
 
 func (m *MultiBackend) Default() string {
@@ -40,6 +44,18 @@ func (m *MultiBackend) Default() string {
 	}
 	if m.Kiro != nil {
 		return m.Kiro.Default()
+	}
+	if m.Verboo != nil {
+		return m.Verboo.Default()
+	}
+	if m.NVIDIA != nil {
+		return m.NVIDIA.Default()
+	}
+	if m.Groq != nil {
+		return m.Groq.Default()
+	}
+	if m.Cloudflare != nil {
+		return m.Cloudflare.Default()
 	}
 	return ""
 }
@@ -97,6 +113,26 @@ func (m *MultiBackend) resolve(ctx context.Context, model string) (backend.Backe
 				return nil, "", fmt.Errorf("kiro provider not configured; run: seavxrouter login kiro")
 			}
 			return m.Kiro, kiro.ModelID(id), nil
+		case "verboo":
+			if m.Verboo == nil {
+				return nil, "", fmt.Errorf("verboo provider not configured; run: seavxrouter login verboo")
+			}
+			return m.Verboo, id, nil
+		case "nvidia":
+			if m.NVIDIA == nil {
+				return nil, "", fmt.Errorf("nvidia provider not configured; run: seavxrouter login nvidia")
+			}
+			return m.NVIDIA, id, nil
+		case "groq":
+			if m.Groq == nil {
+				return nil, "", fmt.Errorf("groq provider not configured; run: seavxrouter login groq")
+			}
+			return m.Groq, id, nil
+		case "cloudflare", "cf":
+			if m.Cloudflare == nil {
+				return nil, "", fmt.Errorf("cloudflare provider not configured; run: seavxrouter login cloudflare")
+			}
+			return m.Cloudflare, id, nil
 		}
 	}
 	model = normalizeModel(model)
@@ -117,6 +153,18 @@ func (m *MultiBackend) resolve(ctx context.Context, model string) (backend.Backe
 	}
 	if m.Kiro != nil {
 		return m.Kiro, model, nil
+	}
+	if m.Verboo != nil {
+		return m.Verboo, model, nil
+	}
+	if m.NVIDIA != nil {
+		return m.NVIDIA, model, nil
+	}
+	if m.Groq != nil {
+		return m.Groq, model, nil
+	}
+	if m.Cloudflare != nil {
+		return m.Cloudflare, model, nil
 	}
 	return nil, "", fmt.Errorf("no providers configured")
 }
@@ -178,6 +226,36 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		}
 		for _, mo := range models {
 			out = append(out, backend.Model{ID: "kiro/" + mo.ID, Name: mo.Name})
+		}
+	}
+	if m.Verboo != nil {
+		models, err := m.Verboo.Models(ctx)
+		if err != nil {
+			lastErr = err
+			slog.Warn("verboo models unavailable", "err", err)
+		}
+		for _, mo := range models {
+			out = append(out, backend.Model{ID: "verboo/" + mo.ID, Name: mo.Name})
+		}
+	}
+	for _, p := range []struct {
+		name    string
+		backend backend.BackendAPI
+	}{
+		{"nvidia", m.NVIDIA},
+		{"groq", m.Groq},
+		{"cloudflare", m.Cloudflare},
+	} {
+		if p.backend == nil {
+			continue
+		}
+		models, err := p.backend.Models(ctx)
+		if err != nil {
+			lastErr = err
+			slog.Warn(p.name+" models unavailable", "err", err)
+		}
+		for _, mo := range models {
+			out = append(out, backend.Model{ID: p.name + "/" + mo.ID, Name: mo.Name})
 		}
 	}
 	if len(out) == 0 && lastErr != nil {
@@ -266,24 +344,58 @@ func (m *MultiBackend) Chat(ctx context.Context, req *backend.ChatRequest, onDel
 		}
 	}
 
+	primaryErr := lastErr
+	tried := map[backend.BackendAPI]bool{primary: true}
 	for _, p := range m.slots() {
-		if p.backend == nil || p.backend == primary {
+		if p.backend == nil || tried[p.backend] {
 			continue
 		}
 		altID := p.modelID(id)
 		if altID == "" || !p.backend.HasModel(ctx, altID) {
 			continue
 		}
+		tried[p.backend] = true
 		result, err := call(p.backend, altID)
 		if err == nil {
 			slog.Info("failover succeeded", "provider", p.name, "model", altID)
 			return result, nil
 		}
 		lastErr = err
-		if started || !backend.IsRetryableError(err) || ctx.Err() != nil {
+		if started || ctx.Err() != nil {
 			return nil, lastErr
 		}
+		if !backend.IsRetryableError(err) {
+			// A provider can claim a model via a fail-open HasModel and then
+			// reject it; that must not end the fallback chain.
+			slog.Warn("fallback provider rejected the model", "provider", p.name, "model", altID, "err", err)
+			continue
+		}
 		slog.Warn("fallback provider failed", "provider", p.name, "model", altID, "err", err)
+	}
+
+	// The primary is quota- or auth-dead and no provider served the requested
+	// model. Give every remaining provider one try with its own default model
+	// so the request is still answered elsewhere.
+	if backend.IsQuotaError(primaryErr) || backend.IsAuthError(primaryErr) {
+		for _, p := range m.slots() {
+			if p.backend == nil || p.backend == primary {
+				continue
+			}
+			def := p.backend.Default()
+			if def == "" {
+				continue
+			}
+			result, err := call(p.backend, def)
+			if err == nil {
+				slog.Info("last-resort fallback succeeded", "provider", p.name, "model", def)
+				return result, nil
+			}
+			lastErr = err
+			if started || ctx.Err() != nil {
+				return nil, lastErr
+			}
+			slog.Warn("last-resort fallback failed", "provider", p.name, "model", def, "err", err)
+		}
 	}
 	return nil, lastErr
 }
@@ -307,6 +419,10 @@ func (m *MultiBackend) slots() []providerSlot {
 		{name: "codebuddy", backend: m.CodeBuddy, modelID: codebuddy.ModelID},
 		{name: "qoder", backend: m.Qoder, modelID: identityModel},
 		{name: "kiro", backend: m.Kiro, modelID: kiro.ModelID},
+		{name: "verboo", backend: m.Verboo, modelID: identityModel},
+		{name: "nvidia", backend: m.NVIDIA, modelID: identityModel},
+		{name: "groq", backend: m.Groq, modelID: identityModel},
+		{name: "cloudflare", backend: m.Cloudflare, modelID: identityModel},
 	}
 }
 
@@ -328,7 +444,9 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func (m *MultiBackend) Provider(ctx context.Context, model string) string {
 	if name, _, ok := strings.Cut(model, "/"); ok {
 		switch name {
-		case "codex", "antigravity", "codebuddy", "qoder", "kiro":
+		case "cloudflare":
+			return "cloudflare"
+		case "codex", "antigravity", "codebuddy", "qoder", "kiro", "verboo", "nvidia", "groq":
 			return name
 		}
 	}
@@ -351,6 +469,18 @@ func (m *MultiBackend) Provider(ctx context.Context, model string) string {
 	if m.Kiro != nil {
 		return "kiro"
 	}
+	if m.Verboo != nil {
+		return "verboo"
+	}
+	if m.NVIDIA != nil {
+		return "nvidia"
+	}
+	if m.Groq != nil {
+		return "groq"
+	}
+	if m.Cloudflare != nil {
+		return "cloudflare"
+	}
 	return ""
 }
 
@@ -361,7 +491,7 @@ type quotaReporter interface {
 // Quota aggregates per-account quota across providers that expose it.
 func (m *MultiBackend) Quota() []auth.ProviderQuota {
 	out := []auth.ProviderQuota{}
-	for _, b := range []backend.BackendAPI{m.Antigravity, m.Codex, m.CodeBuddy, m.Qoder, m.Kiro} {
+	for _, b := range []backend.BackendAPI{m.Antigravity, m.Codex, m.CodeBuddy, m.Qoder, m.Kiro, m.Verboo, m.NVIDIA, m.Groq, m.Cloudflare} {
 		if b == nil {
 			continue
 		}

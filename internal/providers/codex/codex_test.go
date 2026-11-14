@@ -155,6 +155,69 @@ func TestCodexChatStreamFunctionCall(t *testing.T) {
 	}
 }
 
+func TestPromptSessionIDStable(t *testing.T) {
+	a := promptSessionID("m", "", `{"role":"user"}`)
+	if a != promptSessionID("m", "", `{"role":"user"}`) {
+		t.Fatal("session id is not deterministic")
+	}
+	if a == promptSessionID("m", "", `{"role":"other"}`) {
+		t.Fatal("different prompts share a session id")
+	}
+	if len(a) != 36 {
+		t.Fatalf("session id = %q, want UUID shape", a)
+	}
+}
+
+// TestChatSessionHeaderStable guards cache affinity: the Codex backend routes
+// prompt-cache hits by Session-Id, so the same conversation must reuse it.
+func TestChatSessionHeaderStable(t *testing.T) {
+	sessions := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessions <- r.Header.Get("Session-Id")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+	}))
+	defer srv.Close()
+
+	e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.BaseURL = srv.URL
+	req := &backend.ChatRequest{Model: "gpt-5-codex", Messages: []backend.ChatMessage{{Role: "user", Content: "hello"}}}
+	for i := 0; i < 2; i++ {
+		if _, err := e.Chat(context.Background(), req, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := <-sessions, <-sessions
+	if first == "" || first != second {
+		t.Fatalf("session ids = %q / %q, want stable", first, second)
+	}
+}
+
+func TestCodexLegacyStreamCachesTokens(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":4,\"total_tokens\":24,\"input_tokens_details\":{\"cached_tokens\":16},\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n")
+	}))
+	defer srv.Close()
+
+	e, err := NewCodexEngine(auth.AuthStore{}, []*auth.Auth{{AccessToken: "t", Expiry: time.Now().Add(time.Hour)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.BaseURL = srv.URL
+	res, err := e.Stream(context.Background(), "gpt-5-codex", "hello", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Usage.InputTokens != 20 || res.Usage.CacheReadTokens != 16 || res.Usage.ThinkingTokens != 2 {
+		t.Fatalf("usage = %+v", res.Usage)
+	}
+}
+
 func TestCodexChatRequestRoundTrip(t *testing.T) {
 	var upstreamBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

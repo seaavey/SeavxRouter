@@ -1,4 +1,4 @@
-package httpapi
+package completions
 
 import (
 	"encoding/json"
@@ -255,7 +255,7 @@ func anthropicMessageObject(id, model string, result *backend.ChatResult) map[st
 	}
 }
 
-func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+func (s *Server) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	var req anthropicRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 10<<20)).Decode(&req); err != nil {
 		writeError(w, &apiError{http.StatusBadRequest, "invalid JSON body: " + err.Error(), "invalid_request_error", "invalid_json"})
@@ -274,7 +274,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeError(w, err)
 		return
 	}
-	s.applyCompression(cr, "messages")
+	s.applyCompression(r, cr, "messages")
 	id := backend.NewID("msg_")
 
 	if !req.Stream {
@@ -340,6 +340,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	})
 	if err != nil {
 		slog.Warn("anthropic stream failed", "err", err)
+		s.logFailure(r, backend.StatusCode(err), err)
 		send("error", map[string]any{"error": map[string]any{"type": "backend_error", "message": err.Error()}})
 		return
 	}

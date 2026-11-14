@@ -202,7 +202,7 @@ func (e *CodexEngine) fetchUsageWindows(ctx context.Context, a *auth.Auth) ([]au
 		if err != nil {
 			return nil, err
 		}
-		e.setHeaders(req, token, a, false)
+		e.setHeaders(req, token, a, false, "")
 		resp, err := e.HTTP.Do(req)
 		if err != nil {
 			return nil, err
