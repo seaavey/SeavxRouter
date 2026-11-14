@@ -156,6 +156,27 @@ Every release ships static binaries (`CGO_ENABLED=0`) with a
 Download the file for your platform from
 [Releases](https://github.com/seaavey/SeavxRouter/releases/latest):
 
+### Install script
+
+The installer detects your OS and architecture, downloads the matching
+release, verifies its SHA-256 checksum, and installs to `$PREFIX/bin` on
+Termux or `~/.local/bin` elsewhere:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seaavey/SeavxRouter/main/install.sh | sh
+```
+
+Pin a release or choose a directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seaavey/SeavxRouter/main/install.sh \
+  | sh -s -- --version v0.1.1 --dir "$HOME/bin"
+```
+
+On Windows, run the script from Git Bash or download the `.exe` manually.
+
+### Manual download
+
 ```bash
 # Linux x86_64
 curl -fsSL -o seavxrouter \
