@@ -24,6 +24,23 @@ func newTestUsageStore(t *testing.T) *UsageStore {
 	return store
 }
 
+func TestUsageStoreBoundsWAL(t *testing.T) {
+	store := newTestUsageStore(t)
+	var auto, limit int
+	if err := store.db.QueryRow("PRAGMA wal_autocheckpoint").Scan(&auto); err != nil {
+		t.Fatalf("PRAGMA wal_autocheckpoint: %v", err)
+	}
+	if auto != usageWalAutocheckpoint {
+		t.Fatalf("wal_autocheckpoint = %d, want %d", auto, usageWalAutocheckpoint)
+	}
+	if err := store.db.QueryRow("PRAGMA journal_size_limit").Scan(&limit); err != nil {
+		t.Fatalf("PRAGMA journal_size_limit: %v", err)
+	}
+	if limit != usageJournalSizeLimit {
+		t.Fatalf("journal_size_limit = %d, want %d", limit, usageJournalSizeLimit)
+	}
+}
+
 func TestUsageStoreRecordAndQuery(t *testing.T) {
 	store := newTestUsageStore(t)
 	entries := []UsageEntry{

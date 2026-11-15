@@ -22,6 +22,12 @@ import (
 // time ordering for range filters.
 const usageTimestampLayout = "2006-01-02T15:04:05Z"
 
+// Keep the WAL near 1 MiB instead of the default 1000 pages (~4 MiB).
+const (
+	usageWalAutocheckpoint = 256
+	usageJournalSizeLimit  = 1 << 20
+)
+
 // UsageEntry is one recorded billable request.
 type UsageEntry struct {
 	TS               string
@@ -132,7 +138,8 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 			return nil, fmt.Errorf("creating usage db dir: %w", err)
 		}
 	}
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=wal_autocheckpoint(%d)&_pragma=journal_size_limit(%d)",
+		path, usageWalAutocheckpoint, usageJournalSizeLimit)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening usage db: %w", err)
@@ -169,7 +176,13 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 	return &UsageStore{db: db}, nil
 }
 
-func (s *UsageStore) Close() error { return s.db.Close() }
+// Close truncates the WAL back into the main database before closing so the
+// -wal file does not linger at its capped size after shutdown.
+func (s *UsageStore) Close() error {
+	var busy, log, checkpointed int
+	_ = s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &log, &checkpointed)
+	return s.db.Close()
+}
 
 // ensureUsageCostColumn adds cost_usd to databases created before cost
 // tracking existed.
