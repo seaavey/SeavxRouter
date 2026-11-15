@@ -26,6 +26,7 @@ import (
 	"seavxrouter/internal/providers/codebuddy"
 	"seavxrouter/internal/providers/codex"
 	"seavxrouter/internal/providers/kiro"
+	"seavxrouter/internal/providers/opencode"
 	"seavxrouter/internal/providers/qoder"
 	"seavxrouter/internal/providers/upstream"
 	"seavxrouter/internal/providers/verboo"
@@ -218,11 +219,13 @@ func main() {
 		case "verboo":
 			engine := &verboo.Engine{Store: store, HTTP: &http.Client{}}
 			err = engine.Login(ctx)
+		case "opencode":
+			err = opencode.Login(ctx, store, os.Stdout)
 		case "nvidia", "groq", "cloudflare":
 			p := upstream.Providers[loginProvider]
 			err = upstream.Login(ctx, p, store, os.Stdin, os.Stdout, "")
 		default:
-			slog.Error("unknown login provider (want antigravity, codex, codebuddy, qoder, kiro, verboo, nvidia, groq or cloudflare)", "provider", loginProvider)
+			slog.Error("unknown login provider (want antigravity, codex, codebuddy, qoder, kiro, verboo, nvidia, groq, cloudflare or opencode)", "provider", loginProvider)
 			os.Exit(1)
 		}
 		if err != nil {
@@ -236,7 +239,7 @@ func main() {
 	store := auth.AuthStore{Path: *authFile}
 	auths, err := store.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare]\n", err)
+		fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare|opencode]\n", err)
 		os.Exit(1)
 	}
 	accounts := groupAuths(auths)
@@ -354,7 +357,16 @@ func main() {
 		engine.DefaultModel = pickDefault(*defaultModel, upstream.Providers["cloudflare"].DefaultModel)
 		multi.Cloudflare = engine
 	}
-	slog.Info("providers ready", "antigravity", len(accounts.antigravity), "codex", len(accounts.codex), "codebuddy", len(accounts.codebuddy), "qoder", len(accounts.qoder), "kiro", len(accounts.kiro), "verboo", len(accounts.verboo), "nvidia", len(accounts.nvidia), "groq", len(accounts.groq), "cloudflare", len(accounts.cloudflare))
+	if len(accounts.opencode) > 0 {
+		engine, err := opencode.NewEngine(opencode.ConfigFromEnv())
+		if err != nil {
+			slog.Error("cannot start opencode", "err", err)
+			os.Exit(1)
+		}
+		defer engine.Close()
+		multi.OpenCode = engine
+	}
+	slog.Info("providers ready", "antigravity", len(accounts.antigravity), "codex", len(accounts.codex), "codebuddy", len(accounts.codebuddy), "qoder", len(accounts.qoder), "kiro", len(accounts.kiro), "verboo", len(accounts.verboo), "nvidia", len(accounts.nvidia), "groq", len(accounts.groq), "cloudflare", len(accounts.cloudflare), "opencode", len(accounts.opencode))
 	provider = multi
 
 	var usageStore *httpapi.UsageStore
@@ -432,7 +444,7 @@ func pickDefault(override, fallback string) string {
 	return fallback
 }
 
-var providerNames = []string{"antigravity", "codex", "codebuddy", "qoder", "kiro", "verboo", "nvidia", "groq", "cloudflare"}
+var providerNames = []string{"antigravity", "codex", "codebuddy", "qoder", "kiro", "verboo", "nvidia", "groq", "cloudflare", "opencode"}
 
 type providerAccounts struct {
 	antigravity []*auth.Auth
@@ -444,6 +456,7 @@ type providerAccounts struct {
 	nvidia      []*auth.Auth
 	groq        []*auth.Auth
 	cloudflare  []*auth.Auth
+	opencode    []*auth.Auth
 }
 
 func groupAuths(auths []*auth.Auth) providerAccounts {
@@ -466,6 +479,8 @@ func groupAuths(auths []*auth.Auth) providerAccounts {
 			accounts.groq = append(accounts.groq, a)
 		case "cloudflare":
 			accounts.cloudflare = append(accounts.cloudflare, a)
+		case "opencode":
+			accounts.opencode = append(accounts.opencode, a)
 		default:
 			accounts.antigravity = append(accounts.antigravity, a)
 		}
@@ -473,22 +488,34 @@ func groupAuths(auths []*auth.Auth) providerAccounts {
 	return accounts
 }
 
-func (p providerAccounts) count(name string) int {
+func (p providerAccounts) list(name string) []*auth.Auth {
 	switch name {
 	case "antigravity":
-		return len(p.antigravity)
+		return p.antigravity
 	case "codex":
-		return len(p.codex)
+		return p.codex
 	case "codebuddy":
-		return len(p.codebuddy)
+		return p.codebuddy
 	case "qoder":
-		return len(p.qoder)
+		return p.qoder
 	case "kiro":
-		return len(p.kiro)
+		return p.kiro
 	case "verboo":
-		return len(p.verboo)
+		return p.verboo
+	case "nvidia":
+		return p.nvidia
+	case "groq":
+		return p.groq
+	case "cloudflare":
+		return p.cloudflare
+	case "opencode":
+		return p.opencode
 	}
-	return 0
+	return nil
+}
+
+func (p providerAccounts) count(name string) int {
+	return len(p.list(name))
 }
 
 func isProvider(name string) bool {
@@ -514,6 +541,10 @@ func newChecker(name string, accounts providerAccounts, store auth.AuthStore, ap
 		return kiro.NewKiroEngine(store, accounts.kiro)
 	case "verboo":
 		return verboo.NewEngine(store, accounts.verboo)
+	case "opencode":
+		return opencode.NewEngine(opencode.ConfigFromEnv())
+	case "nvidia", "groq", "cloudflare":
+		return upstream.NewProviderEngine(upstream.Providers[name], store, accounts.list(name))
 	}
 	return nil, fmt.Errorf("unknown provider %q", name)
 }
@@ -525,7 +556,7 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 	store := auth.AuthStore{Path: authFile}
 	auths, err := store.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare]\n", err)
+		fmt.Fprintf(os.Stderr, "cannot load credentials (%v)\nRun: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare|opencode]\n", err)
 		return 1
 	}
 	accounts := groupAuths(auths)
@@ -546,7 +577,7 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 		}
 	}
 	if len(selected) == 0 {
-		fmt.Fprintln(os.Stderr, "no providers configured; run: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo]")
+		fmt.Fprintln(os.Stderr, "no providers configured; run: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare|opencode]")
 		return 1
 	}
 
@@ -562,7 +593,7 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 
 	for _, name := range selected {
 		if !isProvider(name) {
-			failProvider(name, "unknown provider (want antigravity, codex, codebuddy, qoder, kiro or verboo)")
+			failProvider(name, "unknown provider (want antigravity, codex, codebuddy, qoder, kiro, verboo, nvidia, groq, cloudflare or opencode)")
 			continue
 		}
 		if accounts.count(name) == 0 {
@@ -577,6 +608,9 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 		checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
 		results := checker.Check(checkCtx)
 		cancel()
+		if closer, ok := checker.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		if len(results) == 0 {
 			failProvider(name, "no accounts")
 			continue

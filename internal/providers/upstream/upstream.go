@@ -112,12 +112,14 @@ func (e *Engine) snapshot() []*auth.Auth {
 	return append([]*auth.Auth(nil), e.auths...)
 }
 
+type modelEntry struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	OwnedBy string `json:"owned_by"`
+}
+
 type modelList struct {
-	Data []struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		OwnedBy string `json:"owned_by"`
-	} `json:"data"`
+	Data []modelEntry `json:"data"`
 }
 
 // Models discovers the catalog from GET /models. The list is account-specific,
@@ -179,11 +181,7 @@ func (e *Engine) fetchModelsWith(ctx context.Context, a *auth.Auth) ([]backend.M
 		}
 		if cfErr := json.Unmarshal(body, &cf); cfErr == nil {
 			for _, m := range cf.Result {
-				list.Data = append(list.Data, struct {
-					ID      string `json:"id"`
-					Name    string `json:"name"`
-					OwnedBy string `json:"owned_by"`
-				}{ID: m.Name, Name: m.Name})
+				list.Data = append(list.Data, modelEntry{ID: m.Name, Name: m.Name})
 			}
 		}
 	}

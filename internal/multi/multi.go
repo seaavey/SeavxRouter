@@ -14,9 +14,9 @@ import (
 )
 
 // MultiBackend routes requests across providers. backend.Model IDs may carry an
-// explicit "codex/", "antigravity/", "codebuddy/", "qoder/", "kiro/" or
-// "verboo/", "nvidia/", "groq/" or "cloudflare/" prefix; bare IDs go to codex only when codex lists that model,
-// otherwise to antigravity.
+// explicit "codex/", "antigravity/", "codebuddy/", "qoder/", "kiro/",
+// "verboo/", "nvidia/", "groq/", "cloudflare/" or "opencode/" prefix; bare IDs
+// go to codex only when codex lists that model, otherwise to antigravity.
 type MultiBackend struct {
 	Antigravity backend.BackendAPI
 	Codex       backend.BackendAPI
@@ -27,6 +27,7 @@ type MultiBackend struct {
 	NVIDIA      backend.BackendAPI
 	Groq        backend.BackendAPI
 	Cloudflare  backend.BackendAPI
+	OpenCode    backend.BackendAPI
 }
 
 func (m *MultiBackend) Default() string {
@@ -56,6 +57,9 @@ func (m *MultiBackend) Default() string {
 	}
 	if m.Cloudflare != nil {
 		return m.Cloudflare.Default()
+	}
+	if m.OpenCode != nil {
+		return m.OpenCode.Default()
 	}
 	return ""
 }
@@ -133,6 +137,11 @@ func (m *MultiBackend) resolve(ctx context.Context, model string) (backend.Backe
 				return nil, "", fmt.Errorf("cloudflare provider not configured; run: seavxrouter login cloudflare")
 			}
 			return m.Cloudflare, id, nil
+		case "opencode":
+			if m.OpenCode == nil {
+				return nil, "", fmt.Errorf("opencode provider not configured; run: seavxrouter login opencode")
+			}
+			return m.OpenCode, id, nil
 		}
 	}
 	model = normalizeModel(model)
@@ -165,6 +174,9 @@ func (m *MultiBackend) resolve(ctx context.Context, model string) (backend.Backe
 	}
 	if m.Cloudflare != nil {
 		return m.Cloudflare, model, nil
+	}
+	if m.OpenCode != nil {
+		return m.OpenCode, model, nil
 	}
 	return nil, "", fmt.Errorf("no providers configured")
 }
@@ -245,6 +257,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		{"nvidia", m.NVIDIA},
 		{"groq", m.Groq},
 		{"cloudflare", m.Cloudflare},
+		{"opencode", m.OpenCode},
 	} {
 		if p.backend == nil {
 			continue
@@ -423,6 +436,7 @@ func (m *MultiBackend) slots() []providerSlot {
 		{name: "nvidia", backend: m.NVIDIA, modelID: identityModel},
 		{name: "groq", backend: m.Groq, modelID: identityModel},
 		{name: "cloudflare", backend: m.Cloudflare, modelID: identityModel},
+		{name: "opencode", backend: m.OpenCode, modelID: identityModel},
 	}
 }
 
@@ -444,8 +458,8 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func (m *MultiBackend) Provider(ctx context.Context, model string) string {
 	if name, _, ok := strings.Cut(model, "/"); ok {
 		switch name {
-		case "cloudflare":
-			return "cloudflare"
+		case "cloudflare", "opencode":
+			return name
 		case "codex", "antigravity", "codebuddy", "qoder", "kiro", "verboo", "nvidia", "groq":
 			return name
 		}
@@ -481,6 +495,9 @@ func (m *MultiBackend) Provider(ctx context.Context, model string) string {
 	if m.Cloudflare != nil {
 		return "cloudflare"
 	}
+	if m.OpenCode != nil {
+		return "opencode"
+	}
 	return ""
 }
 
@@ -491,7 +508,7 @@ type quotaReporter interface {
 // Quota aggregates per-account quota across providers that expose it.
 func (m *MultiBackend) Quota() []auth.ProviderQuota {
 	out := []auth.ProviderQuota{}
-	for _, b := range []backend.BackendAPI{m.Antigravity, m.Codex, m.CodeBuddy, m.Qoder, m.Kiro, m.Verboo, m.NVIDIA, m.Groq, m.Cloudflare} {
+	for _, b := range []backend.BackendAPI{m.Antigravity, m.Codex, m.CodeBuddy, m.Qoder, m.Kiro, m.Verboo, m.NVIDIA, m.Groq, m.Cloudflare, m.OpenCode} {
 		if b == nil {
 			continue
 		}

@@ -84,6 +84,7 @@ var bearerOnlyProviders = map[string]bool{
 	"nvidia":     true,
 	"groq":       true,
 	"cloudflare": true,
+	"opencode":   true,
 }
 
 var storeMu sync.Mutex

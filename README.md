@@ -18,7 +18,8 @@ accounts, tracks token usage and cost, and ships with a live terminal dashboard.
 >
 > SeavxRouter is an independent, unofficial project. It is **not affiliated
 > with, endorsed by, or supported by** Google, OpenAI, AWS, CodeBuddy, Qoder,
-> Verboo, NVIDIA, Groq, Cloudflare, or any other provider mentioned here.
+> Verboo, NVIDIA, Groq, Cloudflare, OpenCode, or any other provider mentioned
+> here.
 >
 > Using unofficial clients, automated access, or tokens obtained from official
 > CLIs **may violate a provider's Terms of Service** and can lead to rate
@@ -61,8 +62,9 @@ accounts, tracks token usage and cost, and ships with a live terminal dashboard.
 
 - **Three wire formats** — OpenAI Chat Completions (`/v1/chat/completions`),
   Anthropic Messages (`/v1/messages`), and OpenAI Responses (`/v1/responses`).
-- **Nine provider adapters** — Google Antigravity, OpenAI Codex, CodeBuddy,
-  Qoder, Kiro, Verboo, NVIDIA NIM, Groq, and Cloudflare Workers AI.
+- **Ten provider adapters** — Google Antigravity, OpenAI Codex, CodeBuddy,
+  Qoder, Kiro, Verboo, NVIDIA NIM, Groq, Cloudflare Workers AI, and OpenCode
+  (free models through a local OpenCode server).
 - **Multi-account rotation** — store several accounts per provider; requests are
   balanced round-robin and move to the next account when one runs out of quota.
 - **Streaming** — SSE streaming for every supported wire format, including tool
@@ -94,11 +96,27 @@ accounts, tracks token usage and cost, and ships with a live terminal dashboard.
 | `nvidia` | `seavxrouter login nvidia` | API key (`nvapi-...`) | No |
 | `groq` | `seavxrouter login groq` | API key (`gsk_...`) | No |
 | `cloudflare` | `seavxrouter login cloudflare` | API token + account ID | No |
+| `opencode` | `seavxrouter login opencode` | Local OpenCode server (free models) | No |
 
 Login flows that need a browser open one automatically; API-key providers prompt
 on the terminal (or read a key from the environment, see
 [Configuration](#configuration)). Run `seavxrouter check` afterwards to verify
 credentials and list the models each account can see.
+
+`opencode` stores no credential. OpenCode only serves its free model tier to
+requests made from inside its own runtime, so the adapter proxies through a
+local `opencode serve` process instead of calling a public endpoint. The
+`opencode` CLI must be installed (or `OPENCODE_SERVER_URL` must point at a
+running v2 server). By default the router starts a private server on demand at
+`127.0.0.1` on a random port with a generated Basic-auth password, keeps its
+state in `~/.seavx/opencode`, restarts it if it exits, and stops it on shutdown.
+Only enabled zero-cost `opencode` chat models are exposed.
+
+Because OpenCode's session generation API is not the OpenAI wire format,
+conversations are flattened into a single prompt: client tool/function
+definitions and image content are not forwarded, and streamed responses arrive
+as one delta when generation completes rather than token by token. Free usage
+is rate-limited by OpenCode and subject to its terms.
 
 ## Architecture
 
@@ -127,8 +145,11 @@ credentials and list the models each account can see.
      |           |               |           |           |
      +-----------+-------+-------+-----------+-----------+
                          |
-              Verboo / NVIDIA / Groq / Cloudflare
-                       (API keys)
+         Verboo / NVIDIA / Groq / Cloudflare
+                    (API keys)
+
+                OpenCode (local server)
+                  (free models only)
 ```
 
 Each provider adapter owns its authentication, account rotation, model catalog,
@@ -139,7 +160,9 @@ ID, and the `completions` package converts between wire formats.
 
 - Go **1.27** or newer to build from source.
 - Linux (including Termux on Android), macOS, Windows, or FreeBSD.
-- Provider accounts and credentials that you are authorized to use.
+- Provider accounts or API keys that you are authorized to use. OpenCode's free
+  models need no account, but require the `opencode` CLI (or a running
+  `opencode serve`) on the same machine.
 
 ## Install a prebuilt binary
 
@@ -202,6 +225,7 @@ go build -o seavxrouter .
 ### 2. Log in to at least one provider
 
 ```bash
+./seavxrouter login opencode      # free models via the local opencode CLI
 ./seavxrouter login antigravity   # opens a browser
 ./seavxrouter login groq          # prompts for an API key
 ```
@@ -383,6 +407,7 @@ antigravity/gemini-3.8-flash
 groq/openai/gpt-oss-120b
 nvidia/deepseek-ai/deepseek-v4.1-flash
 cloudflare/@cf/meta/llama-3.1-8b-instruct
+opencode/big-pickle
 ```
 
 - The first path segment selects the provider; the rest is passed through, so
@@ -434,8 +459,9 @@ Multiple entries for the same provider add accounts to the rotation pool.
 ### Provider login environment variables
 
 Server configuration is done entirely with CLI flags; run `seavxrouter -h` for
-the complete list. These optional variables only save typing during
-`seavxrouter login`:
+the complete list. These optional variables save typing during
+`seavxrouter login`; the OpenCode ones also control how the running router
+reaches its local server:
 
 | Variable | Purpose |
 | --- | --- |
@@ -443,6 +469,10 @@ the complete list. These optional variables only save typing during
 | `GROQ_API_KEY` | Key read by `seavxrouter login groq` instead of prompting. |
 | `CLOUDFLARE_API_TOKEN` | Token read by `seavxrouter login cloudflare`. |
 | `CLOUDFLARE_ACCOUNT_ID` | Account ID used by Cloudflare requests and login. |
+| `OPENCODE_SERVER_URL` | Existing OpenCode v2 server to use instead of auto-starting one. |
+| `OPENCODE_SERVER_USERNAME` | Basic-auth username for that server (default `opencode`). |
+| `OPENCODE_SERVER_PASSWORD` | Basic-auth password for that server. |
+| `OPENCODE_BIN` | OpenCode binary to auto-start (default `opencode` on `PATH`). |
 
 No `.env` file is loaded automatically. Export the variables in your shell,
 your process manager, or your container environment.
@@ -529,8 +559,9 @@ provider serves the same model, a failover attempt.
 │   │   ├── codebuddy/       CodeBuddy adapter
 │   │   ├── codex/           OpenAI Codex adapter
 │   │   ├── kiro/            Kiro adapter
+│   │   ├── opencode/        Local OpenCode server adapter
 │   │   ├── qoder/           Qoder adapter
-│   │   ├── upstream/        NVIDIA NIM, Groq, Cloudflare Workers AI
+│   │   ├── upstream/        NVIDIA NIM, Groq, Cloudflare
 │   │   └── verboo/          Verboo adapter
 ├── docs/                    Design notes and implementation specs
 ├── CONTRIBUTING.md
@@ -568,9 +599,9 @@ hosted service, and not an official client for any provider.
 SeavxRouter is an independent project. It is **not affiliated with, authorized
 by, endorsed by, sponsored by, or in any way officially connected to** Google,
 OpenAI, Amazon Web Services, CodeBuddy, Qoder, Verboo, NVIDIA, Groq, Cloudflare,
-or any other company whose service it can talk to. All product names, logos,
-and trademarks are the property of their respective owners and are used only
-for identification.
+OpenCode, or any other company whose service it can talk to. All product names,
+logos, and trademarks are the property of their respective owners and are used
+only for identification.
 
 ### Your responsibility and provider terms
 

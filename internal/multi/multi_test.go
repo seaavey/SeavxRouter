@@ -43,6 +43,30 @@ func TestNormalizeModel(t *testing.T) {
 	}
 }
 
+func TestOpenCodeRouting(t *testing.T) {
+	oc := &fakeBackend{models: map[string]bool{"big-pickle": true}, def: "big-pickle"}
+	m := &MultiBackend{OpenCode: oc}
+	ctx := context.Background()
+
+	models, err := m.Models(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "opencode/big-pickle" {
+		t.Fatalf("models = %+v", models)
+	}
+	res, err := m.Chat(ctx, &backend.ChatRequest{Model: "opencode/big-pickle"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "ok" || oc.calls != 1 || oc.lastModel != "big-pickle" {
+		t.Fatalf("result = %+v, calls = %d, model = %q", res, oc.calls, oc.lastModel)
+	}
+	if got := m.Provider(ctx, "opencode/big-pickle"); got != "opencode" {
+		t.Fatalf("provider = %q", got)
+	}
+}
+
 type fakeBackend struct {
 	models    map[string]bool
 	lastModel string

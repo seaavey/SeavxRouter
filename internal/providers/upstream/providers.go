@@ -79,17 +79,15 @@ var Providers = map[string]Provider{
 	},
 }
 
-// newFromProvider builds an engine from a provider definition, applying the
-// Cloudflare-specific path layout when the provider needs an account ID.
-func newFromProvider(p Provider, store auth.AuthStore, auths []*auth.Auth) (*Engine, error) {
-	e, err := NewEngine(p.Name, p.BaseURL, store, auths)
+// NewProviderEngine builds an engine from a provider definition, applying the
+// account-scoped path layout when the provider needs an account ID.
+func NewProviderEngine(p Provider, store auth.AuthStore, auths []*auth.Auth) (*Engine, error) {
+	e, err := NewEngine(p.Name, p.ResolveBaseURL(), store, auths)
 	if err != nil {
 		return nil, err
 	}
 	e.DefaultModel = p.DefaultModel
 	if p.AccountIDEnv != "" {
-		// Cloudflare serves AllowedRoutes under the account scope; the adapter
-		// resolves the ID per account, so the base path is rewritten per call.
 		e.ModelsPath = "accounts/%s/ai/models/search"
 		e.ChatPath = "accounts/%s/ai/v1/chat/completions"
 	}
@@ -165,7 +163,7 @@ func Login(ctx context.Context, p Provider, store auth.AuthStore, in io.Reader, 
 
 // probeKey confirms the key actually authenticates by listing the catalog.
 func probeKey(ctx context.Context, p Provider, acct *auth.Auth) ([]string, error) {
-	e, err := newFromProvider(p, auth.AuthStore{}, []*auth.Auth{acct})
+	e, err := NewProviderEngine(p, auth.AuthStore{}, []*auth.Auth{acct})
 	if err != nil {
 		return nil, err
 	}
