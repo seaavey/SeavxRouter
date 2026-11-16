@@ -318,7 +318,7 @@ func (m *MultiBackend) Chat(ctx context.Context, req *backend.ChatRequest, onDel
 	}
 	var started bool
 	tracked := func(d backend.ChatDelta) {
-		if d.Content != "" || len(d.ToolCalls) > 0 {
+		if d.Content != "" || d.Thinking != "" || len(d.ToolCalls) > 0 {
 			started = true
 		}
 		if onDelta != nil {

@@ -184,12 +184,52 @@ func TestQoderSigPath(t *testing.T) {
 	}
 }
 
-func TestQoderRejectsImages(t *testing.T) {
-	e := &QoderEngine{}
-	_, err := e.Chat(context.Background(), &backend.ChatRequest{Messages: []backend.ChatMessage{{Role: "user", Images: []backend.ImagePart{{MIMEType: "image/png", Data: "aGVsbG8="}}}}}, nil)
-	if err == nil || !strings.Contains(err.Error(), "does not support image content") {
-		t.Fatalf("err = %v, want image rejection", err)
+func TestQoderConvertImageMessage(t *testing.T) {
+	m := qoderConvertMessage(backend.ChatMessage{
+		Role:    "user",
+		Content: "what is this?",
+		Images: []backend.ImagePart{
+			{MIMEType: "image/png", Data: "aGVsbG8="},
+			{URL: "https://example.com/b.jpg"},
+		},
+	}, false, false)
+	if m == nil || m.Role != "user" || m.Contents != nil {
+		t.Fatalf("image message should use content parts only, got %+v", m)
 	}
+	parts, ok := m.Content.([]qoderContentPart)
+	if !ok || len(parts) != 3 {
+		t.Fatalf("content parts = %#v", m.Content)
+	}
+	if parts[0].Type != "text" || parts[0].Text != "what is this?" {
+		t.Fatalf("text part = %+v", parts[0])
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != "data:image/png;base64,aGVsbG8=" {
+		t.Fatalf("inline image part = %+v", parts[1])
+	}
+	if parts[2].ImageURL == nil || parts[2].ImageURL.URL != "https://example.com/b.jpg" {
+		t.Fatalf("remote image part = %+v", parts[2])
+	}
+
+	m = qoderConvertMessage(backend.ChatMessage{
+		Role:   "user",
+		Images: []backend.ImagePart{{MIMEType: "image/png", Data: "aGVsbG8="}},
+	}, false, false)
+	if m == nil {
+		t.Fatalf("image-only message should not be dropped")
+	}
+	parts, ok = m.Content.([]qoderContentPart)
+	if !ok || len(parts) != 1 || parts[0].Type != "image_url" {
+		t.Fatalf("image-only content parts = %#v", m.Content)
+	}
+}
+
+func qoderTextContent(t *testing.T, m *qoderMessage) string {
+	t.Helper()
+	s, ok := m.Content.(string)
+	if !ok {
+		t.Fatalf("content is not a string: %#v", m.Content)
+	}
+	return s
 }
 
 func TestQoderConvertMessage(t *testing.T) {
@@ -201,12 +241,12 @@ func TestQoderConvertMessage(t *testing.T) {
 	}
 
 	m = qoderConvertMessage(backend.ChatMessage{Role: "assistant", Content: "calling", ToolCalls: tools}, false, false)
-	if m == nil || m.Role != "assistant" || !strings.Contains(m.Content, "Tool calls:") || !strings.Contains(m.Content, "lookup") {
+	if m == nil || m.Role != "assistant" || !strings.Contains(qoderTextContent(t, m), "Tool calls:") || !strings.Contains(qoderTextContent(t, m), "lookup") {
 		t.Fatalf("tools-off assistant calls should be rendered as text, got %+v", m)
 	}
 
 	m = qoderConvertMessage(backend.ChatMessage{Role: "assistant", Content: "calling", ToolCalls: tools}, true, false)
-	if m == nil || m.Role != "assistant" || len(m.ToolCalls) != 0 || !strings.Contains(m.Content, "Previously planned but unexecuted tool calls: lookup.") {
+	if m == nil || m.Role != "assistant" || len(m.ToolCalls) != 0 || !strings.Contains(qoderTextContent(t, m), "Previously planned but unexecuted tool calls: lookup.") {
 		t.Fatalf("unresolved calls should collapse to a summary, got %+v", m)
 	}
 
@@ -238,39 +278,42 @@ func TestQoderConvertMessage(t *testing.T) {
 func TestQoderCatalogExtraction(t *testing.T) {
 	raw := map[string]any{
 		"chat": []any{
-			map[string]any{"key": "m1", "display_name": "backend.Model One", "max_output_tokens": float64(8000), "thinking_config": map[string]any{"enabled": true}},
+			map[string]any{"key": "m1", "display_name": "Alpha Model", "max_output_tokens": float64(8000), "is_reasoning": true},
 			map[string]any{"key": "auto", "display_name": "Auto"},
-			map[string]any{"key": "off", "display_name": "Off", "enable": false},
-			map[string]any{"key": "m2", "display_name": "backend.Model Two", "is_reasoning": false},
-			map[string]any{"key": "m1dup", "display_name": "backend.Model One"},
+			map[string]any{"key": "m4", "display_name": "Delta Model", "enable": false, "is_reasoning": false},
+			map[string]any{"key": "m2", "display_name": "Beta Model", "is_reasoning": false, "thinking_config": map[string]any{"enabled": map[string]any{}}},
+			map[string]any{"key": "m1dup", "display_name": "Alpha Model"},
 		},
 		"app": []any{
-			map[string]any{"key": "m3", "display_name": "backend.Model Three"},
+			map[string]any{"key": "m3", "display_name": "Gamma Model", "enable": false},
 		},
 	}
 	cat := qoderExtractCatalog(raw)
 	if cat == nil {
 		t.Fatalf("catalog should extract")
 	}
-	if len(cat.keys) != 3 {
-		t.Fatalf("expected 3 models after dedupe/filter, got %v", cat.keys)
+	if len(cat.keys) != 4 {
+		t.Fatalf("expected 4 models after dedupe, got %v", cat.keys)
 	}
-	if cat.keys["backend.Model One"] != "m1" || cat.keys["backend.Model Two"] != "m2" || cat.keys["backend.Model Three"] != "m3" {
+	if cat.keys["Alpha Model"] != "m1" || cat.keys["Beta Model"] != "m2" || cat.keys["Gamma Model"] != "m3" || cat.keys["Delta Model"] != "m4" {
 		t.Fatalf("unexpected keys: %v", cat.keys)
 	}
 	if cat.maxOutput("m1") != 8000 || !cat.reasoning("m1") {
 		t.Fatalf("m1 caps wrong: %+v", cat.caps["m1"])
 	}
 	if cat.reasoning("m2") {
-		t.Fatalf("m2 should be non-reasoning")
+		t.Fatalf("is_reasoning=false must win over thinking_config: %+v", cat.caps["m2"])
 	}
-	if cat.defaultName != "backend.Model One" {
+	if cat.reasoning("m4") {
+		t.Fatalf("enable=false models keep their reasoning flag: %+v", cat.caps["m4"])
+	}
+	if cat.defaultName != "Alpha Model" {
 		t.Fatalf("default should be the sorted-first name, got %q", cat.defaultName)
 	}
 
 	fallback := qoderFallbackCatalog()
-	if fallback.defaultName != "Qwen3.7-Max" {
-		t.Fatalf("fallback default = %q, want Qwen3.7-Max", fallback.defaultName)
+	if fallback.defaultName != "DeepSeek-Flash" {
+		t.Fatalf("fallback default = %q, want DeepSeek-Flash", fallback.defaultName)
 	}
 	if len(fallback.keys) != 13 {
 		t.Fatalf("fallback should list 13 models, got %d", len(fallback.keys))
@@ -292,6 +335,11 @@ func TestQoderParseStreamLine(t *testing.T) {
 	ev := qoderParseStreamLine(frame(map[string]any{"body": `{"choices":[{"delta":{"content":"hi"}}]}`}))
 	if ev.delta == nil || ev.delta.content != "hi" {
 		t.Fatalf("content frame: %+v", ev)
+	}
+
+	ev = qoderParseStreamLine(frame(map[string]any{"body": `{"choices":[{"delta":{"reasoning_content":"thinking"}}]}`}))
+	if ev.delta == nil || ev.delta.reasoning != "thinking" || ev.delta.content != "" {
+		t.Fatalf("reasoning frame: %+v", ev)
 	}
 
 	ev = qoderParseStreamLine(frame(map[string]any{"body": `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}`}))
@@ -479,7 +527,6 @@ func (m *qoderMock) handler(t *testing.T) http.Handler {
 			fn := m.chatFn
 			m.mu.Unlock()
 			w.Header().Set("content-type", "text/event-stream")
-			w.WriteHeader(http.StatusOK)
 			if fn != nil {
 				fn(n, w)
 			}
@@ -556,6 +603,9 @@ func TestQoderChatEndToEnd(t *testing.T) {
 		statusTier: "personal_pro",
 		catalog:    qoderMockCatalog(),
 		chatFn: func(_ int, w http.ResponseWriter) {
+			fmt.Fprint(w, qoderSSEFrame(t, map[string]any{"choices": []any{
+				map[string]any{"delta": map[string]any{"reasoning_content": "think"}},
+			}}))
 			qoderChatText(w, t, "hel")
 			qoderChatText(w, t, "lo")
 			qoderChatDone(t, w)
@@ -564,6 +614,7 @@ func TestQoderChatEndToEnd(t *testing.T) {
 	e := qoderTestEngine(t, mock, &auth.Auth{Provider: "qoder", AccessToken: "pt-good-123", Region: "cn"})
 
 	var deltas []string
+	var thoughts []string
 	res, err := e.Chat(context.Background(), &backend.ChatRequest{
 		Model:       "Qwen-Unit",
 		Messages:    []backend.ChatMessage{{Role: "user", Content: "hi there"}},
@@ -574,6 +625,9 @@ func TestQoderChatEndToEnd(t *testing.T) {
 			Parameters: map[string]any{"type": "object"},
 		}},
 	}, func(d backend.ChatDelta) {
+		if d.Thinking != "" {
+			thoughts = append(thoughts, d.Thinking)
+		}
 		if d.Content != "" {
 			deltas = append(deltas, d.Content)
 		}
@@ -583,6 +637,9 @@ func TestQoderChatEndToEnd(t *testing.T) {
 	}
 	if res.Content != "hello" || res.FinishReason != "stop" {
 		t.Fatalf("unexpected result: %+v", res)
+	}
+	if strings.Join(thoughts, "") != "think" {
+		t.Fatalf("thinking deltas = %v", thoughts)
 	}
 	if res.Usage.InputTokens != 5 || res.Usage.OutputTokens != 2 || res.Usage.ThinkingTokens != 1 ||
 		res.Usage.CacheReadTokens != 3 || res.Usage.TotalTokens != 7 {
@@ -684,6 +741,72 @@ func TestQoderChatEndToEnd(t *testing.T) {
 	}
 }
 
+func TestQoderChatWithImages(t *testing.T) {
+	mock := &qoderMock{
+		statusTier: "personal_pro",
+		catalog:    qoderMockCatalog(),
+		chatFn: func(_ int, w http.ResponseWriter) {
+			qoderChatText(w, t, "red")
+			qoderChatDone(t, w)
+		},
+	}
+	e := qoderTestEngine(t, mock, &auth.Auth{Provider: "qoder", AccessToken: "pt-good-123", Region: "cn"})
+
+	res, err := e.Chat(context.Background(), &backend.ChatRequest{
+		Model: "Qwen-Unit",
+		Messages: []backend.ChatMessage{{
+			Role:    "user",
+			Content: "what colour?",
+			Images:  []backend.ImagePart{{MIMEType: "image/png", Data: "aGVsbG8="}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if res.Content != "red" {
+		t.Fatalf("content = %q", res.Content)
+	}
+
+	dec, err := qoderDecode(string(mock.lastBody))
+	if err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(dec, &body); err != nil {
+		t.Fatalf("body json: %v", err)
+	}
+	mc, _ := body["model_config"].(map[string]any)
+	if mc["is_vl"] != true || mc["format"] != "openai" || mc["source"] != "system" {
+		t.Fatalf("model_config = %v", mc)
+	}
+	cc, _ := body["chat_context"].(map[string]any)
+	extra, _ := cc["extra"].(map[string]any)
+	if emc, _ := extra["modelConfig"].(map[string]any); emc["is_vl"] != true {
+		t.Fatalf("chat_context.extra.modelConfig = %v", extra)
+	}
+	msgs, _ := body["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %v", body["messages"])
+	}
+	msg0, _ := msgs[0].(map[string]any)
+	if _, has := msg0["contents"]; has {
+		t.Fatalf("image messages should omit contents: %v", msg0)
+	}
+	parts, _ := msg0["content"].([]any)
+	if len(parts) != 2 {
+		t.Fatalf("content parts = %v", msg0["content"])
+	}
+	textPart, _ := parts[0].(map[string]any)
+	if textPart["type"] != "text" || textPart["text"] != "what colour?" {
+		t.Fatalf("text part = %v", parts[0])
+	}
+	imgPart, _ := parts[1].(map[string]any)
+	imgURL, _ := imgPart["image_url"].(map[string]any)
+	if imgPart["type"] != "image_url" || imgURL["url"] != "data:image/png;base64,aGVsbG8=" {
+		t.Fatalf("image part = %v", parts[1])
+	}
+}
+
 func TestQoderChatDefaultMaxTokensAndToolCalls(t *testing.T) {
 	mock := &qoderMock{
 		statusTier: "personal_pro",
@@ -780,6 +903,62 @@ func TestQoderChatRotatesAccounts(t *testing.T) {
 	}
 }
 
+func TestQoderChatQuotaDoesNotRefreshSession(t *testing.T) {
+	mock := &qoderMock{
+		statusTier: "personal_standard",
+		catalog:    qoderMockCatalog(),
+		chatFn: func(n int, w http.ResponseWriter) {
+			if n == 1 {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `{"pricingUrl":"https://qoder.com/pricing"}`)
+				return
+			}
+			qoderChatText(w, t, "from-good")
+			qoderChatDone(t, w)
+		},
+	}
+	e := qoderTestEngine(t, mock,
+		&auth.Auth{Provider: "qoder", AccessToken: "pt-limited", Region: "cn"},
+		&auth.Auth{Provider: "qoder", AccessToken: "pt-good", Region: "cn"},
+	)
+	res, err := e.Chat(context.Background(), &backend.ChatRequest{
+		Model:    "Qwen-Unit",
+		Messages: []backend.ChatMessage{{Role: "user", Content: "hello"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("chat should rotate past the plan-limited account: %v", err)
+	}
+	if res.Content != "from-good" {
+		t.Fatalf("content = %q", res.Content)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.chatCalls != 2 {
+		t.Fatalf("expected exactly 2 chat attempts, got %d", mock.chatCalls)
+	}
+	if mock.refreshCalls != 0 {
+		t.Fatalf("quota rejection must not refresh the session, saw %d refreshes", mock.refreshCalls)
+	}
+}
+
+func TestQoderPrioritizeLimitedAccounts(t *testing.T) {
+	e := &QoderEngine{quotaErr: map[*auth.Auth]time.Time{}}
+	limited := &auth.Auth{Provider: "qoder", AccessToken: "pt-limited"}
+	fresh := &auth.Auth{Provider: "qoder", AccessToken: "pt-good"}
+
+	e.quotaErr[limited] = time.Now()
+	order := e.prioritizeAccounts([]*auth.Auth{limited, fresh})
+	if len(order) != 2 || order[0] != fresh || order[1] != limited {
+		t.Fatalf("limited account should move to the back, got %v", order)
+	}
+
+	e.quotaErr[limited] = time.Now().Add(-qoderQuotaCooldown - time.Second)
+	order = e.prioritizeAccounts([]*auth.Auth{limited, fresh})
+	if len(order) != 2 || order[0] != limited || order[1] != fresh {
+		t.Fatalf("cooldown expiry should restore normal order, got %v", order)
+	}
+}
+
 func TestQoderChatRefreshesOnAuthFrame(t *testing.T) {
 	mock := &qoderMock{
 		statusTier: "personal_pro",
@@ -866,7 +1045,7 @@ func TestQoderFallbackCatalogOnListFailure(t *testing.T) {
 	if len(models) != 13 {
 		t.Fatalf("fallback should expose 13 models, got %d", len(models))
 	}
-	if e.Default() != "Qwen3.7-Max" {
+	if e.Default() != "DeepSeek-Flash" {
 		t.Fatalf("default = %q", e.Default())
 	}
 	if !e.HasModel(context.Background(), "Qwen3.7-Max") {
@@ -907,7 +1086,7 @@ func TestQoderQuota(t *testing.T) {
 	if q.Provider != "qoder" || len(q.Accounts) != 1 {
 		t.Fatalf("quota = %+v", q)
 	}
-	if q.DefaultModel != "Qwen3.7-Max" {
+	if q.DefaultModel != "DeepSeek-Flash" {
 		t.Fatalf("quota default model = %q", q.DefaultModel)
 	}
 }

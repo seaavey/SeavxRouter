@@ -359,6 +359,9 @@ func (s *Server) HandleChat(w http.ResponseWriter, r *http.Request) {
 	chunk(map[string]any{"role": "assistant"}, nil)
 	toolIndex := 0
 	result, err := s.backend.Chat(r.Context(), cr, func(d backend.ChatDelta) {
+		if d.Thinking != "" {
+			chunk(map[string]any{"reasoning_content": d.Thinking}, nil)
+		}
 		if d.Content != "" {
 			chunk(map[string]any{"content": d.Content}, nil)
 		}

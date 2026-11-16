@@ -413,10 +413,11 @@ type QoderEngine struct {
 }
 
 const (
-	qoderRenewMargin  = 2 * time.Hour
-	qoderUnknownTTL   = 30 * time.Minute
-	qoderCatalogTTL   = 10 * time.Minute
-	qoderBusyFallback = 2 * time.Second
+	qoderRenewMargin   = 2 * time.Hour
+	qoderUnknownTTL    = 30 * time.Minute
+	qoderCatalogTTL    = 10 * time.Minute
+	qoderBusyFallback  = 2 * time.Second
+	qoderQuotaCooldown = 10 * time.Minute
 )
 
 var qoderBusyBackoff = qoderBusyFallback
@@ -485,6 +486,25 @@ func (e *QoderEngine) trackQuota(a *auth.Auth, err error) {
 		e.quotaErr = map[*auth.Auth]time.Time{}
 	}
 	e.quotaErr[a] = time.Now()
+}
+
+// prioritizeAccounts moves accounts that recently hit a plan limit to the
+// back, so a dead account does not add a rejected round trip to every request.
+// Limited accounts are still tried once no fresh account is left.
+func (e *QoderEngine) prioritizeAccounts(order []*auth.Auth) []*auth.Auth {
+	now := time.Now()
+	e.quotaMu.Lock()
+	ready := make([]*auth.Auth, 0, len(order))
+	limited := make([]*auth.Auth, 0, len(order))
+	for _, a := range order {
+		if t, ok := e.quotaErr[a]; ok && now.Sub(t) < qoderQuotaCooldown {
+			limited = append(limited, a)
+			continue
+		}
+		ready = append(ready, a)
+	}
+	e.quotaMu.Unlock()
+	return append(ready, limited...)
 }
 
 func (e *QoderEngine) Default() string {
@@ -864,7 +884,7 @@ func qoderFallbackCatalog() *qoderCatalog {
 		caps[key] = qoderModelCaps{maxOutput: qoderDefaultMaxOut, reasoning: true}
 	}
 	cat := &qoderCatalog{keys: keys, caps: caps}
-	cat.defaultName = qoderNameForKey(keys, "qmodel_latest")
+	cat.defaultName = qoderNameForKey(keys, "dfmodel")
 	return cat
 }
 
@@ -923,6 +943,9 @@ func qoderPositiveInt(v any, def int) int {
 }
 
 func qoderReasoningCapability(m map[string]any) bool {
+	if v, present := m["is_reasoning"]; present {
+		return qoderTruthy(v)
+	}
 	if tc, ok := m["thinking_config"]; ok {
 		if tcMap, isMap := tc.(map[string]any); isMap {
 			enabled, present := tcMap["enabled"]
@@ -931,9 +954,6 @@ func qoderReasoningCapability(m map[string]any) bool {
 		if tc != nil {
 			return true
 		}
-	}
-	if v, present := m["is_reasoning"]; present {
-		return qoderTruthy(v)
 	}
 	return true
 }
@@ -948,9 +968,8 @@ func qoderExtractCatalog(raw map[string]any) *qoderCatalog {
 			if !ok {
 				continue
 			}
-			if v, present := m["enable"]; present && !qoderTruthy(v) {
-				continue
-			}
+			// The gateway reports enable=false for every listed model, including
+			// ones the official CLI can use, so it is not an availability gate.
 			key := qoderString(m["key"])
 			name := qoderString(m["display_name"])
 			if key == "" || name == "" || key == "auto" {
@@ -1019,6 +1038,7 @@ func (e *QoderEngine) catalogFor(ctx context.Context) *qoderCatalog {
 
 func (e *QoderEngine) fetchCatalog(ctx context.Context) (*qoderCatalog, error) {
 	auths, _ := e.snapshotAuths()
+	auths = e.prioritizeAccounts(auths)
 	var lastErr error
 	for _, a := range auths {
 		cat, err := e.fetchCatalogWith(ctx, a)
@@ -1137,6 +1157,7 @@ type qoderModelConfig struct {
 	IsVL        bool   `json:"is_vl"`
 	IsReasoning bool   `json:"is_reasoning"`
 	Source      string `json:"source"`
+	Format      string `json:"format,omitempty"`
 }
 
 type qoderBusiness struct {
@@ -1183,9 +1204,14 @@ type qoderResponseMeta struct {
 	Usage qoderResponseMetaUsage `json:"usage"`
 }
 
+type qoderImageURL struct {
+	URL string `json:"url"`
+}
+
 type qoderContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type     string         `json:"type"`
+	Text     string         `json:"text,omitempty"`
+	ImageURL *qoderImageURL `json:"image_url,omitempty"`
 }
 
 type qoderFunctionCall struct {
@@ -1201,7 +1227,7 @@ type qoderWireToolCall struct {
 
 type qoderMessage struct {
 	Role                string              `json:"role"`
-	Content             string              `json:"content"`
+	Content             any                 `json:"content"`
 	ResponseMeta        qoderResponseMeta   `json:"response_meta"`
 	ReasoningContentSig string              `json:"reasoning_content_signature"`
 	Contents            []qoderContentPart  `json:"contents,omitempty"`
@@ -1217,8 +1243,23 @@ func qoderStructuredMessage(role, text string) qoderMessage {
 func qoderUserMessage(text string) qoderMessage {
 	return qoderMessage{
 		Role:     "user",
+		Content:  "",
 		Contents: []qoderContentPart{{Type: "text", Text: text}},
 	}
+}
+
+func qoderUserImageMessage(text string, images []backend.ImagePart) qoderMessage {
+	parts := make([]qoderContentPart, 0, 1+len(images))
+	if strings.TrimSpace(text) != "" {
+		parts = append(parts, qoderContentPart{Type: "text", Text: text})
+	}
+	for _, img := range images {
+		parts = append(parts, qoderContentPart{
+			Type:     "image_url",
+			ImageURL: &qoderImageURL{URL: img.DataURL()},
+		})
+	}
+	return qoderMessage{Role: "user", Content: parts}
 }
 
 func qoderWireToolCalls(calls []backend.ToolCall) []qoderWireToolCall {
@@ -1362,10 +1403,14 @@ func qoderConvertMessage(m backend.ChatMessage, toolsEnabled, allowStructured bo
 		role = "user"
 		text = qoderRenderToolResult(m.Name, m.ToolCallID, text)
 	}
-	if strings.TrimSpace(text) == "" {
+	if strings.TrimSpace(text) == "" && len(m.Images) == 0 {
 		return nil
 	}
 	if role == "user" {
+		if len(m.Images) > 0 {
+			msg := qoderUserImageMessage(text, m.Images)
+			return &msg
+		}
 		msg := qoderUserMessage(text)
 		return &msg
 	}
@@ -1416,6 +1461,7 @@ type qoderChatPlan struct {
 	params    map[string]any
 	tools     []map[string]any
 	reasoning bool
+	vision    bool
 }
 
 func qoderPlanChat(req *backend.ChatRequest, modelKey string, catalog *qoderCatalog, toolsEnabled bool) *qoderChatPlan {
@@ -1450,11 +1496,16 @@ func qoderPlanChat(req *backend.ChatRequest, modelKey string, catalog *qoderCata
 		params:    params,
 		tools:     tools,
 		reasoning: catalog.reasoning(modelKey),
+		vision:    backend.HasImages(req.Messages),
 	}
 }
 
 func (p *qoderChatPlan) body(userType string) *qoderChatBody {
 	nid := backend.UUID()
+	modelConfig := qoderModelConfig{Key: p.modelKey, IsVL: p.vision, IsReasoning: p.reasoning, Source: "system"}
+	if p.vision {
+		modelConfig.Format = "openai"
+	}
 	return &qoderChatBody{
 		RequestID:    nid,
 		RequestSetID: backend.UUID(),
@@ -1463,7 +1514,7 @@ func (p *qoderChatPlan) body(userType string) *qoderChatBody {
 		ChatTask:     "FREE_INPUT",
 		ChatContext: qoderChatContext{
 			Extra: qoderChatContextExtra{
-				ModelConfig:     qoderExtraModelConfig{IsReasoning: p.reasoning, Key: p.modelKey},
+				ModelConfig:     qoderExtraModelConfig{IsReasoning: p.reasoning, Key: p.modelKey, IsVL: p.vision},
 				OriginalContent: qoderOriginalContent{Type: "text", Text: p.prompt},
 			},
 			Text: qoderChatContextText{Type: "text", Text: p.prompt},
@@ -1475,7 +1526,7 @@ func (p *qoderChatPlan) body(userType string) *qoderChatBody {
 		SessionType:    "qodercli",
 		AgentID:        "agent_common",
 		TaskID:         "common",
-		ModelConfig:    qoderModelConfig{Key: p.modelKey, IsReasoning: p.reasoning, Source: "system"},
+		ModelConfig:    modelConfig,
 		Messages:       p.messages,
 		Business:       qoderBusiness{ID: backend.UUID(), Name: qoderTruncateRunes(p.prompt, 30), BeginAt: time.Now().UnixMilli()},
 		Parameters:     p.params,
@@ -1503,6 +1554,7 @@ type qoderToolCallDelta struct {
 
 type qoderFrameDelta struct {
 	content      string
+	reasoning    string
 	toolCalls    []qoderToolCallDelta
 	finishReason string
 	usage        *qoderUsage
@@ -1581,6 +1633,9 @@ func qoderParseInner(inner map[string]any) *qoderFrameDelta {
 		if c, _ := deltaMap["content"].(string); c != "" {
 			d.content += c
 		}
+		if r, _ := deltaMap["reasoning_content"].(string); r != "" {
+			d.reasoning += r
+		}
 		tcList, _ := deltaMap["tool_calls"].([]any)
 		for _, item := range tcList {
 			m, ok := item.(map[string]any)
@@ -1601,7 +1656,7 @@ func qoderParseInner(inner map[string]any) *qoderFrameDelta {
 			d.toolCalls = append(d.toolCalls, td)
 		}
 	}
-	if d.content == "" && len(d.toolCalls) == 0 && d.finishReason == "" && d.usage == nil {
+	if d.content == "" && d.reasoning == "" && len(d.toolCalls) == 0 && d.finishReason == "" && d.usage == nil {
 		return nil
 	}
 	return d
@@ -1785,9 +1840,6 @@ func (e *QoderEngine) Stream(ctx context.Context, model, prompt string, onDelta 
 }
 
 func (e *QoderEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta func(backend.ChatDelta)) (*backend.ChatResult, error) {
-	if backend.HasImages(req.Messages) {
-		return nil, fmt.Errorf("qoder backend does not support image content")
-	}
 	model := req.Model
 	if model == "" {
 		model = e.Default()
@@ -1808,9 +1860,14 @@ func (e *QoderEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelt
 	e.next++
 	e.mu.Unlock()
 
-	var lastErr error
+	order := make([]*auth.Auth, 0, len(auths))
 	for i := range auths {
-		a := auths[(start+i)%len(auths)]
+		order = append(order, auths[(start+i)%len(auths)])
+	}
+	order = e.prioritizeAccounts(order)
+
+	var lastErr error
+	for _, a := range order {
 		acct := e.accountFor(a)
 		res, started, err := e.chatOnce(ctx, acct, plan, onDelta)
 		e.trackQuota(a, err)
@@ -1864,6 +1921,11 @@ func (e *QoderEngine) chatOnce(ctx context.Context, acct *qoderAccount, plan *qo
 			case <-time.After(wait):
 			}
 			continue
+		}
+		// A plan/quota rejection will not clear by minting a new session, so
+		// let Chat move on to the next account instead of burning a refresh.
+		if backend.IsQuotaError(err) {
+			return nil, false, err
 		}
 		var authErr *qoderAuthError
 		if errors.As(err, &authErr) {
@@ -1931,6 +1993,12 @@ func (e *QoderEngine) chatStreamOnce(ctx context.Context, acct *qoderAccount, se
 			if d := ev.delta; d != nil {
 				if d.usage != nil {
 					usage = d.usage
+				}
+				if d.reasoning != "" {
+					started = true
+					if onDelta != nil {
+						onDelta(backend.ChatDelta{Thinking: d.reasoning})
+					}
 				}
 				if d.content != "" {
 					content.WriteString(d.content)

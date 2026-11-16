@@ -73,8 +73,10 @@ type ChatRequest struct {
 }
 
 // ChatDelta is one incremental update emitted while streaming a chat response.
+// Thinking carries provider reasoning output that precedes the visible answer.
 type ChatDelta struct {
 	Content      string
+	Thinking     string
 	ToolCalls    []ToolCall
 	FinishReason string
 	Usage        *Usage
