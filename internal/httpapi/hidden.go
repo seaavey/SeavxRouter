@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"seavxrouter/internal/auth"
 	"seavxrouter/internal/backend"
 	"seavxrouter/internal/completions"
 )
@@ -158,9 +159,8 @@ type hiddenBackend struct {
 	hidden *HiddenModels
 }
 
-// WithHiddenModels wraps b so hidden models disappear from Models(). Chat
-// requests for a hidden model still work, so an operator can keep an ID out of
-// discovery without breaking a client that already knows it.
+// WithHiddenModels wraps b so hidden models disappear from Models() and are
+// rejected by HasModel, so a hidden ID can be neither discovered nor requested.
 func WithHiddenModels(b backend.BackendAPI, h *HiddenModels) backend.BackendAPI {
 	if b == nil || h == nil {
 		return b
@@ -198,4 +198,13 @@ func (h *hiddenBackend) Provider(ctx context.Context, model string) string {
 		return pn.Provider(ctx, model)
 	}
 	return ""
+}
+
+// Quota preserves per-account quota reporting: Quota() is not part of
+// backend.BackendAPI, so embedding alone would hide it from /v1/quota.
+func (h *hiddenBackend) Quota() []auth.ProviderQuota {
+	if qr, ok := h.BackendAPI.(quotaReporter); ok {
+		return qr.Quota()
+	}
+	return []auth.ProviderQuota{}
 }

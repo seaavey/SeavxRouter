@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"seavxrouter/internal/auth"
 	"seavxrouter/internal/backend"
 )
 
@@ -109,5 +110,32 @@ func TestHiddenWrapperPreservesProviderAttribution(t *testing.T) {
 	}
 	if got := pn.Provider(context.Background(), "gpt-6-sol"); got != "codex" {
 		t.Fatalf("provider = %q, want codex", got)
+	}
+}
+
+// quotaStub reports a fixed per-provider quota in addition to the catalog.
+type quotaStub struct{ catalogStub }
+
+func (q *quotaStub) Quota() []auth.ProviderQuota {
+	return []auth.ProviderQuota{{Provider: "codebuddy"}}
+}
+
+func TestHiddenWrapperPreservesQuotaReporting(t *testing.T) {
+	h := NewHiddenModels(filepath.Join(t.TempDir(), "nope.txt"))
+	wrapped := WithHiddenModels(&quotaStub{}, h)
+	qr, ok := wrapped.(quotaReporter)
+	if !ok {
+		t.Fatal("wrapping dropped quota reporting")
+	}
+	got := qr.Quota()
+	if len(got) != 1 || got[0].Provider != "codebuddy" {
+		t.Fatalf("quota = %+v", got)
+	}
+
+	// A backend without quota still yields an empty, non-nil list so the
+	// /v1/quota payload keeps its array shape.
+	plain := WithHiddenModels(&catalogStub{}, h).(quotaReporter)
+	if list := plain.Quota(); list == nil || len(list) != 0 {
+		t.Fatalf("plain quota = %#v, want empty slice", list)
 	}
 }
