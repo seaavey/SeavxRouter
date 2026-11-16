@@ -30,7 +30,8 @@ accounts, tracks token usage and cost, and ships with a live terminal dashboard.
 - **Ten provider adapters** — browser OAuth, device-code, bearer-token, and
   API-key logins behind one interface.
 - **Multi-account rotation** — several accounts per provider, round-robin
-  balancing, and quota-aware failover.
+  balancing, and quota-aware account rotation. A request stays on the provider
+  its model names; failures never hop to another provider.
 - **Usage and cost** — optional SQLite ledger with token counts, estimated USD
   cost from the models.dev catalog, and optional price overrides.
 - **Live TUI dashboard** — grouped usage, recent requests, request detail, and

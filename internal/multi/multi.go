@@ -307,12 +307,15 @@ func (m *MultiBackend) Stream(ctx context.Context, model, prompt string, onDelta
 	return b.Stream(ctx, id, prompt, onDelta)
 }
 
+// Chat sends one request to the provider that owns the model. Failures never
+// hop to another provider: account rotation happens inside the provider, and a
+// dead plan returns its error so the client can pick a different model.
 func (m *MultiBackend) Chat(ctx context.Context, req *backend.ChatRequest, onDelta func(backend.ChatDelta)) (*backend.ChatResult, error) {
 	model := req.Model
 	if model == "" {
 		model = m.Default()
 	}
-	primary, id, err := m.resolve(ctx, model)
+	b, id, err := m.resolve(ctx, model)
 	if err != nil {
 		return nil, err
 	}
@@ -325,120 +328,37 @@ func (m *MultiBackend) Chat(ctx context.Context, req *backend.ChatRequest, onDel
 			onDelta(d)
 		}
 	}
-	call := func(b backend.BackendAPI, modelID string) (*backend.ChatResult, error) {
+	call := func() (*backend.ChatResult, error) {
 		r := *req
-		r.Model = modelID
+		r.Model = id
 		return b.Chat(ctx, &r, tracked)
 	}
 
-	result, err := call(primary, id)
+	result, err := call()
 	if err == nil {
 		return result, nil
 	}
 	if started || !backend.IsRetryableError(err) || ctx.Err() != nil {
 		return nil, err
 	}
-	lastErr := err
-	slog.Warn("provider request failed, attempting fallback", "model", id, "err", err)
-
 	// Quota failures already rotated through every account inside the backend;
 	// an immediate retry would only burn latency.
-	if !backend.IsQuotaError(err) {
-		if !sleepCtx(ctx, retryBackoff) {
-			return nil, lastErr
-		}
-		result, err = call(primary, id)
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		if started || !backend.IsRetryableError(err) || ctx.Err() != nil {
-			return nil, lastErr
-		}
+	if backend.IsQuotaError(err) {
+		return nil, err
 	}
-
-	primaryErr := lastErr
-	tried := map[backend.BackendAPI]bool{primary: true}
-	for _, p := range m.slots() {
-		if p.backend == nil || tried[p.backend] {
-			continue
-		}
-		altID := p.modelID(id)
-		if altID == "" || !p.backend.HasModel(ctx, altID) {
-			continue
-		}
-		tried[p.backend] = true
-		result, err := call(p.backend, altID)
-		if err == nil {
-			slog.Info("failover succeeded", "provider", p.name, "model", altID)
-			return result, nil
-		}
-		lastErr = err
-		if started || ctx.Err() != nil {
-			return nil, lastErr
-		}
-		if !backend.IsRetryableError(err) {
-			// A provider can claim a model via a fail-open HasModel and then
-			// reject it; that must not end the fallback chain.
-			slog.Warn("fallback provider rejected the model", "provider", p.name, "model", altID, "err", err)
-			continue
-		}
-		slog.Warn("fallback provider failed", "provider", p.name, "model", altID, "err", err)
+	if !sleepCtx(ctx, retryBackoff) {
+		return nil, err
 	}
-
-	// The primary is quota- or auth-dead and no provider served the requested
-	// model. Give every remaining provider one try with its own default model
-	// so the request is still answered elsewhere.
-	if backend.IsQuotaError(primaryErr) || backend.IsAuthError(primaryErr) {
-		for _, p := range m.slots() {
-			if p.backend == nil || p.backend == primary {
-				continue
-			}
-			def := p.backend.Default()
-			if def == "" {
-				continue
-			}
-			result, err := call(p.backend, def)
-			if err == nil {
-				slog.Info("last-resort fallback succeeded", "provider", p.name, "model", def)
-				return result, nil
-			}
-			lastErr = err
-			if started || ctx.Err() != nil {
-				return nil, lastErr
-			}
-			slog.Warn("last-resort fallback failed", "provider", p.name, "model", def, "err", err)
-		}
+	result, err = call()
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	return result, nil
 }
 
 // retryBackoff is the pause before retrying a transient, non-quota failure on
-// the primary provider.
+// the same provider.
 var retryBackoff = 300 * time.Millisecond
-
-type providerSlot struct {
-	name    string
-	backend backend.BackendAPI
-	modelID func(string) string
-}
-
-func identityModel(id string) string { return id }
-
-func (m *MultiBackend) slots() []providerSlot {
-	return []providerSlot{
-		{name: "antigravity", backend: m.Antigravity, modelID: normalizeModel},
-		{name: "codex", backend: m.Codex, modelID: normalizeModel},
-		{name: "codebuddy", backend: m.CodeBuddy, modelID: codebuddy.ModelID},
-		{name: "qoder", backend: m.Qoder, modelID: identityModel},
-		{name: "kiro", backend: m.Kiro, modelID: kiro.ModelID},
-		{name: "verboo", backend: m.Verboo, modelID: identityModel},
-		{name: "nvidia", backend: m.NVIDIA, modelID: identityModel},
-		{name: "groq", backend: m.Groq, modelID: identityModel},
-		{name: "cloudflare", backend: m.Cloudflare, modelID: identityModel},
-		{name: "opencode", backend: m.OpenCode, modelID: identityModel},
-	}
-}
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {

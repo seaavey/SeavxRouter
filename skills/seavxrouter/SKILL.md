@@ -1,6 +1,6 @@
 ---
 name: seavxrouter
-description: Operate, debug, and extend SeavxRouter, a single-binary Go AI gateway exposing upstream providers behind OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses APIs. Use when logging in providers, running or checking the server, changing routing or failover, adding a provider adapter, or working with auth.jsonc, hidden-models.txt, usage.db, pricing, compression, and the /v1 HTTP endpoints.
+description: Operate, debug, and extend SeavxRouter, a single-binary Go AI gateway exposing upstream providers behind OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses APIs. Use when logging in providers, running or checking the server, changing routing or retries, adding a provider adapter, or working with auth.jsonc, hidden-models.txt, usage.db, pricing, compression, and the /v1 HTTP endpoints.
 ---
 
 # SeavxRouter
@@ -14,7 +14,7 @@ provider wiring; everything else is under `internal/`:
   `Usage`), error classification, prompts.
 - `completions/` — OpenAI, Anthropic, and Responses wire formats;
   `resolveModel` rejects unknown IDs through `HasModel`.
-- `multi/` — prefix routing, provider fallback, last-resort defaults.
+- `multi/` — prefix routing and provider selection; one provider per request.
 - `auth/` — JSONC credential store, per-provider `AccountCache`, quotas.
 - `httpapi/` — handlers, usage SQLite ledger, request logs, pricing,
   hidden-model wrapper.
@@ -76,8 +76,8 @@ models; `./seavxrouter tui -once` prints one usage snapshot.
    `count`, `groupAuths`, `newChecker`, and the server startup block.
 3. Use `auth.NewAccountCache(store, "<provider>")` so accounts added while the
    server runs are picked up without a restart.
-4. Map upstream statuses to `quota:` / `unauthorized:` wrapped errors so rotation
-   and failover classify them correctly.
+4. Map upstream statuses to `quota:` / `unauthorized:` wrapped errors so account
+   rotation classifies them correctly.
 5. Add `httptest`-based tests in the adapter package covering stream
    aggregation, tool calls, rotation, and error classification.
 
@@ -91,7 +91,7 @@ models; `./seavxrouter tui -once` prints one usage snapshot.
 - Slow first call after idle — adapter catalog fetch on the request path;
   prefer stale-while-revalidate.
 - Wrong provider/account — inspect `/v1/quota`, `/v1/logging`, and the server
-  logs for rotation and failover lines.
+  logs for rotation lines.
 
 ## Resources
 
