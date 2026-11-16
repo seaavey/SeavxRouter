@@ -3,9 +3,13 @@
 tmp/
 
 # Build artifacts
-seavxrouter
+/seavxrouter
+/bin/
 *.exe
 *.bak-*
 
 # SDD scratch workspace
 .superpowers/
+
+# Local agent config
+.qoder/
