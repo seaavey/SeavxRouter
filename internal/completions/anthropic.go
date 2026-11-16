@@ -340,8 +340,12 @@ func (s *Server) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	})
 	if err != nil {
 		slog.Warn("anthropic stream failed", "err", err)
-		s.logFailure(r, backend.StatusCode(err), err)
-		send("error", map[string]any{"error": map[string]any{"type": "backend_error", "message": err.Error()}})
+		s.logFailure(r, failureStatus(err), err)
+		errType := "backend_error"
+		if backend.IsQuotaError(err) {
+			errType = "rate_limit_error"
+		}
+		send("error", map[string]any{"error": map[string]any{"type": errType, "message": err.Error()}})
 		return
 	}
 	s.recordResult(r, "messages", model, result)

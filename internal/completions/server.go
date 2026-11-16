@@ -119,13 +119,33 @@ func (e *apiError) Error() string { return e.msg }
 func writeError(w http.ResponseWriter, err error) {
 	var ae *apiError
 	if !errors.As(err, &ae) {
-		ae = &apiError{http.StatusBadGateway, err.Error(), "backend_error", "backend_error"}
+		ae = upstreamError(err)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(ae.status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{"message": ae.msg, "type": ae.typ, "code": ae.code},
 	})
+}
+
+// upstreamError classifies a provider failure. A quota rejection surfaces only
+// after the provider rotated through every account, so it means "nothing left
+// right now": return 429 so clients back off or switch models instead of
+// treating it as a gateway fault.
+func upstreamError(err error) *apiError {
+	if backend.IsQuotaError(err) {
+		return &apiError{http.StatusTooManyRequests, err.Error(), "insufficient_quota", "insufficient_quota"}
+	}
+	return &apiError{http.StatusBadGateway, err.Error(), "backend_error", "backend_error"}
+}
+
+// failureStatus is the status recorded when a failure arrives after the
+// streaming response has already sent its 200 headers.
+func failureStatus(err error) int {
+	if backend.IsQuotaError(err) {
+		return http.StatusTooManyRequests
+	}
+	return backend.StatusCode(err)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

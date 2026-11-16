@@ -238,7 +238,7 @@ func TestRequestLoggingCapturesErrors(t *testing.T) {
 // TestStreamFailureLogsUpstreamStatus guards that a stream that died after the
 // 200 header was sent still logs the real upstream status, not a fake success.
 func TestStreamFailureLogsUpstreamStatus(t *testing.T) {
-	stub := &chatStub{err: &backend.HTTPError{Status: 492, Message: "492 status code 492: quota exceeded"}}
+	stub := &chatStub{err: &backend.HTTPError{Status: 492, Message: "492 status code 492: upstream exploded"}}
 	s, path := newLoggingServer(t, stub)
 	h := s.Handler()
 
@@ -257,6 +257,35 @@ func TestStreamFailureLogsUpstreamStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(logs) != 1 || logs[0].Status != 492 {
+		t.Fatalf("logs = %+v", logs)
+	}
+	if !strings.Contains(logs[0].Response, "upstream exploded") {
+		t.Fatalf("error body not logged: %q", logs[0].Response)
+	}
+}
+
+// TestStreamQuotaFailureLogs429 guards that quota exhaustion surfaces as 429
+// even though the stream had already sent its 200 headers.
+func TestStreamQuotaFailureLogs429(t *testing.T) {
+	stub := &chatStub{err: &backend.HTTPError{Status: 492, Message: "492 status code 492: quota exceeded"}}
+	s, path := newLoggingServer(t, stub)
+	h := s.Handler()
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("stream code %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "insufficient_quota") {
+		t.Fatalf("stream body missing quota error: %s", w.Body.String())
+	}
+
+	logs, err := s.usage.QueryLogs(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Status != 429 {
 		t.Fatalf("logs = %+v", logs)
 	}
 	if !strings.Contains(logs[0].Response, "quota exceeded") {

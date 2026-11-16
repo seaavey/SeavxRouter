@@ -381,9 +381,13 @@ func (s *Server) HandleChat(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Warn("chat stream failed", "err", err)
-		s.logFailure(r, backend.StatusCode(err), err)
+		s.logFailure(r, failureStatus(err), err)
+		typ, code := "backend_error", "backend_error"
+		if backend.IsQuotaError(err) {
+			typ, code = "insufficient_quota", "insufficient_quota"
+		}
 		data, _ := json.Marshal(map[string]any{
-			"error": map[string]any{"message": err.Error(), "type": "backend_error", "code": "backend_error"},
+			"error": map[string]any{"message": err.Error(), "type": typ, "code": code},
 		})
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		fmt.Fprint(w, "data: [DONE]\n\n")
@@ -594,7 +598,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Warn("responses stream failed", "err", err)
-		s.logFailure(r, backend.StatusCode(err), err)
+		s.logFailure(r, failureStatus(err), err)
 		send("response.failed", map[string]any{"response": responseObject(id, model, "failed", []responsesOutput{}, nil)})
 		return
 	}
