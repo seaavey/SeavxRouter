@@ -64,12 +64,15 @@ ones also control how the running router reaches its local server:
 | --- | --- |
 | `~/.seavx/auth.jsonc` | Provider credentials, mode `0600`. |
 | `~/.seavx/usage.db` | SQLite usage ledger and recent request logs. |
+| `~/.seavx/keys.db` | SQLite tenant API keys, monthly budgets, and token caps. |
 | `~/.seavx/hidden-models.txt` | Optional model blocklist. |
 | `~/.seavx/cache/models.json` | Cached models.dev pricing catalog. |
 | `~/.seavx/server.url` | URL of the running server, used by the TUI. |
 
 Set `-auth-file` to move `auth.jsonc`; `hidden-models.txt` always sits next to
-it.
+it. Set `-usage-db` and `-keys-db` to relocate or disable their databases
+(`off` disables). Keys stay usable with usage tracking off, but budgets and
+token caps are not enforced in that case.
 
 ## Hidden models
 
@@ -119,6 +122,28 @@ cumulative savings at `/v1/compression`.
 Providers that expose quota report it at `/v1/quota`, aggregated per account.
 Quota errors rotate accounts and may fail over to another provider, as described
 in `references/providers.md`.
+
+## Multi-tenant API keys (SaaS)
+
+`-api-key` is the master/admin credential. Once it is set, customer keys minted
+through `/v1/keys` or `seavxrouter key create` can call the inference endpoints
+and `/v1/models`. Operator routes (`/v1/usage`, `/v1/logging*`, `/v1/quota`,
+`/v1/compression`) and key management stay master-only.
+
+- Keys are stored in `~/.seavx/keys.db`; only a SHA-256 hash is kept and the
+  plaintext is shown once. Set `-keys-db off` to disable the feature.
+- Usage and logs attribute a tenant request to `key:<name>`; filter with
+  `GET /v1/usage?user=key:acme`.
+- `budget_usd` is a monthly cap reset at 00:00 UTC on the 1st; `0` means
+  unlimited. Exceeding it returns `429 insufficient_quota` on inference
+  requests. Enforcement needs usage tracking; models without a price entry
+  record cost 0 and do not consume budget.
+- `limit_token` is a monthly cap on total tokens with the same reset; `0`
+  means unlimited. Exceeding it also returns `429 insufficient_quota`. Priced
+  and unpriced models both count their tokens.
+- Revoking (`DELETE /v1/keys/{id}`) keeps the row and history; the key stops
+  authenticating immediately.
+- Running without `-api-key` leaves the server open and makes tenant keys inert.
 
 ## Security
 

@@ -5,12 +5,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -121,6 +123,7 @@ func main() {
 	loginMode := len(os.Args) > 1 && os.Args[1] == "login"
 	checkMode := len(os.Args) > 1 && os.Args[1] == "check"
 	tuiMode := len(os.Args) > 1 && os.Args[1] == "tui"
+	keyMode := len(os.Args) > 1 && os.Args[1] == "key"
 	loginProvider := "antigravity"
 	loginRegion := ""
 	var checkProviders []string
@@ -148,6 +151,9 @@ func main() {
 	if tuiMode {
 		args = os.Args[2:]
 	}
+	if keyMode {
+		os.Exit(runKeyCmd(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	fs := flag.NewFlagSet("seavxrouter", flag.ExitOnError)
 	listen := fs.String("listen", "127.0.0.1:20128", "listen address")
 	authFile := fs.String("auth-file", auth.DefaultPath(), "credentials file")
@@ -155,6 +161,7 @@ func main() {
 	apiKey := fs.String("api-key", "", "require this bearer token on /v1/* (empty = no auth)")
 	defaultModel := fs.String("default-model", "", "model used when the request omits one")
 	usageDB := fs.String("usage-db", httpapi.DefaultUsageDBPath(), `SQLite file for token usage tracking (empty or "off" disables)`)
+	keysDB := fs.String("keys-db", httpapi.DefaultKeysDBPath(), `SQLite file for tenant API keys (empty or "off" disables)`)
 	compressFlag := fs.String("compress", "on", "compress large tool-result output: on|off")
 	compressMinBytes := fs.Int("compress-min-bytes", 2000, "minimum tool-result bytes to compress")
 	pricingFile := fs.String("pricing", "", "JSON file with model prices in USD per 1M tokens (empty = models.dev catalog)")
@@ -384,6 +391,43 @@ func main() {
 		slog.Info("usage tracking enabled", "db", *usageDB)
 	}
 
+	var keyStore *httpapi.KeyStore
+	switch *keysDB {
+	case "", "off", "none":
+		slog.Info("api key store disabled")
+	default:
+		ks, err := httpapi.OpenKeyStore(*keysDB)
+		if err != nil {
+			slog.Error("cannot open api key db", "err", err)
+			os.Exit(1)
+		}
+		defer ks.Close()
+		keyStore = ks
+		slog.Info("api key store enabled", "db", *keysDB)
+	}
+	if keyStore != nil {
+		keys, err := keyStore.List()
+		if err != nil {
+			slog.Warn("cannot list api keys", "err", err)
+		} else {
+			active, budgeted := 0, 0
+			for _, k := range keys {
+				if k.RevokedAt == nil {
+					active++
+				}
+				if k.BudgetUSD > 0 {
+					budgeted++
+				}
+			}
+			if active > 0 && *apiKey == "" {
+				slog.Warn("tenant API keys exist but -api-key is not set; multi-tenant auth is disabled")
+			}
+			if budgeted > 0 && usageStore == nil {
+				slog.Warn("per-key budgets are not enforced because usage tracking is disabled")
+			}
+		}
+	}
+
 	compressor := compress.New(compress.Options{Enabled: compressionEnabled(*compressFlag), MinBytes: *compressMinBytes})
 	slog.Info("compression", "enabled", compressor.Enabled(), "min_bytes", *compressMinBytes)
 	pricing := httpapi.DefaultPricing()
@@ -402,7 +446,11 @@ func main() {
 			slog.Info("pricing overrides loaded", "file", *pricingFile)
 		}
 	}
-	srv := httpapi.NewServer(provider, *apiKey, usageStore, httpapi.WithCompression(compressor), httpapi.WithPricing(pricing))
+	serverOpts := []httpapi.ServerOption{httpapi.WithCompression(compressor), httpapi.WithPricing(pricing)}
+	if keyStore != nil {
+		serverOpts = append(serverOpts, httpapi.WithKeys(keyStore))
+	}
+	srv := httpapi.NewServer(provider, *apiKey, usageStore, serverOpts...)
 
 	httpSrv := &http.Server{
 		Addr:              *listen,
@@ -649,5 +697,127 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 		return 1
 	}
 	fmt.Printf("all %d provider(s) ok\n", len(selected))
+	return 0
+}
+
+// runKeyCmd handles `seavxrouter key create|list|revoke` against the tenant
+// key database. Flags may follow the positional name or id.
+func runKeyCmd(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintln(stderr, "usage: seavxrouter key create <name> [-budget USD] [-limit-token N] [-keys-db path]")
+		fmt.Fprintln(stderr, "       seavxrouter key list [-keys-db path]")
+		fmt.Fprintln(stderr, "       seavxrouter key revoke <id> [-keys-db path]")
+		return 2
+	}
+	action := args[0]
+	switch action {
+	case "create", "list", "revoke":
+	default:
+		fmt.Fprintf(stderr, "unknown key action %q (want create, list or revoke)\n", action)
+		return 2
+	}
+
+	rest := args[1:]
+	positional := ""
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		positional = rest[0]
+		rest = rest[1:]
+	}
+	fs := flag.NewFlagSet("seavxrouter key", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	keysDB := fs.String("keys-db", httpapi.DefaultKeysDBPath(), "SQLite file with tenant API keys")
+	budget := fs.Float64("budget", 0, "create: monthly budget in USD (0 = unlimited)")
+	limitToken := fs.Int64("limit-token", 0, "create: monthly total token limit (0 = unlimited)")
+	if err := fs.Parse(rest); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	var id int64
+	switch action {
+	case "create":
+		if positional == "" {
+			fmt.Fprintln(stderr, "usage: seavxrouter key create <name> [-budget USD] [-limit-token N]")
+			return 2
+		}
+	case "list":
+		if positional != "" {
+			fmt.Fprintf(stderr, "unexpected argument %q\n", positional)
+			return 2
+		}
+	default: // revoke
+		if positional == "" {
+			fmt.Fprintln(stderr, "usage: seavxrouter key revoke <id>")
+			return 2
+		}
+		parsed, err := strconv.ParseInt(positional, 10, 64)
+		if err != nil || parsed <= 0 {
+			fmt.Fprintf(stderr, "invalid API key id %q\n", positional)
+			return 2
+		}
+		id = parsed
+	}
+
+	store, err := httpapi.OpenKeyStore(*keysDB)
+	if err != nil {
+		fmt.Fprintf(stderr, "cannot open api key db: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	switch action {
+	case "create":
+		key, plaintext, err := store.Create(positional, *budget, *limitToken)
+		if err != nil {
+			fmt.Fprintf(stderr, "cannot create API key: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "created API key %q (id %d)\n", key.Name, key.ID)
+		fmt.Fprintf(stdout, "key: %s\n", plaintext)
+		fmt.Fprintln(stdout, "store this key now; it will not be shown again")
+		return 0
+	case "list":
+		keys, err := store.List()
+		if err != nil {
+			fmt.Fprintf(stderr, "cannot list API keys: %v\n", err)
+			return 1
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tNAME\tPREFIX\tBUDGET\tTOKENS\tCREATED\tSTATUS")
+		for _, k := range keys {
+			status := "active"
+			if k.RevokedAt != nil {
+				status = "revoked"
+			}
+			budget := "unlimited"
+			if k.BudgetUSD > 0 {
+				budget = fmt.Sprintf("$%.2f/mo", k.BudgetUSD)
+			}
+			tokens := "unlimited"
+			if k.LimitToken > 0 {
+				tokens = fmt.Sprintf("%d/mo", k.LimitToken)
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", k.ID, k.Name, k.Prefix, budget, tokens, k.CreatedAt, status)
+		}
+		tw.Flush()
+		if len(keys) == 0 {
+			fmt.Fprintln(stdout, "no API keys")
+		}
+		return 0
+	}
+
+	key, err := store.Revoke(id)
+	if errors.Is(err, httpapi.ErrKeyNotFound) {
+		fmt.Fprintf(stderr, "API key %d not found\n", id)
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "cannot revoke API key: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "revoked API key %d (%s)\n", key.ID, key.Name)
 	return 0
 }

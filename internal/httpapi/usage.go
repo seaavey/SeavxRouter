@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -164,6 +165,10 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating usage index: %w", err)
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS usage_user_ts ON usage(user, ts)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating usage user index: %w", err)
 	}
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS request_logs_ts ON request_logs(ts)"); err != nil {
 		db.Close()
@@ -329,9 +334,13 @@ func (s *UsageStore) Query(f UsageFilter) (UsageTotals, []UsageGroup, error) {
 	return totals, groups, nil
 }
 
-// usageUser attributes a request to a user: explicit X-Seavx-User header,
-// else a short hash of the bearer token, else "anonymous".
+// usageUser attributes a request to a user: a tenant key's billing identity,
+// else explicit X-Seavx-User header, else a short hash of the bearer token,
+// else "anonymous".
 func usageUser(r *http.Request) string {
+	if k := tenantKeyFromContext(r.Context()); k != nil {
+		return tenantUser(k.Name)
+	}
 	if u := strings.TrimSpace(r.Header.Get("X-Seavx-User")); u != "" {
 		if len(u) > 128 {
 			u = u[:128]
@@ -343,6 +352,19 @@ func usageUser(r *http.Request) string {
 		return hex.EncodeToString(sum[:])[:12]
 	}
 	return "anonymous"
+}
+
+// SpendSince sums recorded cost and total tokens for one attributed user,
+// which is how tenant limits are enforced.
+func (s *UsageStore) SpendSince(ctx context.Context, user string, since time.Time) (costUSD float64, totalTokens int64, err error) {
+	err = s.db.QueryRowContext(ctx,
+		"SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(total_tokens), 0) FROM usage WHERE user = ? AND ts >= ?",
+		user, since.UTC().Format(usageTimestampLayout),
+	).Scan(&costUSD, &totalTokens)
+	if err != nil {
+		return 0, 0, fmt.Errorf("summing usage spend: %w", err)
+	}
+	return costUSD, totalTokens, nil
 }
 
 // RecordCompression inserts one compression event, stamping TS with the

@@ -5,6 +5,7 @@ seavxrouter [flags]              run the HTTP server
 seavxrouter login [provider]     authenticate and store credentials
 seavxrouter check [provider...]  verify credentials and list models
 seavxrouter tui [flags]          terminal usage dashboard
+seavxrouter key <action>         manage tenant API keys
 ```
 
 `check` with no arguments verifies every configured provider with a 45-second
@@ -12,15 +13,28 @@ timeout per provider. `tui` discovers a running server through
 `~/.seavx/server.url` (falling back to `http://localhost:20128`) for the SSE log
 feed.
 
+`key` actions run against the local key database, not a running server:
+
+```bash
+seavxrouter key create <name> [-budget USD] [-limit-token N] [-keys-db path]
+seavxrouter key list [-keys-db path]
+seavxrouter key revoke <id> [-keys-db path]
+```
+
+`create` prints the plaintext key once. `-budget` and `-limit-token` set monthly
+caps; `0` (the default) means unlimited. Revoking is soft; the row stays in
+`list` with status `revoked`.
+
 ## Server flags
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `-listen` | `127.0.0.1:20128` | Listen address. Keep it on loopback unless protected. |
 | `-auth-file` | `~/.seavx/auth.jsonc` | Credentials file. |
-| `-api-key` | empty | Require this bearer token on `/v1/*`. Empty disables auth. |
+| `-api-key` | empty | Require this bearer token on `/v1/*`. Empty disables auth. Also the master key for key management. |
 | `-default-model` | empty | Model used when a request omits `model`. |
 | `-usage-db` | `~/.seavx/usage.db` | SQLite usage database; `off` disables tracking. |
+| `-keys-db` | `~/.seavx/keys.db` | SQLite tenant API keys and budgets; `off` disables. |
 | `-compress` | `on` | Compress large tool results (`on`/`off`). |
 | `-compress-min-bytes` | `2000` | Minimum tool-result size before compression. |
 | `-pricing` | empty | JSON price overrides in USD per 1M tokens. |

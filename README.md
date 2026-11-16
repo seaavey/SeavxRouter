@@ -38,6 +38,9 @@ accounts, tracks token usage and cost, and ships with a live terminal dashboard.
   an SSE feed of finished calls.
 - **Request logs** — the newest 1,000 requests with response bodies and token
   counts, never request bodies.
+- **Multi-tenant API keys** — SQLite-backed customer keys with revocation,
+  usage attribution per customer, and monthly USD budgets or token caps.
+  Manage through `/v1/keys` or `seavxrouter key`.
 - **Operational controls** — tool-output compression, a hot-reloaded model
   blocklist, and optional bearer auth on `/v1/*`.
 
@@ -88,15 +91,30 @@ Credentials are written to `~/.seavx/auth.jsonc` with mode `0600`. Protect the
 endpoint with `-api-key` whenever it is reachable by anything other than your
 own user account.
 
+## Multi-tenant (SaaS)
+
+Run with `-api-key` to make it the admin key, then mint revocable customer keys
+with monthly USD budgets and/or token caps:
+
+```bash
+./seavxrouter -api-key "$ADMIN_KEY" -listen 127.0.0.1:20128
+./seavxrouter key create acme -budget 50 -limit-token 2000000
+```
+
+Customers use the printed `sk-svr-...` key. Usage and cost are attributed to
+`key:acme`, an exhausted budget or token cap returns `429 insufficient_quota`,
+and operator routes stay master-only. Keys can also be managed over HTTP at
+`/v1/keys` (master key required).
+
 ## Documentation
 
-| Topic | Where |
-| --- | --- |
-| Full operator and developer reference — providers, CLI, HTTP API, configuration, state, quirks | [`skills/seavxrouter/SKILL.md`](skills/seavxrouter/SKILL.md) |
-| Design notes and implementation specs | [`docs/`](docs/) |
-| Security policy and vulnerability reporting | [SECURITY.md](SECURITY.md) |
-| Contributing and code of conduct | [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
-| Legal disclaimer | [DISCLAIMER.md](DISCLAIMER.md) |
+| Topic                                                                                          | Where                                                                        |
+| ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Full operator and developer reference — providers, CLI, HTTP API, configuration, state, quirks | [`skills/seavxrouter/SKILL.md`](skills/seavxrouter/SKILL.md)                 |
+| Design notes and implementation specs                                                          | [`docs/`](docs/)                                                             |
+| Security policy and vulnerability reporting                                                    | [SECURITY.md](SECURITY.md)                                                   |
+| Contributing and code of conduct                                                               | [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
+| Legal disclaimer                                                                               | [DISCLAIMER.md](DISCLAIMER.md)                                               |
 
 ## License
 
