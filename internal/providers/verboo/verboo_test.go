@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"seavxrouter/internal/auth"
 	"seavxrouter/internal/backend"
@@ -159,14 +160,86 @@ func TestChatStreamAggregates(t *testing.T) {
 	if res.Usage != wantUsage {
 		t.Fatalf("usage = %#v, want %#v", res.Usage, wantUsage)
 	}
-	var content, toolDeltas int
+	var content, thinking, toolDeltas int
 	for _, d := range deltas {
 		content += len(d.Content)
+		thinking += len(d.Thinking)
 		toolDeltas += len(d.ToolCalls)
 	}
-	if content != len("Hello world") || toolDeltas != 1 {
-		t.Fatalf("deltas: content bytes = %d, tool calls = %d", content, toolDeltas)
+	if content != len("Hello world") || thinking != len("thinking") || toolDeltas != 1 {
+		t.Fatalf("deltas: content bytes = %d, thinking bytes = %d, tool calls = %d", content, thinking, toolDeltas)
 	}
+}
+
+func TestChatClassifiesPausedFreeTierAsQuota(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, `{"error":{"code":"free_tokens_accounting_pending","message":"The limit of requests awaiting usage confirmation has been reached. Free inference is paused until a request is settled; paid activation remains available."}}`)
+	}))
+	defer srv.Close()
+
+	e := newTestEngine(t, srv, "tok")
+	_, err := e.Chat(context.Background(), &backend.ChatRequest{
+		Model:    "deepseek-v4.1-flash",
+		Messages: []backend.ChatMessage{{Role: "user", Content: "hi"}},
+	}, nil)
+	if err == nil || !backend.IsQuotaError(err) {
+		t.Fatalf("err = %v, want a quota error", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
+func TestModelsServesStaleWhileRefreshing(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":[{"id":"fresh","display_name":"Fresh"}]}`)
+	}))
+	defer srv.Close()
+
+	e := newTestEngine(t, srv, "tok")
+	e.mu.Lock()
+	e.models = []backend.Model{{ID: "stale"}}
+	e.modelsAt = time.Now().Add(-time.Hour)
+	e.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	models, err := e.Models(ctx)
+	if err != nil {
+		t.Fatalf("stale read blocked on refresh: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "stale" {
+		t.Fatalf("models = %+v, want the cached entry", models)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background refresh did not start")
+	}
+	close(release)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		models, err := e.Models(context.Background())
+		if err == nil && len(models) == 1 && models[0].ID == "fresh" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("catalog was not refreshed in the background")
 }
 
 func TestChatRotatesOnQuota(t *testing.T) {

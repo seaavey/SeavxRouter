@@ -29,12 +29,13 @@ type Engine struct {
 	Stdin io.Reader
 	Out   io.Writer
 
-	mu       sync.Mutex
-	auths    []*auth.Auth
-	cache    auth.AccountCache
-	next     int
-	models   []backend.Model
-	modelsAt time.Time
+	mu         sync.Mutex
+	auths      []*auth.Auth
+	cache      auth.AccountCache
+	next       int
+	models     []backend.Model
+	modelsAt   time.Time
+	refreshing bool
 
 	quotaMu  sync.Mutex
 	quotaErr map[*auth.Auth]time.Time
@@ -111,12 +112,21 @@ type modelList struct {
 	} `json:"data"`
 }
 
-// Models discovers the account's catalog from GET /models. The list is
-// account-specific, so there is no static fallback.
+// modelsTTL bounds how often the catalog is refreshed. Requests keep using the
+// last known catalog, so an expired entry never adds a /models round trip to a
+// chat; the refresh runs in the background instead.
+const modelsTTL = 5 * time.Minute
+
+// Models returns the account's catalog. The first call fetches synchronously;
+// later calls serve the cached list immediately while a stale cache is
+// refreshed in the background.
 func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
 	e.mu.Lock()
-	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
-		models := e.models
+	if models := e.models; models != nil {
+		if time.Since(e.modelsAt) >= modelsTTL && !e.refreshing {
+			e.refreshing = true
+			go e.refreshModels(context.WithoutCancel(ctx))
+		}
 		e.mu.Unlock()
 		return models, nil
 	}
@@ -131,6 +141,23 @@ func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
 	e.modelsAt = time.Now()
 	e.mu.Unlock()
 	return models, nil
+}
+
+// refreshModels replaces the catalog off the request path. A failed refresh
+// keeps the previous list and retries on the next stale request.
+func (e *Engine) refreshModels(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	models, err := e.fetchModels(ctx)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.refreshing = false
+	if err != nil {
+		slog.Warn("verboo model refresh failed", "err", err)
+		return
+	}
+	e.models = models
+	e.modelsAt = time.Now()
 }
 
 func (e *Engine) fetchModels(ctx context.Context) ([]backend.Model, error) {
@@ -385,8 +412,9 @@ type verbooChunk struct {
 	Usage   *verbooUsage `json:"usage"`
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -437,6 +465,15 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, 
 		case http.StatusUnauthorized, http.StatusForbidden:
 			return nil, false, fmt.Errorf("unauthorized: %w", err)
 		}
+		// A paused free tier ("free_tokens_accounting_pending") is a per-account
+		// allowance condition too: classify it as quota so the caller rotates or
+		// falls back instead of retrying the same account after a backoff.
+		msg := strings.ToLower(err.Error())
+		pausedFreeTier := resp.StatusCode == http.StatusServiceUnavailable &&
+			(strings.Contains(msg, "usage confirmation") || strings.Contains(msg, "free inference is paused"))
+		if pausedFreeTier {
+			return nil, false, fmt.Errorf("quota: %w", err)
+		}
 		return nil, false, err
 	}
 	var (
@@ -460,6 +497,14 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, 
 						return nil, started, fmt.Errorf("verboo: %s", chunk.Error.Message)
 					}
 					for _, c := range chunk.Choices {
+						if c.Delta.ReasoningContent != "" {
+							// Reasoning streams before visible text; forwarding it lets
+							// the client render output instead of waiting in silence.
+							started = true
+							if onDelta != nil {
+								onDelta(backend.ChatDelta{Thinking: c.Delta.ReasoningContent})
+							}
+						}
 						if c.Delta.Content != "" {
 							full.WriteString(c.Delta.Content)
 							started = true
