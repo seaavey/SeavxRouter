@@ -51,7 +51,12 @@ an existing custom provider are picked up live.
 
 - **Antigravity** — base URL overridable with `-api-base` (default is the
   built-in Antigravity endpoint). Bare model IDs fall back here.
-- **Qoder** — a quota 403 (for example a `pricingUrl` body) does not trigger a
+- **Qoder** — the adapter exchanges the PAT for a machine-bound job token at the
+  Center (`jobToken/exchange`), refreshes it in place (`jobToken/refresh`), and
+  falls back to a fresh exchange if the refresh token is rejected. Chat and the
+  model list use the COSY-signed endpoints on `api2.qoder.sh` (global) or
+  `gateway.qoder.com.cn` (cn). `GET /v1/quota` reports live plan and add-on
+  credit usage. A quota 403 (for example a `pricingUrl` body) does not trigger a
   session refresh. Quota-limited accounts move behind healthy accounts for
   `qoderQuotaCooldown` (10 minutes) but are still tried last, so a request can
   recover once the cooldown expires.

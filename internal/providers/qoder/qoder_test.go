@@ -65,18 +65,6 @@ func TestQoderRegionDefault(t *testing.T) {
 	}
 }
 
-func TestQoderSign(t *testing.T) {
-	t.Setenv("QODER_SIGNATURE_SECRET", "")
-	date := "Mon, 22 Jul 2026 05:30:00 GMT"
-	if got := qoderSign(date); got != "549a179af939a97f816ed77605db041c" {
-		t.Fatalf("qoderSign(%q) = %q", date, got)
-	}
-	t.Setenv("QODER_SIGNATURE_SECRET", "custom-secret")
-	if got := qoderSign(date); got == "549a179af939a97f816ed77605db041c" {
-		t.Fatalf("qoderSign should honor QODER_SIGNATURE_SECRET")
-	}
-}
-
 func TestQoderMachineIdentityStable(t *testing.T) {
 	id1, tok1, typ1 := qoderMachineIdentity("pt-abc")
 	id2, tok2, typ2 := qoderMachineIdentity("pt-abc")
@@ -173,8 +161,8 @@ func TestQoderSessionAndBearer(t *testing.T) {
 
 func TestQoderSigPath(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1", "/api/v2/model/list"},
-		{"https://api1.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=x", "/api/v2/service/pro/sse/agent_chat_generation"},
+		{"https://api2.qoder.sh/algo/api/v2/model/list?Encode=1", "/api/v2/model/list"},
+		{"https://api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=x", "/api/v2/service/pro/sse/agent_chat_generation"},
 		{"https://x/other/path", "/other/path"},
 	}
 	for _, tc := range cases {
@@ -445,51 +433,51 @@ type qoderMock struct {
 	catalog     any
 	catalogFail bool
 	chatFn      func(n int, w http.ResponseWriter)
+	refreshFail bool
+	quota       any
 
-	jobTokens     int
-	badTokens     int
-	goodTokens    int
-	refreshCalls  int
-	needRefresh   bool
-	chatCalls     int
-	lastBody      []byte
-	lastAuth      string
-	lastCosyKey   string
-	lastCosyDate  string
-	lastModelKey  string
-	lastToolCount int
+	exchanges    int
+	badTokens    int
+	goodTokens   int
+	refreshCalls int
+	chatCalls    int
+	lastBody     []byte
+	lastAuth     string
+	lastCosyKey  string
+	lastCosyDate string
+	lastModelKey string
+	lastUUID     string
+}
+
+func (m *qoderMock) jobToken(w http.ResponseWriter) {
+	exp := time.Now().Add(24 * time.Hour)
+	fmt.Fprintf(w, `{"token":"jt-%d","refresh_token":"jrt-%d","expires_at":%q,"expires_in":86400000}`,
+		time.Now().UnixNano(), time.Now().UnixNano(), exp.Format(time.RFC3339))
 }
 
 func (m *qoderMock) handler(t *testing.T) http.Handler {
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/algo/api/v3/user/jobToken":
-			raw, _ := io.ReadAll(r.Body)
-			dec, err := qoderDecode(string(raw))
-			if err != nil {
-				t.Errorf("jobToken body not encoded: %v", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobToken/exchange":
+			var body struct {
+				PersonalToken string `json:"personal_token"`
+				MachineID     string `json:"machine_id"`
+				MachineToken  string `json:"machine_token"`
 			}
-			var outer struct {
-				Payload       string `json:"payload"`
-				EncodeVersion string `json:"encodeVersion"`
-			}
-			if err := json.Unmarshal(dec, &outer); err != nil || outer.EncodeVersion != "1" || outer.Payload == "" {
-				t.Errorf("jobToken envelope malformed: %s", dec)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("exchange body: %v", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			var inner struct {
-				PersonalToken string `json:"personalToken"`
-				RefreshToken  string `json:"refreshToken"`
-				NeedRefresh   bool   `json:"needRefresh"`
+			if body.MachineID == "" || body.MachineToken == "" {
+				t.Errorf("exchange must carry machine credentials: %+v", body)
+				w.WriteHeader(http.StatusBadRequest)
+				return
 			}
-			_ = json.Unmarshal([]byte(outer.Payload), &inner)
 			m.mu.Lock()
-			m.jobTokens++
-			if inner.PersonalToken == m.badPAT {
+			m.exchanges++
+			if body.PersonalToken == m.badPAT {
 				m.badTokens++
 				m.mu.Unlock()
 				w.WriteHeader(http.StatusUnauthorized)
@@ -497,15 +485,40 @@ func (m *qoderMock) handler(t *testing.T) http.Handler {
 				return
 			}
 			m.goodTokens++
-			if inner.NeedRefresh {
-				m.refreshCalls++
-				m.needRefresh = true
-			}
 			m.mu.Unlock()
-			fmt.Fprintf(w, `{"id":"u1","name":"Tester","expireTime":%d,"securityOauthToken":"so-1","refreshToken":"rt-1","userType":"personal_pro"}`,
-				time.Now().Add(24*time.Hour).UnixMilli())
-		case r.Method == http.MethodPost && r.URL.Path == "/algo/api/v3/user/status":
-			fmt.Fprintf(w, `{"userType":%q}`, m.statusTier)
+			m.jobToken(w)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobToken/refresh":
+			var body struct {
+				RefreshToken string `json:"refresh_token"`
+				MachineID    string `json:"machine_id"`
+				MachineToken string `json:"machine_token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("refresh body: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			m.mu.Lock()
+			m.refreshCalls++
+			fail := m.refreshFail || body.RefreshToken == "" || body.MachineID == "" || body.MachineToken == ""
+			m.mu.Unlock()
+			if fail {
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprint(w, `{"code":401,"message":"refresh rejected"}`)
+				return
+			}
+			m.jobToken(w)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/userinfo":
+			fmt.Fprint(w, `{"id":"u1","name":"Tester","email":"t@example.com"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/user/status":
+			fmt.Fprintf(w, `{"userType":%q,"plan":"PLAN_TIER_PRO_TRIAL"}`, m.statusTier)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/quota/usage":
+			if m.quota == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			b, _ := json.Marshal(m.quota)
+			w.Write(b)
 		case r.Method == http.MethodGet && r.URL.Path == "/algo/api/v2/model/list":
 			if m.catalogFail || m.catalog == nil {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -524,6 +537,7 @@ func (m *qoderMock) handler(t *testing.T) http.Handler {
 			m.lastCosyKey = r.Header.Get("cosy-key")
 			m.lastCosyDate = r.Header.Get("cosy-date")
 			m.lastModelKey = r.Header.Get("x-model-key")
+			m.lastUUID = r.Header.Get("cosy-machineid")
 			fn := m.chatFn
 			m.mu.Unlock()
 			w.Header().Set("content-type", "text/event-stream")
@@ -738,6 +752,17 @@ func TestQoderChatEndToEnd(t *testing.T) {
 	biz, _ := body["business"].(map[string]any)
 	if biz["name"] != "hi there" || biz["id"] == "" {
 		t.Fatalf("business = %v", biz)
+	}
+
+	mock.mu.Lock()
+	exchanges, machineID := mock.exchanges, mock.lastUUID
+	mock.mu.Unlock()
+	if exchanges != 1 {
+		t.Fatalf("expected one job token exchange, got %d", exchanges)
+	}
+	wantMachine, _, _ := qoderMachineIdentity("pt-good-123")
+	if machineID != wantMachine {
+		t.Fatalf("chat cosy-machineid = %q, want the token-bound %q", machineID, wantMachine)
 	}
 }
 
@@ -988,11 +1013,46 @@ func TestQoderChatRefreshesOnAuthFrame(t *testing.T) {
 	}
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
-	if mock.refreshCalls != 1 || !mock.needRefresh {
-		t.Fatalf("expected one needRefresh jobToken call, got refreshCalls=%d needRefresh=%v", mock.refreshCalls, mock.needRefresh)
+	if mock.refreshCalls != 1 || mock.exchanges != 1 {
+		t.Fatalf("expected one refresh on top of the initial exchange, got refreshCalls=%d exchanges=%d", mock.refreshCalls, mock.exchanges)
 	}
 	if mock.chatCalls != 2 {
 		t.Fatalf("expected 2 chat attempts, got %d", mock.chatCalls)
+	}
+}
+
+func TestQoderRefreshFallsBackToExchange(t *testing.T) {
+	mock := &qoderMock{
+		statusTier:  "personal_pro",
+		catalog:     qoderMockCatalog(),
+		refreshFail: true,
+		chatFn: func(n int, w http.ResponseWriter) {
+			if n == 1 {
+				fmt.Fprint(w, qoderSSERawFrame(t, map[string]any{
+					"statusCodeValue": float64(401),
+					"body":            `{"code":105,"message":"login expired"}`,
+				}))
+				return
+			}
+			qoderChatText(w, t, "recovered")
+			qoderChatDone(t, w)
+		},
+	}
+	e := qoderTestEngine(t, mock, &auth.Auth{Provider: "qoder", AccessToken: "pt-good", Region: "cn"})
+	res, err := e.Chat(context.Background(), &backend.ChatRequest{
+		Model:    "Qwen-Unit",
+		Messages: []backend.ChatMessage{{Role: "user", Content: "hello"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("chat should fall back to a PAT exchange: %v", err)
+	}
+	if res.Content != "recovered" {
+		t.Fatalf("content = %q", res.Content)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.refreshCalls != 1 || mock.exchanges != 2 {
+		t.Fatalf("expected refresh then re-exchange, got refreshCalls=%d exchanges=%d", mock.refreshCalls, mock.exchanges)
 	}
 }
 
@@ -1098,6 +1158,35 @@ func TestQoderQuota(t *testing.T) {
 	}
 	if q.DefaultModel != "DeepSeek-Flash" {
 		t.Fatalf("quota default model = %q", q.DefaultModel)
+	}
+}
+
+func TestQoderQuotaLiveWindows(t *testing.T) {
+	mock := &qoderMock{
+		statusTier: "personal_pro",
+		catalog:    qoderMockCatalog(),
+		quota: map[string]any{
+			"isQuotaExceeded": false,
+			"expiresAt":       float64(time.Now().Add(72 * time.Hour).UnixMilli()),
+			"userQuota":       map[string]any{"total": 300.0, "used": 24.0, "remaining": 276.0, "unit": "credits"},
+			"addOnQuota":      map[string]any{"total": 100.0, "used": 0.0, "remaining": 100.0, "unit": "credits"},
+		},
+	}
+	e := qoderTestEngine(t, mock, &auth.Auth{Provider: "qoder", AccessToken: "pt-good", Region: "cn"})
+
+	q := e.Quota()
+	if len(q.Accounts) != 1 || len(q.Accounts[0].Windows) != 2 {
+		t.Fatalf("quota windows = %+v", q.Accounts)
+	}
+	w := q.Accounts[0].Windows[0]
+	if w.Group != "Credits" || w.Name != "Plan credits" || w.UsedPercent == nil || *w.UsedPercent != 8 {
+		t.Fatalf("plan window = %+v", w)
+	}
+	if w.ResetsAt == nil {
+		t.Fatalf("plan window should carry a reset time")
+	}
+	if addOn := q.Accounts[0].Windows[1]; addOn.Name != "Add-on credits" || addOn.UsedPercent == nil || *addOn.UsedPercent != 0 {
+		t.Fatalf("add-on window = %+v", addOn)
 	}
 }
 

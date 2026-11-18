@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,22 +35,28 @@ import (
 
 // --- Qoder regions ---
 
+// qoderRegion maps one deployment's three service groups: CenterBase mints
+// machine-bound job tokens, OpenBase serves Bearer-authenticated identity and
+// usage APIs, and ChatBase hosts the COSY-signed inference and model list.
 type qoderRegion struct {
-	Name     string
-	AuthBase string
-	ChatBase string
+	Name       string
+	CenterBase string
+	OpenBase   string
+	ChatBase   string
 }
 
 var (
 	qoderCN = &qoderRegion{
-		Name:     "cn",
-		AuthBase: "https://gateway.qoder.com.cn",
-		ChatBase: "https://gateway.qoder.com.cn",
+		Name:       "cn",
+		CenterBase: "https://gateway.qoder.com.cn",
+		OpenBase:   "https://openapi.qoder.com.cn",
+		ChatBase:   "https://gateway.qoder.com.cn",
 	}
 	qoderGlobal = &qoderRegion{
-		Name:     "global",
-		AuthBase: "https://api1.qoder.sh",
-		ChatBase: "https://api1.qoder.sh",
+		Name:       "global",
+		CenterBase: "https://center.qoder.sh",
+		OpenBase:   "https://openapi.qoder.sh",
+		ChatBase:   "https://api2.qoder.sh",
 	}
 )
 
@@ -69,10 +76,8 @@ func qoderRegionFor(name string) *qoderRegion {
 const (
 	qoderCustomAlphabet = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!"
 	qoderStdAlphabet    = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	qoderAppCode        = "cosy"
 	qoderClientVersion  = "0.1.43"
 	qoderClientType     = "5"
-	qoderDefaultSecret  = "d2FyLCB3YXIgbmV2ZXIgY2hhbmdlcw=="
 	qoderUserAgent      = "Go-http-client/2.0"
 	qoderBusyCode       = "10605"
 	qoderDefaultTier    = "personal_standard"
@@ -149,26 +154,9 @@ func qoderDecode(encoded string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(string(std))
 }
 
-// --- Machine signature ---
-
-func qoderSecret() string {
-	if s := os.Getenv("QODER_SIGNATURE_SECRET"); s != "" {
-		return s
-	}
-	return qoderDefaultSecret
-}
-
 func qoderMD5(s string) string {
 	h := md5.Sum([]byte(s))
 	return hex.EncodeToString(h[:])
-}
-
-func qoderCurrentDate() string {
-	return time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
-}
-
-func qoderSign(date string) string {
-	return qoderMD5(qoderAppCode + "&" + qoderSecret() + "&" + date)
 }
 
 // qoderMachineIdentity derives stable machine identifiers from the PAT so a
@@ -329,24 +317,6 @@ func qoderSigPath(fullURL string) string {
 	return path
 }
 
-func qoderMachineHeaders(machineID, machineToken, machineType, date, sig string) http.Header {
-	h := http.Header{}
-	h.Set("cosy-machinetoken", machineToken)
-	h.Set("cosy-machinetype", machineType)
-	h.Set("login-version", "v2")
-	h.Set("appcode", qoderAppCode)
-	h.Set("accept", "application/json")
-	h.Set("accept-encoding", "identity")
-	h.Set("cosy-version", qoderClientVersion)
-	h.Set("cosy-clienttype", qoderClientType)
-	h.Set("date", date)
-	h.Set("signature", sig)
-	h.Set("content-type", "application/json")
-	h.Set("cosy-machineid", machineID)
-	h.Set("user-agent", qoderUserAgent)
-	return h
-}
-
 func qoderSessionHeaders(sess *qoderSession, date, bearer, accept string) http.Header {
 	h := http.Header{}
 	h.Set("cosy-data-policy", "AGREE")
@@ -392,7 +362,7 @@ type QoderEngine struct {
 	Store        auth.AuthStore
 	HTTP         *http.Client
 	DefaultModel string
-	AuthBase     string // test override for both regions
+	AuthBase     string // test override for center and openapi everywhere
 	ChatBase     string // test override for both regions
 	Region       string // preferred login region ("cn"/"global")
 	Stdin        io.Reader
@@ -406,8 +376,9 @@ type QoderEngine struct {
 
 	catalogCache *backend.Catalog[*qoderCatalog]
 
-	quotaMu  sync.Mutex
-	quotaErr map[*auth.Auth]time.Time
+	quotaMu   sync.Mutex
+	quotaErr  map[*auth.Auth]time.Time
+	quotaLive map[*auth.Auth]qoderQuotaSnapshot
 }
 
 const (
@@ -436,11 +407,19 @@ func (e *QoderEngine) client() *http.Client {
 	return http.DefaultClient
 }
 
-func (e *QoderEngine) authBase(r *qoderRegion) string {
-	if e.AuthBase != "" {
-		return strings.TrimRight(e.AuthBase, "/")
+func (e *QoderEngine) base(override, fallback string) string {
+	if override != "" {
+		return strings.TrimRight(override, "/")
 	}
-	return r.AuthBase
+	return fallback
+}
+
+func (e *QoderEngine) centerBase(r *qoderRegion) string {
+	return e.base(e.AuthBase, r.CenterBase)
+}
+
+func (e *QoderEngine) openBase(r *qoderRegion) string {
+	return e.base(e.AuthBase, r.OpenBase)
 }
 
 func (e *QoderEngine) chatBase(r *qoderRegion) string {
@@ -614,51 +593,121 @@ func qoderRotatable(err error) bool {
 	return backend.IsQuotaError(err) || backend.IsAuthError(err) || errors.As(err, &authErr)
 }
 
-// --- auth.Auth endpoints (machine-signature authenticated) ---
+// --- Center job tokens (machine-bound, Bearer-authenticated identity) ---
 
-type qoderJobTokenInner struct {
-	PersonalToken      string          `json:"personalToken"`
-	SecurityOauthToken string          `json:"securityOauthToken"`
-	RefreshToken       string          `json:"refreshToken"`
-	NeedRefresh        bool            `json:"needRefresh"`
-	AuthInfo           json.RawMessage `json:"authInfo"`
+// qoderJobToken is the Center's response for both exchange and refresh. The
+// token is bound to the machine identity sent in the request body, so the same
+// machine_id/machine_token must appear in the COSY chat headers.
+type qoderJobToken struct {
+	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    string `json:"expires_at"`
+	ExpiresIn    int64  `json:"expires_in"`
 }
 
-type qoderOuterPayload struct {
-	Payload       string `json:"payload"`
-	EncodeVersion string `json:"encodeVersion"`
-}
-
-func (e *QoderEngine) requestJobToken(ctx context.Context, acct *qoderAccount, refreshToken, securityOauth string, needRefresh bool) (map[string]any, error) {
-	inner, err := qoderMarshalNoEscape(qoderJobTokenInner{
-		PersonalToken:      acct.auth.AccessToken,
-		SecurityOauthToken: securityOauth,
-		RefreshToken:       refreshToken,
-		NeedRefresh:        needRefresh,
-		AuthInfo:           json.RawMessage("{}"),
+func (e *QoderEngine) exchangeJobToken(ctx context.Context, acct *qoderAccount) (*qoderJobToken, error) {
+	return e.postJobToken(ctx, acct, "/api/v1/jobToken/exchange", map[string]string{
+		"personal_token": acct.auth.AccessToken,
+		"machine_id":     acct.machineID,
+		"machine_token":  acct.machineToken,
 	})
+}
+
+func (e *QoderEngine) refreshJobToken(ctx context.Context, acct *qoderAccount, refreshToken string) (*qoderJobToken, error) {
+	return e.postJobToken(ctx, acct, "/api/v1/jobToken/refresh", map[string]string{
+		"refresh_token": refreshToken,
+		"machine_id":    acct.machineID,
+		"machine_token": acct.machineToken,
+	})
+}
+
+func (e *QoderEngine) postJobToken(ctx context.Context, acct *qoderAccount, path string, body map[string]string) (*qoderJobToken, error) {
+	plain, err := qoderMarshalNoEscape(body)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	urlStr := e.authBase(acct.region) + "/algo/api/v3/user/jobToken?Encode=1"
-	return e.postEncoded(ctx, acct, urlStr, qoderOuterPayload{Payload: string(inner), EncodeVersion: "1"})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.centerBase(acct.region)+path, bytes.NewReader(plain))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("cosy-clienttype", qoderClientType)
+	req.Header.Set("cosy-version", qoderClientVersion)
+	req.Header.Set("user-agent", qoderUserAgent)
+
+	resp, err := e.client().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return nil, qoderAPIError(resp.StatusCode, detail)
+	}
+	var tok qoderJobToken
+	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
+		return nil, err
+	}
+	if tok.Token == "" {
+		return nil, fmt.Errorf("qoder jobToken %s: empty token", path)
+	}
+	return &tok, nil
 }
 
-func (e *QoderEngine) postEncoded(ctx context.Context, acct *qoderAccount, urlStr string, obj any) (map[string]any, error) {
-	date := qoderCurrentDate()
-	plain, err := qoderMarshalNoEscape(obj)
-	if err != nil {
-		return nil, err
+// qoderIdentityInfo carries the profile fields the COSY identity payload needs.
+type qoderIdentityInfo struct {
+	ID       string
+	Name     string
+	UserType string
+}
+
+// fetchIdentity decodes the job token's owner via the open API. Failures are
+// logged and tolerated: the cached account fields still produce a usable
+// session, and the chat endpoint ignores most of the identity payload.
+func (e *QoderEngine) fetchIdentity(ctx context.Context, acct *qoderAccount, token string) qoderIdentityInfo {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var info qoderIdentityInfo
+	var user struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
 	}
-	body := qoderEncode(plain)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, strings.NewReader(body))
-	if err != nil {
-		return nil, err
+	if err := e.openGet(ctx, acct, token, "/api/v1/userinfo", &user); err != nil {
+		slog.Warn("qoder userinfo failed", "err", err)
+		return info
 	}
-	req.Header = qoderMachineHeaders(acct.machineID, acct.machineToken, acct.machineType, date, qoderSign(date))
-	return e.doJSON(req)
+	info.ID, info.Name = user.ID, user.Name
+	var status struct {
+		UserType string `json:"userType"`
+	}
+	if err := e.openGet(ctx, acct, token, "/api/v3/user/status", &status); err != nil {
+		slog.Warn("qoder user/status failed", "err", err)
+	}
+	info.UserType = status.UserType
+	return info
+}
+
+func (e *QoderEngine) openGet(ctx context.Context, acct *qoderAccount, token, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.openBase(acct.region)+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("authorization", "Bearer "+token)
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("user-agent", qoderUserAgent)
+	resp, err := e.client().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return qoderAPIError(resp.StatusCode, detail)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func (e *QoderEngine) doJSON(req *http.Request) (map[string]any, error) {
@@ -676,35 +725,6 @@ func (e *QoderEngine) doJSON(req *http.Request) (map[string]any, error) {
 		return nil, err
 	}
 	return out, nil
-}
-
-func (e *QoderEngine) fetchUserType(ctx context.Context, acct *qoderAccount, userID string) string {
-	if userID == "" {
-		return ""
-	}
-	inner, err := qoderMarshalNoEscape(struct {
-		UserID             string          `json:"userId"`
-		PersonalToken      string          `json:"personalToken"`
-		SecurityOauthToken string          `json:"securityOauthToken"`
-		RefreshToken       string          `json:"refreshToken"`
-		NeedRefresh        bool            `json:"needRefresh"`
-		AuthInfo           json.RawMessage `json:"authInfo"`
-	}{UserID: userID, AuthInfo: json.RawMessage("{}")})
-	if err != nil {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	urlStr := e.authBase(acct.region) + "/algo/api/v3/user/status?Encode=1"
-	raw, err := e.postEncoded(ctx, acct, urlStr, qoderOuterPayload{Payload: string(inner), EncodeVersion: "1"})
-	if err != nil {
-		slog.Warn("qoder user/status failed", "err", err)
-		return ""
-	}
-	if t, _ := raw["userType"].(string); t != "" {
-		return t
-	}
-	return ""
 }
 
 // --- Session lifecycle ---
@@ -742,70 +762,71 @@ func (e *QoderEngine) renewSession(ctx context.Context, acct *qoderAccount, forc
 	}
 	bootstrapped := acct.bootstrapped
 	refreshToken := acct.refreshToken
-	securityOauth := acct.securityOauth
 	acct.mu.Unlock()
 
-	var jt map[string]any
+	var tok *qoderJobToken
 	var err error
 	if bootstrapped && refreshToken != "" {
-		jt, err = e.requestJobToken(ctx, acct, refreshToken, securityOauth, true)
-		if err != nil && force {
+		tok, err = e.refreshJobToken(ctx, acct, refreshToken)
+		if err != nil {
 			slog.Warn("qoder refresh token rejected; re-exchanging PAT", "err", err)
-			jt, err = e.requestJobToken(ctx, acct, "", "", false)
+			tok, err = e.exchangeJobToken(ctx, acct)
 		}
 	} else {
-		jt, err = e.requestJobToken(ctx, acct, "", "", false)
+		tok, err = e.exchangeJobToken(ctx, acct)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return e.applyJobToken(ctx, acct, jt)
+	return e.applyJobToken(ctx, acct, tok)
 }
 
-func (e *QoderEngine) applyJobToken(ctx context.Context, acct *qoderAccount, jt map[string]any) (*qoderSession, error) {
-	name := qoderString(jt["name"])
-	id := qoderString(jt["id"])
-	userType := e.fetchUserType(ctx, acct, id)
+func (e *QoderEngine) applyJobToken(ctx context.Context, acct *qoderAccount, tok *qoderJobToken) (*qoderSession, error) {
+	info := e.fetchIdentity(ctx, acct, tok.Token)
+	acct.mu.Lock()
+	userType := info.UserType
 	if userType == "" {
-		acct.mu.Lock()
 		userType = acct.userType
-		acct.mu.Unlock()
 	}
-	if userType == "" {
-		userType = qoderString(jt["userType"])
-	}
+	acct.mu.Unlock()
 	if userType == "" {
 		userType = qoderDefaultTier
 	}
-	securityOauth := qoderString(jt["securityOauthToken"])
-	refreshToken := qoderString(jt["refreshToken"])
 	sess, err := qoderNewSession(qoderIdentity{
-		Name:          name,
-		Aid:           id,
-		UID:           id,
+		Name:          info.Name,
+		Aid:           info.ID,
+		UID:           info.ID,
 		UserType:      userType,
-		SecurityOauth: securityOauth,
-		RefreshToken:  refreshToken,
+		SecurityOauth: tok.Token,
+		RefreshToken:  tok.RefreshToken,
 	}, acct.machineID, acct.machineToken, acct.machineType)
 	if err != nil {
 		return nil, err
 	}
-	expireMs := qoderInt64(jt["expireTime"])
+	expireAt := qoderTokenExpiry(tok)
 	acct.mu.Lock()
 	acct.sess = sess
 	acct.userType = userType
-	acct.securityOauth = securityOauth
-	acct.refreshToken = refreshToken
+	acct.securityOauth = tok.Token
+	acct.refreshToken = tok.RefreshToken
 	acct.bootstrapped = true
 	acct.refreshedAt = time.Now()
-	if expireMs > 0 {
-		acct.expireAt = time.UnixMilli(expireMs)
-	} else {
-		acct.expireAt = time.Time{}
-	}
+	acct.expireAt = expireAt
 	acct.mu.Unlock()
-	slog.Info("qoder session ready", "account", name, "tier", userType, "region", acct.region.Name)
+	slog.Info("qoder session ready", "account", info.Name, "tier", userType, "region", acct.region.Name)
 	return sess, nil
+}
+
+// qoderTokenExpiry prefers the absolute expires_at; it falls back to the
+// relative expires_in (milliseconds) when the timestamp is unparsable.
+func qoderTokenExpiry(tok *qoderJobToken) time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, tok.ExpiresAt); err == nil {
+		return t
+	}
+	if tok.ExpiresIn > 0 {
+		return time.Now().Add(time.Duration(tok.ExpiresIn) * time.Millisecond)
+	}
+	return time.Time{}
 }
 
 func qoderString(v any) string {
@@ -822,24 +843,6 @@ func qoderInt(v any) int {
 	case json.Number:
 		i, _ := n.Int64()
 		return int(i)
-	}
-	return 0
-}
-
-func qoderInt64(v any) int64 {
-	switch n := v.(type) {
-	case float64:
-		return int64(n)
-	case int64:
-		return n
-	case int:
-		return int64(n)
-	case json.Number:
-		i, _ := n.Int64()
-		return i
-	case string:
-		i, _ := strconv.ParseInt(n, 10, 64)
-		return i
 	}
 	return 0
 }
@@ -2086,23 +2089,22 @@ func (e *QoderEngine) Login(ctx context.Context) error {
 	acct := &qoderAccount{auth: &auth.Auth{Provider: "qoder", AccessToken: pat, Region: region.Name}, region: region}
 	acct.machineID, acct.machineToken, acct.machineType = qoderMachineIdentity(pat)
 
-	jt, err := e.requestJobToken(ctx, acct, "", "", false)
+	tok, err := e.exchangeJobToken(ctx, acct)
 	if err != nil {
 		return fmt.Errorf("qoder login failed: %w", err)
 	}
-	name := qoderString(jt["name"])
-	id := qoderString(jt["id"])
-	tier := e.fetchUserType(ctx, acct, id)
+	info := e.fetchIdentity(ctx, acct, tok.Token)
+	tier := info.UserType
 	if tier == "" {
-		tier = qoderString(jt["userType"])
+		tier = qoderDefaultTier
 	}
-	fmt.Fprintf(out, "Signed in to Qoder (%s) as %s [id=%s tier=%s]\n", region.Name, name, id, tier)
+	fmt.Fprintf(out, "Signed in to Qoder (%s) as %s [id=%s tier=%s]\n", region.Name, info.Name, info.ID, tier)
 
 	return e.Store.Save([]*auth.Auth{{
 		Provider:    "qoder",
 		AccessToken: pat,
-		AccountID:   id,
-		Email:       name,
+		AccountID:   info.ID,
+		Email:       info.Name,
 		Tier:        tier,
 		Region:      region.Name,
 	}})
@@ -2110,6 +2112,28 @@ func (e *QoderEngine) Login(ctx context.Context) error {
 
 // --- Quota ---
 
+const qoderLiveQuotaTTL = time.Minute
+
+type qoderQuotaSnapshot struct {
+	windows []auth.QuotaWindow
+	at      time.Time
+}
+
+type qoderQuotaBucket struct {
+	Total float64 `json:"total"`
+	Used  float64 `json:"used"`
+	Unit  string  `json:"unit"`
+}
+
+type qoderQuotaUsage struct {
+	IsQuotaExceeded bool              `json:"isQuotaExceeded"`
+	ExpiresAt       int64             `json:"expiresAt"`
+	UserQuota       *qoderQuotaBucket `json:"userQuota"`
+	AddOnQuota      *qoderQuotaBucket `json:"addOnQuota"`
+}
+
+// Quota reports per-account availability for GET /v1/quota, including credit
+// usage pulled from the open API when a client is configured.
 func (e *QoderEngine) Quota() auth.ProviderQuota {
 	auths, _ := e.snapshotAuths()
 	e.quotaMu.Lock()
@@ -2118,9 +2142,98 @@ func (e *QoderEngine) Quota() auth.ProviderQuota {
 		limited[a] = t
 	}
 	e.quotaMu.Unlock()
+	var windows map[*auth.Auth][]auth.QuotaWindow
+	if e.HTTP != nil {
+		windows = e.liveQuotaWindows(auths)
+	}
 	q := auth.ProviderQuota{Provider: "qoder", DefaultModel: e.Default(), Accounts: make([]auth.AccountQuota, 0, len(auths))}
 	for _, a := range auths {
-		q.Accounts = append(q.Accounts, auth.AccountStatus("qoder", a, limited))
+		ac := auth.AccountStatus("qoder", a, limited)
+		ac.Windows = windows[a]
+		q.Accounts = append(q.Accounts, ac)
 	}
 	return q
+}
+
+// liveQuotaWindows refreshes cached usage windows for all accounts in parallel.
+func (e *QoderEngine) liveQuotaWindows(auths []*auth.Auth) map[*auth.Auth][]auth.QuotaWindow {
+	out := make(map[*auth.Auth][]auth.QuotaWindow, len(auths))
+	if len(auths) == 0 {
+		return out
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, a := range auths {
+		wg.Add(1)
+		go func(a *auth.Auth) {
+			defer wg.Done()
+			if w := e.accountQuotaWindows(ctx, a); len(w) > 0 {
+				mu.Lock()
+				out[a] = w
+				mu.Unlock()
+			}
+		}(a)
+	}
+	wg.Wait()
+	return out
+}
+
+func (e *QoderEngine) accountQuotaWindows(ctx context.Context, a *auth.Auth) []auth.QuotaWindow {
+	e.quotaMu.Lock()
+	snap, cached := e.quotaLive[a]
+	e.quotaMu.Unlock()
+	if cached && time.Since(snap.at) < qoderLiveQuotaTTL {
+		return snap.windows
+	}
+	windows, err := e.fetchQuotaWindows(ctx, e.accountFor(a))
+	if err != nil {
+		slog.Warn("qoder quota fetch failed", "email", a.Email, "err", err)
+		return snap.windows
+	}
+	e.quotaMu.Lock()
+	if e.quotaLive == nil {
+		e.quotaLive = map[*auth.Auth]qoderQuotaSnapshot{}
+	}
+	e.quotaLive[a] = qoderQuotaSnapshot{windows: windows, at: time.Now()}
+	e.quotaMu.Unlock()
+	return windows
+}
+
+func (e *QoderEngine) fetchQuotaWindows(ctx context.Context, acct *qoderAccount) ([]auth.QuotaWindow, error) {
+	if _, err := e.ensureSession(ctx, acct); err != nil {
+		return nil, err
+	}
+	acct.mu.Lock()
+	token := acct.securityOauth
+	acct.mu.Unlock()
+	if token == "" {
+		return nil, fmt.Errorf("qoder quota: no job token")
+	}
+	var usage qoderQuotaUsage
+	if err := e.openGet(ctx, acct, token, "/api/v2/quota/usage", &usage); err != nil {
+		return nil, err
+	}
+	return qoderQuotaWindows(&usage), nil
+}
+
+func qoderQuotaWindows(u *qoderQuotaUsage) []auth.QuotaWindow {
+	windows := []auth.QuotaWindow{}
+	add := func(name string, b *qoderQuotaBucket) {
+		if b == nil || b.Total <= 0 {
+			return
+		}
+		used := math.Round(b.Used/b.Total*10000) / 100
+		used = math.Max(0, math.Min(100, used))
+		w := auth.QuotaWindow{Group: "Credits", Name: name, UsedPercent: &used}
+		if u.ExpiresAt > 0 {
+			t := time.UnixMilli(u.ExpiresAt)
+			w.ResetsAt = &t
+		}
+		windows = append(windows, w)
+	}
+	add("Plan credits", u.UserQuota)
+	add("Add-on credits", u.AddOnQuota)
+	return windows
 }
