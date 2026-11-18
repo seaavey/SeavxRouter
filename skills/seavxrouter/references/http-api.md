@@ -27,7 +27,7 @@ token cap. Inference requests from an exhausted key return
 | `GET` | `/v1/quota` | Per-account quota for providers that expose it. Master only. |
 | `GET` | `/v1/usage` | Usage totals and groups. Filters: `provider`, `model`, `user`, `start`, `end`, `group_by`. Master only. |
 | `GET` | `/v1/compression` | Cumulative tool-output compression statistics. Master only. |
-| `GET` | `/v1/logging` | Recent request logs with response bodies and token usage. Master only. |
+| `GET` | `/v1/logging` | Recent request logs with response bodies, token usage, and the serving account. Master only. |
 | `GET` | `/v1/logging/stream` | SSE stream of finished requests. Master only. |
 | `GET` | `/v1/logging/{id}` | One request log. Master only. |
 | `POST` | `/v1/keys` | Mint a tenant key. Master only. |
@@ -43,6 +43,10 @@ hash of the bearer token, otherwise `anonymous`.
 
 Model resolution rejects unknown IDs with `404 model_not_found`. Hidden models
 are filtered out of `/v1/models` and are not resolvable either.
+
+Every log entry also carries `account`, the provider credential that served the
+request: the account email when known, else the upstream account ID, else a
+short fingerprint of the API key.
 
 ## Examples
 
@@ -137,6 +141,7 @@ groq/openai/gpt-oss-120b
 nvidia/deepseek-ai/deepseek-v4.1-flash
 cloudflare/@cf/meta/llama-3.1-8b-instruct
 opencode/big-pickle
+combo/fast
 ```
 
 - The first segment selects the provider; the remainder passes through, so IDs
@@ -144,5 +149,12 @@ opencode/big-pickle
 - Bare IDs resolve to codex when it lists the model, otherwise antigravity.
 - Common aliases are normalized (for example `gemini-flash`, dashed versus
   dotted Gemini versions).
-- Fallback order on retryable failures: other providers that serve the same
-  model, then (quota/auth only) each remaining provider's default model.
+- A request stays on the provider its model names. Retryable failures retry the
+  same provider once; quota failures rotate accounts inside the provider.
+- `combo/<name>` is the explicit cross-provider fallback. Its members are tried
+  in order and the request moves on when a member fails before producing output
+  (quota, auth, or transient). A non-retryable failure or a partially streamed
+  answer ends the request. Usage and logs attribute the member that answered;
+  the response echoes the requested `combo/<name>`.
+- Combos are listed by `GET /v1/models` as `combo/<name>` entries with
+  `owned_by: "seavx"`, since the router assembles the fallback list itself.

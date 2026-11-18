@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -29,6 +30,7 @@ func TestRequestLogging(t *testing.T) {
 	stub := &chatStub{result: &backend.ChatResult{
 		Content:      "hi there",
 		FinishReason: "stop",
+		Account:      "alice@example.com",
 		Usage:        backend.Usage{InputTokens: 3, OutputTokens: 2, ThinkingTokens: 1, CacheReadTokens: 4, TotalTokens: 5},
 	}}
 	s, path := newLoggingServer(t, stub)
@@ -62,6 +64,9 @@ func TestRequestLogging(t *testing.T) {
 	}
 	if raw["id"] == "" || raw["endpoint"] != "chat" || raw["provider"] != "antigravity" || raw["model"] != "m" || raw["status"] != float64(200) {
 		t.Fatalf("entry = %v", raw)
+	}
+	if raw["account"] != "alice@example.com" {
+		t.Fatalf("account = %v", raw["account"])
 	}
 	if raw["request_bytes"].(float64) != 0 || raw["response_bytes"].(float64) == 0 {
 		t.Fatalf("body sizes = %v / %v", raw["request_bytes"], raw["response_bytes"])
@@ -139,6 +144,7 @@ func TestRequestLoggingStream(t *testing.T) {
 	stub := &chatStub{result: &backend.ChatResult{
 		Content:      "hi there",
 		FinishReason: "stop",
+		Account:      "bob@example.com",
 		Usage:        backend.Usage{InputTokens: 3, OutputTokens: 2, TotalTokens: 5},
 	}}
 	s, path := newLoggingServer(t, stub)
@@ -177,6 +183,7 @@ func TestRequestLoggingStream(t *testing.T) {
 	var e struct {
 		Endpoint     string `json:"endpoint"`
 		Model        string `json:"model"`
+		Account      string `json:"account"`
 		Status       int    `json:"status"`
 		RequestBytes int    `json:"request_bytes"`
 		Usage        struct {
@@ -189,6 +196,9 @@ func TestRequestLoggingStream(t *testing.T) {
 	}
 	if e.Endpoint != "chat" || e.Model != "m" || e.Status != 200 || e.RequestBytes != 0 {
 		t.Fatalf("streamed log = %s", data)
+	}
+	if e.Account != "bob@example.com" {
+		t.Fatalf("streamed account = %s", data)
 	}
 	if e.Usage.PromptTokens != 3 || e.Usage.TotalTokens != 5 {
 		t.Fatalf("streamed usage = %s", data)
@@ -299,5 +309,115 @@ func TestRequestLoggingDisabled(t *testing.T) {
 	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/v1/logging", nil))
 	if w.Code != 404 {
 		t.Fatalf("code %d body %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequestLogRecordsParsedMeta guards that handlers report the model and
+// stream flag themselves: the logging middleware no longer reads request bodies.
+func TestRequestLogRecordsParsedMeta(t *testing.T) {
+	stub := &chatStub{result: &backend.ChatResult{Content: "x", FinishReason: "stop"}}
+	s, path := newLoggingServer(t, stub)
+	h := s.Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`)))
+	if w.Code != 200 {
+		t.Fatalf("chat code %d body %s", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/messages",
+		strings.NewReader(`{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)))
+	if w.Code != 200 {
+		t.Fatalf("messages code %d body %s", w.Code, w.Body.String())
+	}
+
+	logs, err := s.usage.QueryLogs(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("logs = %+v", logs)
+	}
+	byEndpoint := map[string]RequestLog{}
+	for _, e := range logs {
+		byEndpoint[e.Endpoint] = e
+	}
+	if e := byEndpoint["chat"]; e.Model != "m" || !e.Stream {
+		t.Fatalf("chat log = %+v", e)
+	}
+	if e := byEndpoint["messages"]; e.Model != "m" || e.Stream {
+		t.Fatalf("messages log = %+v", e)
+	}
+}
+
+// TestUsageStoreMigratesRequestLogAccount guards that databases created before
+// account attribution existed gain the column instead of failing inserts.
+func TestUsageStoreMigratesRequestLogAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE request_logs (
+		id TEXT PRIMARY KEY, ts TEXT NOT NULL, endpoint TEXT NOT NULL DEFAULT '',
+		provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+		user TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0, stream INTEGER NOT NULL DEFAULT 0,
+		request TEXT NOT NULL DEFAULT '', response TEXT NOT NULL DEFAULT '',
+		prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0,
+		thinking_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenUsageStore(path)
+	if err != nil {
+		t.Fatalf("OpenUsageStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.RecordLog(RequestLog{ID: "x", Account: "alice@example.com", Status: 200}); err != nil {
+		t.Fatalf("RecordLog: %v", err)
+	}
+	logs, err := store.QueryLogs(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Account != "alice@example.com" {
+		t.Fatalf("logs = %+v", logs)
+	}
+}
+
+// TestOversizedRequestBodyReturns413 keeps the old middleware behavior: bodies
+// past the limit are rejected with body_too_large even though the handler now
+// owns the body read.
+func TestOversizedRequestBodyReturns413(t *testing.T) {
+	stub := &chatStub{result: &backend.ChatResult{Content: "x"}}
+	s, path := newLoggingServer(t, stub)
+	h := s.Handler()
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"padding":"` + strings.Repeat("a", 11<<20) + `"}`
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(body)))
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d body %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "body_too_large") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	if stub.gotReq != nil {
+		t.Fatal("backend must not see an oversized request")
+	}
+
+	logs, err := s.usage.QueryLogs(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("logs = %+v", logs)
 	}
 }

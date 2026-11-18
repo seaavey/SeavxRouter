@@ -133,6 +133,7 @@ func (r renderer) detail(v View, height int) string {
 		{"DATE", localStamp(e.TS), ""},
 		{"MODEL", e.Model, ""},
 		{"PROVIDER", e.Provider, ""},
+		{"ACCOUNT", e.Account, ""},
 		{"STATUS", strconv.Itoa(e.Status), statusStyle},
 		{"STREAM", strconv.FormatBool(e.Stream), ""},
 		{"INPUT", humanCount(int64(e.InputTokens)) + " tokens", ""},

@@ -21,6 +21,32 @@ the matching environment variable is set (see
 `references/configuration.md`). Storing several entries for one provider adds
 them to that provider's round-robin rotation.
 
+## Custom providers
+
+Any OpenAI-compatible endpoint can be registered without code changes:
+
+```bash
+seavxrouter provider add runcrate \
+  -base-url https://api.runcrate.ai/v1 -api-key "$RUNCATE_API_KEY"
+```
+
+`add` validates the name, requires an `http(s)` base URL, and probes the key
+with both `GET /models` (non-empty catalog required) and a tiny
+`chat/completions` request against up to three chat-capable models — some
+providers serve `/models` publicly, so the catalog alone cannot prove the key.
+An empty catalog or a 401/403 aborts the command; a 402/429 quota response
+still stores the key, with a `warning:` printed. Pass `-model ID` to pin the
+smoke test to a model the plan can use when the catalog's first chat models
+are paid. The entry lands in
+`auth.jsonc` with `base_url`, and models are exposed as `runcrate/<model>`. Use
+`seavxrouter provider list` and `seavxrouter provider remove <name>` to manage
+them.
+
+Several keys for one custom provider rotate like any other provider, but all
+keys must share the same base URL. A running server builds custom engines at
+startup, so restart it after adding or removing a provider; additional keys for
+an existing custom provider are picked up live.
+
 ## Adapter behavior worth knowing
 
 - **Antigravity** — base URL overridable with `-api-base` (default is the
@@ -55,7 +81,8 @@ them to that provider's round-robin rotation.
 - `IsAuthError` matches 401/unauthorized/invalid token.
 - `IsRetryableError` is quota, auth, or transient transport/5xx wording.
 
-On a quota or auth error, `multi` first tries other configured providers that
-list the same model, then gives every remaining provider one attempt with its
-own default model. Expect `verboo/<id>` requests to be answered by another
-provider when the Verboo key is paused.
+On a quota or auth error inside one provider, `multi` rotates to the next
+account of the same provider and never switches providers implicitly. To span
+providers, request a `combo/<name>` (see `references/configuration.md`):
+members run in order and a quota, auth, or transient failure before any output
+moves to the next one.

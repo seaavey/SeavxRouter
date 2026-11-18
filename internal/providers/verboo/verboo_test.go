@@ -194,9 +194,15 @@ func TestChatClassifiesPausedFreeTierAsQuota(t *testing.T) {
 }
 
 func TestModelsServesStaleWhileRefreshing(t *testing.T) {
+	var calls atomic.Int32
 	started := make(chan struct{})
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"data":[{"id":"stale","display_name":"Stale"}]}`)
+			return
+		}
 		select {
 		case <-started:
 		default:
@@ -209,14 +215,19 @@ func TestModelsServesStaleWhileRefreshing(t *testing.T) {
 	defer srv.Close()
 
 	e := newTestEngine(t, srv, "tok")
-	e.mu.Lock()
-	e.models = []backend.Model{{ID: "stale"}}
-	e.modelsAt = time.Now().Add(-time.Hour)
-	e.mu.Unlock()
+	e.catalog = backend.NewCatalog("verboo", time.Nanosecond, e.fetchModels)
+	models, err := e.Models(context.Background())
+	if err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "stale" {
+		t.Fatalf("models = %+v, want the first fetch", models)
+	}
 
+	time.Sleep(5 * time.Millisecond) // let the entry go stale
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	models, err := e.Models(ctx)
+	models, err = e.Models(ctx)
 	if err != nil {
 		t.Fatalf("stale read blocked on refresh: %v", err)
 	}

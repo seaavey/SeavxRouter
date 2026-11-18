@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -9,9 +10,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -124,6 +128,9 @@ func main() {
 	checkMode := len(os.Args) > 1 && os.Args[1] == "check"
 	tuiMode := len(os.Args) > 1 && os.Args[1] == "tui"
 	keyMode := len(os.Args) > 1 && os.Args[1] == "key"
+	providerMode := len(os.Args) > 1 && os.Args[1] == "provider"
+	comboMode := len(os.Args) > 1 && os.Args[1] == "combo"
+	serviceMode := len(os.Args) > 1 && os.Args[1] == "service"
 	loginProvider := "antigravity"
 	loginRegion := ""
 	var checkProviders []string
@@ -154,9 +161,19 @@ func main() {
 	if keyMode {
 		os.Exit(runKeyCmd(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if providerMode {
+		os.Exit(runProviderCmd(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+	if comboMode {
+		os.Exit(runComboCmd(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	if serviceMode {
+		os.Exit(runServiceCmd(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	fs := flag.NewFlagSet("seavxrouter", flag.ExitOnError)
 	listen := fs.String("listen", "127.0.0.1:20128", "listen address")
 	authFile := fs.String("auth-file", auth.DefaultPath(), "credentials file")
+	combosFile := fs.String("combos", "", "JSONC file with model combos (empty = combos.jsonc next to the credentials file)")
 	apiBase := fs.String("api-base", antigravity.DefaultAPIBase, "Antigravity API base URL")
 	apiKey := fs.String("api-key", "", "require this bearer token on /v1/* (empty = no auth)")
 	defaultModel := fs.String("default-model", "", "model used when the request omits one")
@@ -250,7 +267,11 @@ func main() {
 		os.Exit(1)
 	}
 	accounts := groupAuths(auths)
-	multi := &multi.MultiBackend{}
+	combosPath := *combosFile
+	if combosPath == "" {
+		combosPath = defaultCombosPath(*authFile)
+	}
+	multi := &multi.MultiBackend{Combos: multi.NewCombos(combosPath)}
 	if len(accounts.antigravity) > 0 {
 		engine, err := antigravity.NewEngine(store, *apiBase, accounts.antigravity)
 		if err != nil {
@@ -364,6 +385,32 @@ func main() {
 		engine.DefaultModel = pickDefault(*defaultModel, upstream.Providers["cloudflare"].DefaultModel)
 		multi.Cloudflare = engine
 	}
+	multi.Custom = map[string]backend.BackendAPI{}
+	for _, name := range accounts.customNames() {
+		customAuths := accounts.custom[name]
+		base, err := customBaseURL(name, customAuths)
+		if err != nil {
+			slog.Error("invalid custom provider", "provider", name, "err", err)
+			os.Exit(1)
+		}
+		engine, err := upstream.NewEngine(name, base, store, customAuths)
+		if err != nil {
+			slog.Error("cannot start "+name, "err", err)
+			os.Exit(1)
+		}
+		engine.DefaultModel = *defaultModel
+		if engine.DefaultModel == "" {
+			defaultCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			models, err := engine.Models(defaultCtx)
+			cancel()
+			if err == nil && len(models) > 0 {
+				engine.DefaultModel = models[0].ID
+			} else if err != nil {
+				slog.Warn("could not fetch default model", "provider", name, "err", err)
+			}
+		}
+		multi.Custom[name] = engine
+	}
 	if len(accounts.opencode) > 0 {
 		engine, err := opencode.NewEngine(opencode.ConfigFromEnv())
 		if err != nil {
@@ -373,7 +420,10 @@ func main() {
 		defer engine.Close()
 		multi.OpenCode = engine
 	}
-	slog.Info("providers ready", "antigravity", len(accounts.antigravity), "codex", len(accounts.codex), "codebuddy", len(accounts.codebuddy), "qoder", len(accounts.qoder), "kiro", len(accounts.kiro), "verboo", len(accounts.verboo), "nvidia", len(accounts.nvidia), "groq", len(accounts.groq), "cloudflare", len(accounts.cloudflare), "opencode", len(accounts.opencode))
+	slog.Info("providers ready", "antigravity", len(accounts.antigravity), "codex", len(accounts.codex), "codebuddy", len(accounts.codebuddy), "qoder", len(accounts.qoder), "kiro", len(accounts.kiro), "verboo", len(accounts.verboo), "nvidia", len(accounts.nvidia), "groq", len(accounts.groq), "cloudflare", len(accounts.cloudflare), "opencode", len(accounts.opencode), "custom", len(accounts.custom))
+	if names := multi.Combos.Names(); len(names) > 0 {
+		slog.Info("model combos loaded", "file", combosPath, "combos", len(names))
+	}
 	provider = multi
 
 	var usageStore *httpapi.UsageStore
@@ -430,23 +480,7 @@ func main() {
 
 	compressor := compress.New(compress.Options{Enabled: compressionEnabled(*compressFlag), MinBytes: *compressMinBytes})
 	slog.Info("compression", "enabled", compressor.Enabled(), "min_bytes", *compressMinBytes)
-	pricing := httpapi.DefaultPricing()
-	if p, err := httpapi.ModelsDevPricing(""); err != nil {
-		slog.Warn("models.dev pricing unavailable, using built-in defaults", "err", err)
-	} else {
-		pricing = p
-		slog.Info("pricing loaded from models.dev", "cache", httpapi.DefaultPricingCachePath())
-	}
-	if *pricingFile != "" {
-		p, err := pricing.MergeFile(*pricingFile)
-		if err != nil {
-			slog.Warn("cannot load pricing file, keeping current prices", "err", err)
-		} else {
-			pricing = p
-			slog.Info("pricing overrides loaded", "file", *pricingFile)
-		}
-	}
-	serverOpts := []httpapi.ServerOption{httpapi.WithCompression(compressor), httpapi.WithPricing(pricing)}
+	serverOpts := []httpapi.ServerOption{httpapi.WithCompression(compressor)}
 	if keyStore != nil {
 		serverOpts = append(serverOpts, httpapi.WithKeys(keyStore))
 	}
@@ -474,6 +508,28 @@ func main() {
 			slog.Error("server failed", "err", err)
 			stop()
 		}
+	}()
+
+	// Pricing is advisory for cost reporting, so the catalog fetch runs after
+	// the listener is up: requests use the built-in table until it lands.
+	go func() {
+		pricing := httpapi.DefaultPricing()
+		if p, err := httpapi.ModelsDevPricing(""); err != nil {
+			slog.Warn("models.dev pricing unavailable, using built-in defaults", "err", err)
+		} else {
+			pricing = p
+			slog.Info("pricing loaded from models.dev", "cache", httpapi.DefaultPricingCachePath())
+		}
+		if *pricingFile != "" {
+			p, err := pricing.MergeFile(*pricingFile)
+			if err != nil {
+				slog.Warn("cannot load pricing file, keeping current prices", "err", err)
+			} else {
+				pricing = p
+				slog.Info("pricing overrides loaded", "file", *pricingFile)
+			}
+		}
+		srv.SetPricing(pricing)
 	}()
 
 	<-ctx.Done()
@@ -505,6 +561,9 @@ type providerAccounts struct {
 	groq        []*auth.Auth
 	cloudflare  []*auth.Auth
 	opencode    []*auth.Auth
+	// custom collects user-defined providers (auth entries carrying a
+	// base_url), grouped by their model prefix.
+	custom map[string][]*auth.Auth
 }
 
 func groupAuths(auths []*auth.Auth) providerAccounts {
@@ -530,6 +589,13 @@ func groupAuths(auths []*auth.Auth) providerAccounts {
 		case "opencode":
 			accounts.opencode = append(accounts.opencode, a)
 		default:
+			if a.BaseURL != "" {
+				if accounts.custom == nil {
+					accounts.custom = map[string][]*auth.Auth{}
+				}
+				accounts.custom[a.Provider] = append(accounts.custom[a.Provider], a)
+				continue
+			}
 			accounts.antigravity = append(accounts.antigravity, a)
 		}
 	}
@@ -559,14 +625,23 @@ func (p providerAccounts) list(name string) []*auth.Auth {
 	case "opencode":
 		return p.opencode
 	}
-	return nil
+	return p.custom[name]
 }
 
 func (p providerAccounts) count(name string) int {
 	return len(p.list(name))
 }
 
-func isProvider(name string) bool {
+func (p providerAccounts) customNames() []string {
+	names := make([]string, 0, len(p.custom))
+	for name := range p.custom {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func isBuiltinProvider(name string) bool {
 	for _, p := range providerNames {
 		if p == name {
 			return true
@@ -575,7 +650,21 @@ func isProvider(name string) bool {
 	return false
 }
 
+func isProvider(name string, accounts providerAccounts) bool {
+	if _, ok := accounts.custom[name]; ok {
+		return true
+	}
+	return isBuiltinProvider(name)
+}
+
 func newChecker(name string, accounts providerAccounts, store auth.AuthStore, apiBase string) (backend.Checker, error) {
+	if customAuths, ok := accounts.custom[name]; ok {
+		base, err := customBaseURL(name, customAuths)
+		if err != nil {
+			return nil, err
+		}
+		return upstream.NewEngine(name, base, store, customAuths)
+	}
 	switch name {
 	case "antigravity":
 		return antigravity.NewEngine(store, apiBase, accounts.antigravity)
@@ -623,9 +712,10 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 				selected = append(selected, name)
 			}
 		}
+		selected = append(selected, accounts.customNames()...)
 	}
 	if len(selected) == 0 {
-		fmt.Fprintln(os.Stderr, "no providers configured; run: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare|opencode]")
+		fmt.Fprintln(os.Stderr, "no providers configured; run: seavxrouter login [antigravity|codex|codebuddy|qoder|kiro|verboo|nvidia|groq|cloudflare|opencode] or seavxrouter provider add <name> -base-url URL")
 		return 1
 	}
 
@@ -640,12 +730,12 @@ func runCheck(ctx context.Context, authFile, apiBase string, providers []string)
 	}
 
 	for _, name := range selected {
-		if !isProvider(name) {
-			failProvider(name, "unknown provider (want antigravity, codex, codebuddy, qoder, kiro, verboo, nvidia, groq, cloudflare or opencode)")
+		if !isProvider(name, accounts) {
+			failProvider(name, "unknown provider (built-ins: antigravity, codex, codebuddy, qoder, kiro, verboo, nvidia, groq, cloudflare, opencode; custom see: seavxrouter provider list)")
 			continue
 		}
 		if accounts.count(name) == 0 {
-			failProvider(name, "not configured; run: seavxrouter login "+name)
+			failProvider(name, "not configured; run: seavxrouter login "+name+" or seavxrouter provider add "+name+" -base-url URL")
 			continue
 		}
 		checker, err := newChecker(name, accounts, store, apiBase)
@@ -820,4 +910,420 @@ func runKeyCmd(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "revoked API key %d (%s)\n", key.ID, key.Name)
 	return 0
+}
+
+var customProviderNameRE = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+
+// runProviderCmd handles `seavxrouter provider add|list|remove` for custom
+// OpenAI-compatible endpoints. The base URL and bearer key live in auth.jsonc;
+// model IDs use "<name>/<model>".
+func runProviderCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		providerUsage(stderr)
+		return 2
+	}
+	action := args[0]
+	switch action {
+	case "add", "list", "remove":
+	default:
+		fmt.Fprintf(stderr, "unknown provider action %q (want add, list or remove)\n", action)
+		return 2
+	}
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+
+	rest := args[1:]
+	var positional []string
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		positional = append(positional, rest[0])
+		rest = rest[1:]
+	}
+	fs := flag.NewFlagSet("seavxrouter provider", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	authFile := fs.String("auth-file", auth.DefaultPath(), "credentials file")
+	baseURL := fs.String("base-url", "", "add: upstream API base URL, e.g. https://api.example.com/v1")
+	apiKey := fs.String("api-key", "", "add: upstream bearer API key (prompted when empty)")
+	probeModel := fs.String("model", "", "add: model ID used for the chat validation smoke test")
+	if err := fs.Parse(rest); err != nil {
+		return 2
+	}
+	positional = append(positional, fs.Args()...)
+
+	want := 1
+	if action == "list" {
+		want = 0
+	}
+	if len(positional) != want {
+		if want == 1 {
+			fmt.Fprintf(stderr, "usage: seavxrouter provider %s <name> [flags]\n", action)
+		} else {
+			fmt.Fprintln(stderr, "usage: seavxrouter provider list [-auth-file path]")
+		}
+		return 2
+	}
+
+	store := auth.AuthStore{Path: *authFile}
+	switch action {
+	case "add":
+		return runProviderAdd(store, positional[0], *baseURL, *apiKey, *probeModel, stdin, stdout, stderr)
+	case "list":
+		return runProviderList(store, stdout, stderr)
+	default:
+		return runProviderRemove(store, positional[0], stdout, stderr)
+	}
+}
+
+func providerUsage(w io.Writer) {
+	fmt.Fprintln(w, "usage: seavxrouter provider add <name> -base-url URL [-api-key KEY] [-model ID] [-auth-file path]")
+	fmt.Fprintln(w, "       seavxrouter provider list [-auth-file path]")
+	fmt.Fprintln(w, "       seavxrouter provider remove <name> [-auth-file path]")
+}
+
+func normalizeCustomProviderName(raw string) (string, error) {
+	name := strings.ToLower(strings.TrimSpace(raw))
+	if !customProviderNameRE.MatchString(name) {
+		return "", fmt.Errorf("provider name %q must start with a letter and use only a-z, 0-9, _ or - (max 32 chars)", raw)
+	}
+	if isBuiltinProvider(name) {
+		return "", fmt.Errorf("provider name %q is built in; use: seavxrouter login %s", name, name)
+	}
+	switch name {
+	case "cf", "auto", "default", "combo":
+		return "", fmt.Errorf("provider name %q is reserved", name)
+	}
+	return name, nil
+}
+
+func normalizeCustomBaseURL(raw string) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("invalid base URL %q: want http(s)://host[/path]", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid base URL %q: remove the query string and fragment", raw)
+	}
+	return base, nil
+}
+
+// customBaseURL validates the endpoint shared by a custom provider's accounts.
+func customBaseURL(name string, auths []*auth.Auth) (string, error) {
+	if len(auths) == 0 {
+		return "", fmt.Errorf("no %s accounts", name)
+	}
+	base, err := normalizeCustomBaseURL(auths[0].BaseURL)
+	if err != nil {
+		return "", err
+	}
+	for _, a := range auths[1:] {
+		if a.BaseURL != auths[0].BaseURL {
+			return "", fmt.Errorf("accounts use different base URLs (%s and %s); remove the provider and add it again", auths[0].BaseURL, a.BaseURL)
+		}
+	}
+	return base, nil
+}
+
+func readPrompt(reader *bufio.Reader, out io.Writer, label string) (string, error) {
+	fmt.Fprint(out, label)
+	line, err := reader.ReadString('\n')
+	value := strings.TrimSpace(line)
+	if value == "" && err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func runProviderAdd(store auth.AuthStore, rawName, rawBaseURL, rawKey, rawProbeModel string, stdin io.Reader, stdout, stderr io.Writer) int {
+	name, err := normalizeCustomProviderName(rawName)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+
+	reader := bufio.NewReader(stdin)
+	base := strings.TrimSpace(rawBaseURL)
+	if base == "" {
+		base, err = readPrompt(reader, stdout, "Base URL: ")
+		if err != nil {
+			fmt.Fprintln(stderr, "a base URL is required")
+			return 2
+		}
+	}
+	base, err = normalizeCustomBaseURL(base)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	key := strings.TrimSpace(rawKey)
+	if key == "" {
+		key, err = readPrompt(reader, stdout, "API key: ")
+		if err != nil {
+			fmt.Fprintln(stderr, "an API key is required")
+			return 2
+		}
+	}
+	if key == "" {
+		fmt.Fprintln(stderr, "an API key is required")
+		return 2
+	}
+
+	existing, err := store.Load()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "cannot load credentials: %v\n", err)
+		return 1
+	}
+	for _, a := range existing {
+		if a.Provider != name {
+			continue
+		}
+		if a.BaseURL == "" {
+			fmt.Fprintf(stderr, "a stored account named %q exists without a base_url; remove it first\n", name)
+			return 1
+		}
+		if a.BaseURL != base {
+			fmt.Fprintf(stderr, "provider %q already points at %s; remove it first: seavxrouter provider remove %s\n", name, a.BaseURL, name)
+			return 1
+		}
+	}
+
+	// Validation is mandatory: the key must authenticate against the base URL,
+	// the endpoint must return a non-empty model catalog, and a tiny chat
+	// completion must pass before anything is stored. -model pins that
+	// completion to a model the operator knows their plan can use.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	models, note, err := upstream.ProbeKey(ctx, name, base, key, strings.TrimSpace(rawProbeModel))
+	cancel()
+	if err != nil {
+		fmt.Fprintf(stderr, "cannot verify %s at %s: %v\n", name, base, err)
+		fmt.Fprintln(stderr, "check the base URL and API key, then try again")
+		return 1
+	}
+
+	acct := &auth.Auth{Provider: name, AccessToken: key, BaseURL: base}
+	if err := store.Save([]*auth.Auth{acct}); err != nil {
+		fmt.Fprintf(stderr, "cannot save credentials: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "verified %s: %d model(s) available\n", name, len(models))
+	if note != "" {
+		fmt.Fprintf(stdout, "warning: %s\n", note)
+	}
+	fmt.Fprintf(stdout, "added custom provider %q at %s\n", name, base)
+	fmt.Fprintf(stdout, "model IDs: %s/<model>\n", name)
+	fmt.Fprintf(stdout, "restart a running server to activate the provider, then run: seavxrouter check %s\n", name)
+	return 0
+}
+
+func runProviderList(store auth.AuthStore, stdout, stderr io.Writer) int {
+	auths, err := store.Load()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stdout, "no custom providers")
+			return 0
+		}
+		fmt.Fprintf(stderr, "cannot load credentials: %v\n", err)
+		return 1
+	}
+	type entry struct {
+		baseURL string
+		keys    int
+	}
+	byName := map[string]*entry{}
+	for _, a := range auths {
+		if a.BaseURL == "" || isBuiltinProvider(a.Provider) {
+			continue
+		}
+		e := byName[a.Provider]
+		if e == nil {
+			e = &entry{baseURL: a.BaseURL}
+			byName[a.Provider] = e
+		}
+		e.keys++
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		fmt.Fprintln(stdout, "no custom providers")
+		return 0
+	}
+	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tBASE URL\tKEYS")
+	for _, name := range names {
+		e := byName[name]
+		fmt.Fprintf(tw, "%s\t%s\t%d\n", name, e.baseURL, e.keys)
+	}
+	tw.Flush()
+	return 0
+}
+
+func runProviderRemove(store auth.AuthStore, rawName string, stdout, stderr io.Writer) int {
+	name, err := normalizeCustomProviderName(rawName)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	removed, err := store.RemoveProvider(name)
+	if err != nil {
+		fmt.Fprintf(stderr, "cannot remove provider: %v\n", err)
+		return 1
+	}
+	if removed == 0 {
+		fmt.Fprintf(stderr, "no custom provider %q\n", name)
+		return 1
+	}
+	fmt.Fprintf(stdout, "removed custom provider %q (%d key(s))\n", name, removed)
+	fmt.Fprintln(stdout, "restart a running server to drop the provider")
+	return 0
+}
+
+// defaultCombosPath keeps combos.jsonc next to the credentials file, like the
+// hidden-models blocklist.
+func defaultCombosPath(authPath string) string {
+	return filepath.Join(filepath.Dir(authPath), "combos.jsonc")
+}
+
+func comboUsage(w io.Writer) {
+	fmt.Fprintln(w, "usage: seavxrouter combo add <name> -models ID,ID,... [-auth-file path] [-combos path]")
+	fmt.Fprintln(w, "       seavxrouter combo list [-auth-file path] [-combos path]")
+	fmt.Fprintln(w, "       seavxrouter combo remove <name> [-auth-file path] [-combos path]")
+}
+
+func normalizeComboName(raw string) (string, error) {
+	name := strings.ToLower(strings.TrimSpace(raw))
+	if !customProviderNameRE.MatchString(name) {
+		return "", fmt.Errorf("combo name %q must start with a letter and use only a-z, 0-9, _ or - (max 32 chars)", raw)
+	}
+	return name, nil
+}
+
+// parseComboModels splits the -models value, preserving order and dropping
+// blank entries so "a, b" and "a,b" behave alike.
+func parseComboModels(raw string) []string {
+	var out []string
+	for _, member := range strings.Split(raw, ",") {
+		if member = strings.TrimSpace(member); member != "" {
+			out = append(out, member)
+		}
+	}
+	return out
+}
+
+// runComboCmd handles `seavxrouter combo add|list|remove`. A combo is an
+// ordered fallback list requested as combo/<name>; the running server re-reads
+// the file when its mtime changes.
+func runComboCmd(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		comboUsage(stderr)
+		return 2
+	}
+	action := args[0]
+	switch action {
+	case "add", "list", "remove":
+	default:
+		fmt.Fprintf(stderr, "unknown combo action %q (want add, list or remove)\n", action)
+		return 2
+	}
+
+	rest := args[1:]
+	var positional []string
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		positional = append(positional, rest[0])
+		rest = rest[1:]
+	}
+	fs := flag.NewFlagSet("seavxrouter combo", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	authFile := fs.String("auth-file", auth.DefaultPath(), "credentials file; combos.jsonc sits next to it")
+	combosFile := fs.String("combos", "", "combos file (empty = combos.jsonc next to the credentials file)")
+	models := fs.String("models", "", "add: comma-separated model IDs in fallback order")
+	if err := fs.Parse(rest); err != nil {
+		return 2
+	}
+	positional = append(positional, fs.Args()...)
+
+	want := 1
+	if action == "list" {
+		want = 0
+	}
+	if len(positional) != want {
+		comboUsage(stderr)
+		return 2
+	}
+	path := *combosFile
+	if path == "" {
+		path = defaultCombosPath(*authFile)
+	}
+
+	entries, err := multi.LoadCombosFile(path)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	switch action {
+	case "add":
+		name, err := normalizeComboName(positional[0])
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		members := parseComboModels(*models)
+		if len(members) == 0 {
+			fmt.Fprintln(stderr, "at least one model is required: -models provider/model,provider/model")
+			return 2
+		}
+		for _, member := range members {
+			if strings.HasPrefix(member, multi.ComboPrefix) {
+				fmt.Fprintf(stderr, "combo members must name real models, not other combos: %s\n", member)
+				return 2
+			}
+		}
+		entries[name] = members
+		if err := multi.SaveCombosFile(path, entries); err != nil {
+			fmt.Fprintf(stderr, "cannot save combos: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "combo %q: %s\n", name, strings.Join(members, " -> "))
+		fmt.Fprintf(stdout, "model ID: %s%s\n", multi.ComboPrefix, name)
+		fmt.Fprintln(stdout, "a running server picks up combos.jsonc changes without a restart")
+		return 0
+	case "list":
+		names := make([]string, 0, len(entries))
+		for name := range entries {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if len(names) == 0 {
+			fmt.Fprintln(stdout, "no combos")
+			return 0
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAME\tMODELS")
+		for _, name := range names {
+			fmt.Fprintf(tw, "%s\t%s\n", name, strings.Join(entries[name], " -> "))
+		}
+		tw.Flush()
+		return 0
+	default: // remove
+		name, err := normalizeComboName(positional[0])
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		if _, ok := entries[name]; !ok {
+			fmt.Fprintf(stderr, "no combo %q\n", name)
+			return 1
+		}
+		delete(entries, name)
+		if err := multi.SaveCombosFile(path, entries); err != nil {
+			fmt.Fprintf(stderr, "cannot save combos: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "removed combo %q\n", name)
+		return 0
+	}
 }

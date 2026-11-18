@@ -29,20 +29,31 @@ accounts, tracks token usage and cost, and ships with a live terminal dashboard.
   OpenAI Responses, including SSE streaming, tool calls, and reasoning deltas.
 - **Ten provider adapters** — browser OAuth, device-code, bearer-token, and
   API-key logins behind one interface.
+- **Custom OpenAI-compatible providers** — register any `/v1` endpoint and key
+  from the terminal with `seavxrouter provider add`; the key is validated
+  against `/models` before it is stored, and models appear as
+  `<name>/<model>`.
 - **Multi-account rotation** — several accounts per provider, round-robin
   balancing, and quota-aware account rotation. A request stays on the provider
   its model names; failures never hop to another provider.
+- **Model combos** — name an ordered fallback list across providers with
+  `seavxrouter combo add fast -models groq/llama-3.3-70b,codex/gpt-5` and
+  request `combo/fast`. Each member is tried in order; a quota, auth, or
+  transient failure before any output moves to the next provider.
 - **Usage and cost** — optional SQLite ledger with token counts, estimated USD
   cost from the models.dev catalog, and optional price overrides.
 - **Live TUI dashboard** — grouped usage, recent requests, request detail, and
   an SSE feed of finished calls.
-- **Request logs** — the newest 1,000 requests with response bodies and token
-  counts, never request bodies.
+- **Request logs** — the newest 1,000 requests with response bodies, token
+  counts, and the serving account; never request bodies.
 - **Multi-tenant API keys** — SQLite-backed customer keys with revocation,
   usage attribution per customer, and monthly USD budgets or token caps.
   Manage through `/v1/keys` or `seavxrouter key`.
 - **Operational controls** — tool-output compression, a hot-reloaded model
   blocklist, and optional bearer auth on `/v1/*`.
+- **Background service** — `seavxrouter service install` turns the current
+  binary and flags into a systemd user unit, enabled at login and restarted on
+  failure; `service status`, `logs`, and `uninstall` manage it.
 
 ## Install
 
@@ -59,7 +70,14 @@ curl -fsSL https://raw.githubusercontent.com/seaavey/SeavxRouter/main/install.sh
 
 Prebuilt static binaries cover Linux/Termux, macOS, Windows, and FreeBSD; see
 [Releases](https://github.com/seaavey/SeavxRouter/releases/latest). Go 1.27 or
-newer is required to build from source.
+newer is required to build from source:
+
+```bash
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o seavxrouter .
+```
+
+`-trimpath` and `-ldflags="-s -w"` drop local paths and debug symbols; they cut
+the binary roughly in half and match the release build.
 
 ## Quick start
 

@@ -29,13 +29,11 @@ type Engine struct {
 	Stdin io.Reader
 	Out   io.Writer
 
-	mu         sync.Mutex
-	auths      []*auth.Auth
-	cache      auth.AccountCache
-	next       int
-	models     []backend.Model
-	modelsAt   time.Time
-	refreshing bool
+	mu      sync.Mutex
+	auths   []*auth.Auth
+	cache   auth.AccountCache
+	next    int
+	catalog *backend.Catalog[[]backend.Model]
 
 	quotaMu  sync.Mutex
 	quotaErr map[*auth.Auth]time.Time
@@ -61,7 +59,9 @@ func NewEngine(store auth.AuthStore, auths []*auth.Auth) (*Engine, error) {
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no verboo accounts")
 	}
-	return &Engine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "verboo")}, nil
+	e := &Engine{Store: store, HTTP: backend.NewHTTPClient(), auths: auths, cache: auth.NewAccountCache(store, "verboo")}
+	e.catalog = backend.NewCatalog("verboo", modelsTTL, e.fetchModels)
+	return e, nil
 }
 
 func (e *Engine) Default() string { return e.DefaultModel }
@@ -121,43 +121,7 @@ const modelsTTL = 5 * time.Minute
 // later calls serve the cached list immediately while a stale cache is
 // refreshed in the background.
 func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
-	e.mu.Lock()
-	if models := e.models; models != nil {
-		if time.Since(e.modelsAt) >= modelsTTL && !e.refreshing {
-			e.refreshing = true
-			go e.refreshModels(context.WithoutCancel(ctx))
-		}
-		e.mu.Unlock()
-		return models, nil
-	}
-	e.mu.Unlock()
-
-	models, err := e.fetchModels(ctx)
-	if err != nil {
-		return nil, err
-	}
-	e.mu.Lock()
-	e.models = models
-	e.modelsAt = time.Now()
-	e.mu.Unlock()
-	return models, nil
-}
-
-// refreshModels replaces the catalog off the request path. A failed refresh
-// keeps the previous list and retries on the next stale request.
-func (e *Engine) refreshModels(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	models, err := e.fetchModels(ctx)
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.refreshing = false
-	if err != nil {
-		slog.Warn("verboo model refresh failed", "err", err)
-		return
-	}
-	e.models = models
-	e.modelsAt = time.Now()
+	return e.catalog.Get(ctx)
 }
 
 func (e *Engine) fetchModels(ctx context.Context) ([]backend.Model, error) {
@@ -303,6 +267,7 @@ func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta fun
 		result, started, err := e.chatStreamOnce(ctx, a, data, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
+			result.Account = a.Label()
 			return result, nil
 		}
 		lastErr = err
@@ -405,6 +370,13 @@ type verbooUsage struct {
 	} `json:"completion_tokens_details"`
 }
 
+// toolCallAcc accumulates streamed tool-call fragments without quadratic
+// string concatenation.
+type toolCallAcc struct {
+	*backend.ToolCall
+	args strings.Builder
+}
+
 type verbooChunk struct {
 	Error *struct {
 		Message string `json:"message"`
@@ -481,16 +453,17 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, 
 		usage   backend.Usage
 		finish  string
 		started bool
-		all     []*backend.ToolCall
-		cur     = map[int]*backend.ToolCall{}
+		all     []*toolCallAcc
+		cur     = map[int]*toolCallAcc{}
 	)
-	reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+	reader := backend.AcquireSSEReader(resp.Body)
+	defer backend.ReleaseSSEReader(reader)
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if payload, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 			payload = bytes.TrimSpace(payload)
-			if string(payload) != "[DONE]" {
+			if !bytes.Equal(payload, []byte("[DONE]")) {
 				var chunk verbooChunk
 				if json.Unmarshal(payload, &chunk) == nil {
 					if chunk.Error != nil && chunk.Error.Message != "" {
@@ -517,7 +490,7 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, 
 							// Some upstreams reuse index 0 for parallel calls; a
 							// fresh non-empty ID starts a new accumulator.
 							if acc == nil || (tc.ID != "" && acc.ID != "" && tc.ID != acc.ID) {
-								acc = &backend.ToolCall{Type: "function"}
+								acc = &toolCallAcc{ToolCall: &backend.ToolCall{Type: "function"}}
 								cur[tc.Index] = acc
 								all = append(all, acc)
 							}
@@ -530,7 +503,7 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, 
 							if tc.Function.Name != "" {
 								acc.Name = tc.Function.Name
 							}
-							acc.Arguments += tc.Function.Arguments
+							acc.args.WriteString(tc.Function.Arguments)
 						}
 						if c.FinishReason != "" {
 							finish = c.FinishReason
@@ -558,7 +531,8 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, 
 	}
 	toolCalls := make([]backend.ToolCall, 0, len(all))
 	for _, acc := range all {
-		tc := *acc
+		tc := *acc.ToolCall
+		tc.Arguments = acc.args.String()
 		if tc.ID == "" {
 			tc.ID = backend.NewID("call_")
 		}

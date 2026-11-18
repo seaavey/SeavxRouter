@@ -88,6 +88,14 @@ type ChatResult struct {
 	ToolCalls    []ToolCall
 	Usage        Usage
 	FinishReason string
+	// Model and Provider name the concrete backend that answered. Routers set
+	// them when the requested ID was an alias such as combo/<name>, so usage
+	// and logs attribute the model that actually served the request.
+	Model    string
+	Provider string
+	// Account names the provider account that answered, for request logs.
+	// Empty when the backend has no per-account identity.
+	Account string
 }
 
 // ChatMessagesToPrompt flattens structured messages into a single text prompt

@@ -80,7 +80,7 @@ func (e *Engine) CompressRequest(req *backend.ChatRequest) Stats {
 		return Stats{}
 	}
 	e.requests.Add(1)
-	commands := collectCommands(req.Messages)
+	var commands map[string]string
 	var st Stats
 	for i := range req.Messages {
 		m := &req.Messages[i]
@@ -91,6 +91,9 @@ func (e *Engine) CompressRequest(req *backend.ChatRequest) Stats {
 		e.toolResults.Add(1)
 		if len(m.Content) < e.opts.MinBytes || len(m.Images) > 0 {
 			continue
+		}
+		if commands == nil {
+			commands = collectCommands(req.Messages)
 		}
 		normalized := normalize(m.Content)
 		kind := classify(commands[m.ToolCallID], normalized)

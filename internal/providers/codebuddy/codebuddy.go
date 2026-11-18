@@ -1,7 +1,6 @@
 package codebuddy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -68,12 +67,11 @@ type CodeBuddyEngine struct {
 	BaseURL      string
 	PollInterval time.Duration
 
-	mu       sync.Mutex
-	auths    []*auth.Auth
-	cache    auth.AccountCache
-	next     int
-	models   []backend.Model
-	modelsAt time.Time
+	mu      sync.Mutex
+	auths   []*auth.Auth
+	cache   auth.AccountCache
+	next    int
+	catalog *backend.Catalog[[]backend.Model]
 
 	quotaMu  sync.Mutex
 	quotaErr map[*auth.Auth]time.Time
@@ -90,7 +88,9 @@ func NewCodeBuddyEngine(store auth.AuthStore, auths []*auth.Auth) (*CodeBuddyEng
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no codebuddy accounts")
 	}
-	return &CodeBuddyEngine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "codebuddy")}, nil
+	e := &CodeBuddyEngine{Store: store, HTTP: backend.NewHTTPClient(), auths: auths, cache: auth.NewAccountCache(store, "codebuddy")}
+	e.catalog = backend.NewCatalog("codebuddy", 5*time.Minute, e.fetchModels)
+	return e, nil
 }
 
 func (e *CodeBuddyEngine) Default() string {
@@ -158,25 +158,13 @@ func codebuddyFallbackModels() []backend.Model {
 // Models discovers the account's catalog from GET /v3/config, falling back to
 // the built-in list when upstream is unreachable.
 func (e *CodeBuddyEngine) Models(ctx context.Context) ([]backend.Model, error) {
-	e.mu.Lock()
-	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
-		models := e.models
-		e.mu.Unlock()
-		return models, nil
-	}
-	e.mu.Unlock()
-
-	models, err := e.fetchModels(ctx)
+	models, err := e.catalog.Get(ctx)
 	if err != nil || len(models) == 0 {
 		if err != nil {
 			slog.Warn("codebuddy model discovery failed; using built-in catalog", "err", err)
 		}
 		return codebuddyFallbackModels(), nil
 	}
-	e.mu.Lock()
-	e.models = models
-	e.modelsAt = time.Now()
-	e.mu.Unlock()
 	return models, nil
 }
 
@@ -385,6 +373,7 @@ func (e *CodeBuddyEngine) Chat(ctx context.Context, req *backend.ChatRequest, on
 		result, started, err := e.chatStreamOnce(ctx, a, data, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
+			result.Account = a.Label()
 			return result, nil
 		}
 		lastErr = err
@@ -481,6 +470,13 @@ func codebuddyTools(tools []backend.ToolDefinition) []map[string]any {
 	return out
 }
 
+// toolCallAcc accumulates streamed tool-call fragments without quadratic
+// string concatenation.
+type toolCallAcc struct {
+	*backend.ToolCall
+	args strings.Builder
+}
+
 type codebuddyChunk struct {
 	Error *struct {
 		Message string `json:"message"`
@@ -547,16 +543,17 @@ func (e *CodeBuddyEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data
 		usage   backend.Usage
 		finish  string
 		started bool
-		all     []*backend.ToolCall
-		cur     = map[int]*backend.ToolCall{}
+		all     []*toolCallAcc
+		cur     = map[int]*toolCallAcc{}
 	)
-	reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+	reader := backend.AcquireSSEReader(resp.Body)
+	defer backend.ReleaseSSEReader(reader)
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if payload, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 			payload = bytes.TrimSpace(payload)
-			if string(payload) != "[DONE]" {
+			if !bytes.Equal(payload, []byte("[DONE]")) {
 				var chunk codebuddyChunk
 				if json.Unmarshal(payload, &chunk) == nil {
 					if chunk.Error != nil && chunk.Error.Message != "" {
@@ -575,7 +572,7 @@ func (e *CodeBuddyEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data
 							// CodeBuddy reuses index 0 for parallel calls; a fresh
 							// non-empty ID starts a new accumulator.
 							if acc == nil || (tc.ID != "" && acc.ID != "" && tc.ID != acc.ID) {
-								acc = &backend.ToolCall{Type: "function"}
+								acc = &toolCallAcc{ToolCall: &backend.ToolCall{Type: "function"}}
 								cur[tc.Index] = acc
 								all = append(all, acc)
 							}
@@ -588,7 +585,7 @@ func (e *CodeBuddyEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data
 							if tc.Function.Name != "" {
 								acc.Name = tc.Function.Name
 							}
-							acc.Arguments += tc.Function.Arguments
+							acc.args.WriteString(tc.Function.Arguments)
 						}
 						if c.FinishReason != "" {
 							finish = c.FinishReason
@@ -616,7 +613,8 @@ func (e *CodeBuddyEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data
 	}
 	toolCalls := make([]backend.ToolCall, 0, len(all))
 	for _, acc := range all {
-		tc := *acc
+		tc := *acc.ToolCall
+		tc.Arguments = acc.args.String()
 		if tc.ID == "" {
 			tc.ID = backend.NewID("call_")
 		}

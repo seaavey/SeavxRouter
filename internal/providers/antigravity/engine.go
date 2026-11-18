@@ -1,7 +1,6 @@
 package antigravity
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -47,12 +46,11 @@ type Engine struct {
 	HTTP         *http.Client
 	DefaultModel string
 
-	mu       sync.Mutex
-	auths    []*auth.Auth
-	cache    auth.AccountCache
-	next     int
-	models   []backend.Model
-	modelsAt time.Time
+	mu      sync.Mutex
+	auths   []*auth.Auth
+	cache   auth.AccountCache
+	next    int
+	catalog *backend.Catalog[[]backend.Model]
 
 	sigMu sync.Mutex
 	sigs  map[string]string
@@ -91,7 +89,9 @@ func NewEngine(store auth.AuthStore, baseURL string, auths []*auth.Auth) (*Engin
 	if baseURL == "" {
 		baseURL = DefaultAPIBase
 	}
-	return &Engine{Store: store, BaseURL: baseURL, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "antigravity")}, nil
+	e := &Engine{Store: store, BaseURL: baseURL, HTTP: backend.NewHTTPClient(), auths: auths, cache: auth.NewAccountCache(store, "antigravity")}
+	e.catalog = backend.NewCatalog("antigravity", 5*time.Minute, e.fetchModels)
+	return e, nil
 }
 
 func (e *Engine) count() int {
@@ -408,23 +408,7 @@ func (e *Engine) postWith(ctx context.Context, a *auth.Auth, method string, data
 }
 
 func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
-	e.mu.Lock()
-	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
-		models := e.models
-		e.mu.Unlock()
-		return models, nil
-	}
-	e.mu.Unlock()
-
-	models, err := e.fetchModels(ctx)
-	if err != nil {
-		return nil, err
-	}
-	e.mu.Lock()
-	e.models = models
-	e.modelsAt = time.Now()
-	e.mu.Unlock()
-	return models, nil
+	return e.catalog.Get(ctx)
 }
 
 // Check verifies each account against upstream, bypassing the Models cache.
@@ -589,6 +573,7 @@ func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta fun
 		result, started, err := e.chatStreamOnce(ctx, a, data, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
+			result.Account = a.Label()
 			return result, nil
 		}
 		lastErr = err
@@ -813,7 +798,8 @@ func (e *Engine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []byte, 
 
 		full.Reset()
 		toolCalls = nil
-		reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+		reader := backend.AcquireSSEReader(resp.Body)
+		defer backend.ReleaseSSEReader(reader)
 		for {
 			line, readErr := reader.ReadBytes('\n')
 			if payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:")); ok {
@@ -1001,7 +987,8 @@ func (e *Engine) streamOnce(ctx context.Context, a *auth.Auth, data []byte, onDe
 		}
 
 		full.Reset()
-		reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+		reader := backend.AcquireSSEReader(resp.Body)
+		defer backend.ReleaseSSEReader(reader)
 		for {
 			line, readErr := reader.ReadBytes('\n')
 			if payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:")); ok {

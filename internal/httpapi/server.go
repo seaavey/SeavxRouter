@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"seavxrouter/internal/backend"
@@ -24,7 +25,7 @@ type Server struct {
 	usage      *UsageStore
 	logs       *logBroker
 	compressor *compress.Engine
-	pricing    *Pricing
+	pricing    atomic.Pointer[Pricing]
 	wire       *completions.Server
 	hidden     *HiddenModels
 }
@@ -44,7 +45,7 @@ func WithoutCompression() ServerOption {
 
 // WithPricing overrides the model price table used for cost tracking.
 func WithPricing(p *Pricing) ServerOption {
-	return func(s *Server) { s.pricing = p }
+	return func(s *Server) { s.pricing.Store(p) }
 }
 
 // WithHiddenModelsFile replaces the blocklist file that is otherwise loaded
@@ -59,7 +60,8 @@ func WithKeys(ks *KeyStore) ServerOption {
 }
 
 func NewServer(b backend.BackendAPI, apiKey string, usage *UsageStore, opts ...ServerOption) *Server {
-	s := &Server{backend: b, apiKey: apiKey, usage: usage, logs: newLogBroker(), compressor: compress.NewDefault(), pricing: DefaultPricing()}
+	s := &Server{backend: b, apiKey: apiKey, usage: usage, logs: newLogBroker(), compressor: compress.NewDefault()}
+	s.pricing.Store(DefaultPricing())
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -100,6 +102,12 @@ func (s *Server) ownerOf(ctx context.Context, id string) string {
 	return "antigravity"
 }
 
+// SetPricing swaps the price table used for usage recorded from now on. It is
+// safe to call while the server is serving requests.
+func (s *Server) SetPricing(p *Pricing) {
+	s.pricing.Store(p)
+}
+
 // RecordUsage persists one completed request's token usage. It satisfies
 // completions.UsageRecorder, which reports already-translated fields rather than
 // a *backend.ChatResult.
@@ -121,7 +129,7 @@ func (s *Server) RecordUsage(endpoint, model, provider, user string, u backend.U
 		ThinkingTokens:   u.ThinkingTokens,
 		CachedTokens:     u.CacheReadTokens,
 		TotalTokens:      total,
-		CostUSD:          s.pricing.Cost(model, u),
+		CostUSD:          s.pricing.Load().Cost(model, u),
 	}
 	if err := s.usage.Record(e); err != nil {
 		slog.Warn("usage record failed", "endpoint", endpoint, "model", model, "err", err)

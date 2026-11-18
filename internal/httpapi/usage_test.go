@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -386,5 +387,100 @@ func TestCompressionRecordedViaHandleChat(t *testing.T) {
 	}
 	if after.Events != 1 {
 		t.Fatalf("unexpected compression event for plain request: %+v", after)
+	}
+}
+
+func TestUsageStoreSynchronousNormal(t *testing.T) {
+	store := newTestUsageStore(t)
+	var mode int
+	if err := store.db.QueryRow("PRAGMA synchronous").Scan(&mode); err != nil {
+		t.Fatalf("PRAGMA synchronous: %v", err)
+	}
+	if mode != 1 {
+		t.Fatalf("synchronous = %d, want 1 (NORMAL)", mode)
+	}
+}
+
+func TestFlushDrainsQueue(t *testing.T) {
+	store := newTestUsageStore(t)
+	for i := 0; i < 50; i++ {
+		if err := store.Record(UsageEntry{TS: "2026-11-13T10:00:00Z", Provider: "p", Model: "m", User: "u", TotalTokens: 1}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	var n int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM usage").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 50 {
+		t.Fatalf("rows after Flush = %d, want 50", n)
+	}
+}
+
+func TestCloseDrainsPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := OpenUsageStore(path)
+	if err != nil {
+		t.Fatalf("OpenUsageStore: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := store.Record(UsageEntry{TS: "2026-11-13T10:00:00Z", Provider: "p", Model: "m", TotalTokens: 1}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := store.Record(UsageEntry{}); err != errUsageStoreClosed {
+		t.Fatalf("Record after Close = %v, want errUsageStoreClosed", err)
+	}
+
+	reopened, err := OpenUsageStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	var n int
+	if err := reopened.db.QueryRow("SELECT COUNT(*) FROM usage").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 10 {
+		t.Fatalf("rows after reopen = %d, want 10; Close must drain queued writes", n)
+	}
+}
+
+func TestConcurrentRecordAndQuery(t *testing.T) {
+	store := newTestUsageStore(t)
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				if err := store.Record(UsageEntry{Provider: "p", Model: "m", TotalTokens: 1}); err != nil {
+					t.Errorf("Record: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 20; i++ {
+		if _, _, err := store.Query(UsageFilter{}); err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+	}
+	wg.Wait()
+	totals, _, err := store.Query(UsageFilter{})
+	if err != nil {
+		t.Fatalf("final Query: %v", err)
+	}
+	if totals.Requests != 400 {
+		t.Fatalf("requests = %d, want 400", totals.Requests)
 	}
 }

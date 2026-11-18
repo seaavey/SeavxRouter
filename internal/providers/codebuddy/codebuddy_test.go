@@ -280,6 +280,7 @@ func TestCodeBuddyModelDiscovery(t *testing.T) {
 	defer srv.Close()
 
 	e := &CodeBuddyEngine{HTTP: &http.Client{}, BaseURL: srv.URL, auths: []*auth.Auth{{Provider: "codebuddy", AccessToken: "tok"}}}
+	e.catalog = backend.NewCatalog("codebuddy", time.Hour, e.fetchModels)
 	models, err := e.Models(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -309,6 +310,7 @@ func TestCodeBuddyModelDiscoveryFallback(t *testing.T) {
 	defer srv.Close()
 
 	e := &CodeBuddyEngine{HTTP: &http.Client{}, BaseURL: srv.URL, auths: []*auth.Auth{{Provider: "codebuddy", AccessToken: "tok"}}}
+	e.catalog = backend.NewCatalog("codebuddy", time.Hour, e.fetchModels)
 	models, err := e.Models(context.Background())
 	if err != nil {
 		t.Fatal(err)

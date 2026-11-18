@@ -28,6 +28,7 @@ type sseLog struct {
 	Endpoint      string `json:"endpoint"`
 	Provider      string `json:"provider"`
 	Model         string `json:"model"`
+	Account       string `json:"account"`
 	User          string `json:"user"`
 	Status        int    `json:"status"`
 	DurationMS    int64  `json:"duration_ms"`
@@ -51,6 +52,7 @@ func (e sseLog) summary() httpapi.LogSummary {
 			Endpoint:   e.Endpoint,
 			Provider:   e.Provider,
 			Model:      e.Model,
+			Account:    e.Account,
 			User:       e.User,
 			Status:     e.Status,
 			DurationMS: e.DurationMS,

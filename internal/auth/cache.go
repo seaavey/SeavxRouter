@@ -71,5 +71,6 @@ func sameCredentials(a, b *Auth) bool {
 		a.RefreshToken == b.RefreshToken &&
 		a.AccountID == b.AccountID &&
 		a.ProjectID == b.ProjectID &&
+		a.BaseURL == b.BaseURL &&
 		a.Expiry.Equal(b.Expiry)
 }

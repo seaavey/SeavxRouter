@@ -71,6 +71,7 @@ type Engine struct {
 	cfg          Config
 	client       *http.Client
 	defaultModel string
+	catalog      *backend.Catalog[[]backend.Model]
 
 	mu      sync.Mutex
 	closed  bool
@@ -108,9 +109,11 @@ func NewEngine(cfg Config) (*Engine, error) {
 	}
 	client := cfg.HTTP
 	if client == nil {
-		client = &http.Client{}
+		client = backend.NewHTTPClient()
 	}
-	return &Engine{cfg: cfg, client: client, defaultModel: defaultModelID}, nil
+	e := &Engine{cfg: cfg, client: client, defaultModel: defaultModelID}
+	e.catalog = backend.NewCatalog("opencode", 5*time.Minute, e.fetchModels)
+	return e, nil
 }
 
 // Login verifies the local server and stores a marker account. The marker
@@ -145,6 +148,10 @@ func (e *Engine) Default() string { return e.defaultModel }
 
 // Models lists chat models that OpenCode marks free and enabled.
 func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
+	return e.catalog.Get(ctx)
+}
+
+func (e *Engine) fetchModels(ctx context.Context) ([]backend.Model, error) {
 	var resp struct {
 		Data []modelInfo `json:"data"`
 	}
@@ -277,6 +284,7 @@ func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta fun
 		Content:      generated.Data.Text,
 		Usage:        usage,
 		FinishReason: "stop",
+		Account:      "local server",
 	}, nil
 }
 

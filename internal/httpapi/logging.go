@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -21,8 +20,8 @@ import (
 const (
 	// logRetention bounds the request log table to the newest entries.
 	logRetention = 1000
-	// maxLogBody caps captured response bodies and the request body read limit.
-	// Request bodies are never persisted: they dwarf everything else in the DB.
+	// maxLogBody caps captured response bodies. Request bodies are never read
+	// or persisted: they dwarf everything else in the DB.
 	maxLogBody = 10 << 20
 )
 
@@ -33,6 +32,7 @@ type RequestLog struct {
 	Endpoint   string
 	Provider   string
 	Model      string
+	Account    string
 	User       string
 	Status     int
 	DurationMS int64
@@ -48,6 +48,7 @@ const requestLogSchema = `CREATE TABLE IF NOT EXISTS request_logs (
 	endpoint TEXT NOT NULL DEFAULT '',
 	provider TEXT NOT NULL DEFAULT '',
 	model TEXT NOT NULL DEFAULT '',
+	account TEXT NOT NULL DEFAULT '',
 	user TEXT NOT NULL DEFAULT '',
 	status INTEGER NOT NULL DEFAULT 0,
 	duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -61,36 +62,37 @@ const requestLogSchema = `CREATE TABLE IF NOT EXISTS request_logs (
 	total_tokens INTEGER NOT NULL DEFAULT 0
 )`
 
-// RecordLog inserts one request log and prunes entries past the retention cap.
+// RecordLog queues one request log. Retention pruning runs in batches with the
+// other queued writes instead of on every request.
 func (s *UsageStore) RecordLog(e RequestLog) error {
 	if e.TS == "" {
 		e.TS = time.Now().UTC().Format(usageTimestampLayout)
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO request_logs (id, ts, endpoint, provider, model, user, status, duration_ms, stream,
-			request, response, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, e.TS, e.Endpoint, e.Provider, e.Model, e.User, e.Status, e.DurationMS, e.Stream,
+	return s.enqueue(ledgerOp{log: &e})
+}
+
+const insertRequestLogSQL = `INSERT INTO request_logs (id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
+	request, response, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens)
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+func insertRequestLog(db execer, e *RequestLog) error {
+	_, err := db.Exec(insertRequestLogSQL,
+		e.ID, e.TS, e.Endpoint, e.Provider, e.Model, e.Account, e.User, e.Status, e.DurationMS, e.Stream,
 		e.Request, e.Response,
 		e.InputTokens, e.OutputTokens, e.ThinkingTokens, e.CacheReadTokens, e.TotalTokens,
-	)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.Exec(
-		`DELETE FROM request_logs WHERE rowid IN
-			(SELECT rowid FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?)`,
-		logRetention,
 	)
 	return err
 }
 
-const requestLogColumns = `id, ts, endpoint, provider, model, user, status, duration_ms, stream,
+const pruneRequestLogsSQL = `DELETE FROM request_logs WHERE rowid IN
+	(SELECT rowid FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?)`
+
+const requestLogColumns = `id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
 	request, response, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens`
 
 func scanRequestLog(row interface{ Scan(...any) error }) (RequestLog, error) {
 	var e RequestLog
-	err := row.Scan(&e.ID, &e.TS, &e.Endpoint, &e.Provider, &e.Model, &e.User,
+	err := row.Scan(&e.ID, &e.TS, &e.Endpoint, &e.Provider, &e.Model, &e.Account, &e.User,
 		&e.Status, &e.DurationMS, &e.Stream, &e.Request, &e.Response,
 		&e.InputTokens, &e.OutputTokens, &e.ThinkingTokens, &e.CacheReadTokens, &e.TotalTokens)
 	return e, err
@@ -98,6 +100,9 @@ func scanRequestLog(row interface{ Scan(...any) error }) (RequestLog, error) {
 
 // QueryLogs returns the newest logs first, including request and response bodies.
 func (s *UsageStore) QueryLogs(limit, offset int) ([]RequestLog, error) {
+	if err := s.Flush(); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.Query(
 		"SELECT "+requestLogColumns+" FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
 		limit, offset,
@@ -126,12 +131,15 @@ type LogSummary struct {
 	ResponseBytes int64
 }
 
-const requestLogSummaryColumns = `id, ts, endpoint, provider, model, user, status, duration_ms, stream,
+const requestLogSummaryColumns = `id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
 	length(CAST(request AS BLOB)), length(CAST(response AS BLOB)),
 	prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens`
 
 // QueryLogSummaries returns the newest logs first without body payloads.
 func (s *UsageStore) QueryLogSummaries(limit, offset int) ([]LogSummary, error) {
+	if err := s.Flush(); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.Query(
 		"SELECT "+requestLogSummaryColumns+" FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
 		limit, offset,
@@ -144,7 +152,7 @@ func (s *UsageStore) QueryLogSummaries(limit, offset int) ([]LogSummary, error) 
 	out := []LogSummary{}
 	for rows.Next() {
 		var e LogSummary
-		err := rows.Scan(&e.ID, &e.TS, &e.Endpoint, &e.Provider, &e.Model, &e.User,
+		err := rows.Scan(&e.ID, &e.TS, &e.Endpoint, &e.Provider, &e.Model, &e.Account, &e.User,
 			&e.Status, &e.DurationMS, &e.Stream, &e.RequestBytes, &e.ResponseBytes,
 			&e.InputTokens, &e.OutputTokens, &e.ThinkingTokens, &e.CacheReadTokens, &e.TotalTokens)
 		if err != nil {
@@ -157,6 +165,9 @@ func (s *UsageStore) QueryLogSummaries(limit, offset int) ([]LogSummary, error) 
 
 // QueryLog returns one log by ID; (nil, nil) when it does not exist.
 func (s *UsageStore) QueryLog(id string) (*RequestLog, error) {
+	if err := s.Flush(); err != nil {
+		return nil, err
+	}
 	e, err := scanRequestLog(s.db.QueryRow("SELECT "+requestLogColumns+" FROM request_logs WHERE id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -210,10 +221,21 @@ func logFailure(r *http.Request, status int, err error) {
 	}
 }
 
+// SetRequestMeta records the model and streaming mode parsed by the handler.
+func (e *logEntry) SetRequestMeta(model string, stream bool) {
+	e.Model = model
+	e.Stream = stream
+}
+
 // SetModel records which model and provider served the request.
 func (e *logEntry) SetModel(model, provider string) {
 	e.Model = model
 	e.Provider = provider
+}
+
+// SetAccount records which provider account served the request.
+func (e *logEntry) SetAccount(account string) {
+	e.Account = account
 }
 
 // SetUsage stores the token accounting reported for the request.
@@ -287,37 +309,22 @@ func (w *logResponseWriter) Flush() {
 }
 
 // logged captures the final status and, for completion endpoints, the
-// structured result recorded by the handler. Request bodies are read for
-// model/stream hints but not persisted.
+// structured result recorded by the handler. Request bodies are never read
+// here; handlers report the model and stream flag via SetRequestMeta.
 func (s *Server) logged(endpoint string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		entry := &logEntry{
 			RequestLog: RequestLog{ID: backend.UUID(), Endpoint: endpoint, User: usageUser(r)},
 			started:    time.Now(),
 		}
-		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxLogBody))
-		r.Body = io.NopCloser(bytes.NewReader(raw))
-		var head struct {
-			Model  string `json:"model"`
-			Stream bool   `json:"stream"`
-		}
-		_ = json.Unmarshal(raw, &head)
-		entry.Model = head.Model
-		entry.Stream = head.Stream
-
 		lw := &logResponseWriter{ResponseWriter: w, capture: true}
-		if err != nil {
-			writeError(w, &apiError{http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error", "body_too_large"})
-			entry.Status = http.StatusRequestEntityTooLarge
-		} else {
-			next(lw, r.WithContext(withUser(context.WithValue(r.Context(), logKey{}, entry), r)))
-			entry.Status = lw.status
-			if entry.statusOverride != 0 {
-				entry.Status = entry.statusOverride
-			}
-			if entry.Response == "" && lw.body.Len() > 0 {
-				entry.Response = lw.body.String()
-			}
+		next(lw, r.WithContext(withUser(context.WithValue(r.Context(), logKey{}, entry), r)))
+		entry.Status = lw.status
+		if entry.statusOverride != 0 {
+			entry.Status = entry.statusOverride
+		}
+		if entry.Response == "" && lw.body.Len() > 0 {
+			entry.Response = lw.body.String()
 		}
 		if entry.Provider == "" && entry.Model != "" {
 			entry.Provider = s.ownerOf(r.Context(), entry.Model)
@@ -389,6 +396,7 @@ func requestLogMeta(e RequestLog) map[string]any {
 		"endpoint":    e.Endpoint,
 		"provider":    e.Provider,
 		"model":       e.Model,
+		"account":     e.Account,
 		"user":        e.User,
 		"status":      e.Status,
 		"duration_ms": e.DurationMS,

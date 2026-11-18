@@ -3,6 +3,8 @@ package auth
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -26,6 +28,25 @@ type Auth struct {
 	ClientID     string    `json:"client_id,omitempty"`
 	ClientSecret string    `json:"client_secret,omitempty"`
 	ProfileARN   string    `json:"profile_arn,omitempty"`
+	// BaseURL marks a custom OpenAI-compatible provider: the endpoint the
+	// bearer key talks to. Empty for built-in providers.
+	BaseURL string `json:"base_url,omitempty"`
+}
+
+// Label identifies the account for request logs: email when the provider
+// reports one, else the upstream account ID, else a short fingerprint of the
+// API key so distinct keys stay distinguishable without exposing the secret.
+func (a *Auth) Label() string {
+	switch {
+	case a.Email != "":
+		return a.Email
+	case a.AccountID != "":
+		return a.AccountID
+	case a.AccessToken != "":
+		sum := sha256.Sum256([]byte(a.AccessToken))
+		return "key:" + hex.EncodeToString(sum[:])[:8]
+	}
+	return ""
 }
 
 // AuthStore reads and writes the JSONC credentials file.
@@ -64,8 +85,9 @@ func (s AuthStore) Load() ([]*Auth, error) {
 			a.Provider = "antigravity"
 		}
 		// Bearer-only providers hold a long-lived API key and never refresh;
-		// the rest rotate tokens through a refresh_token.
-		if a.RefreshToken == "" && !bearerOnlyProviders[a.Provider] {
+		// the rest rotate tokens through a refresh_token. Custom providers
+		// carry their base URL and also authenticate with a bare key.
+		if a.RefreshToken == "" && !bearerOnlyProviders[a.Provider] && a.BaseURL == "" {
 			return nil, fmt.Errorf("%s: an account has no refresh_token; run login again", s.Path)
 		}
 	}
@@ -128,13 +150,50 @@ func (s AuthStore) Save(auths []*Auth) error {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(merged, "", "  ")
+	return s.write(merged)
+}
+
+// write replaces the credentials file with exactly the accounts given.
+func (s AuthStore) write(auths []*Auth) error {
+	data, err := json.MarshalIndent(auths, "", "  ")
 	if err != nil {
 		return err
 	}
 	out := append([]byte("// SeavxRouter credentials. Keep this file private.\n"), data...)
 	out = append(out, '\n')
 	return os.WriteFile(s.Path, out, 0o600)
+}
+
+// RemoveProvider deletes every stored account for provider and reports how
+// many entries were removed. Removing the last account deletes the file so a
+// later Save starts from a clean slate.
+func (s AuthStore) RemoveProvider(provider string) (int, error) {
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	all, err := s.Load()
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	kept := make([]*Auth, 0, len(all))
+	for _, a := range all {
+		if a.Provider != provider {
+			kept = append(kept, a)
+		}
+	}
+	removed := len(all) - len(kept)
+	if removed == 0 {
+		return 0, nil
+	}
+	if len(kept) == 0 {
+		if err := os.Remove(s.Path); err != nil && !os.IsNotExist(err) {
+			return removed, err
+		}
+		return removed, nil
+	}
+	return removed, s.write(kept)
 }
 
 func sameAccount(a, b *Auth) bool {
@@ -149,7 +208,9 @@ func sameAccount(a, b *Auth) bool {
 	if a.Provider == "kiro" && a.AccountID != "" && b.AccountID != "" {
 		return a.AccountID == b.AccountID
 	}
-	if a.Provider == "codebuddy" || a.Provider == "qoder" || a.Provider == "verboo" {
+	// Custom providers and the bearer-token providers below have no refresh
+	// token; their API key identifies the account.
+	if a.BaseURL != "" || b.BaseURL != "" || a.Provider == "codebuddy" || a.Provider == "qoder" || a.Provider == "verboo" {
 		return a.AccessToken != "" && a.AccessToken == b.AccessToken
 	}
 	return a.RefreshToken == b.RefreshToken

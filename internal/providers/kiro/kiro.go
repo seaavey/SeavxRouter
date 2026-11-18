@@ -91,7 +91,7 @@ func NewKiroEngine(store auth.AuthStore, auths []*auth.Auth) (*Engine, error) {
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no kiro accounts")
 	}
-	return &Engine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "kiro")}, nil
+	return &Engine{Store: store, HTTP: backend.NewHTTPClient(), auths: auths, cache: auth.NewAccountCache(store, "kiro")}, nil
 }
 
 func (e *Engine) Default() string {
@@ -264,6 +264,7 @@ func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta fun
 		result, started, err := e.chatOnce(ctx, a, data, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
+			result.Account = a.Label()
 			return result, nil
 		}
 		lastErr = err

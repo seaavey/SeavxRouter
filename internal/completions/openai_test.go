@@ -366,6 +366,44 @@ func TestOwnerOf(t *testing.T) {
 	}
 }
 
+type usageStub struct {
+	model    string
+	provider string
+}
+
+func (u *usageStub) RecordUsage(_, model, provider, _ string, _ backend.Usage, _ int) {
+	u.model, u.provider = model, provider
+}
+
+func TestRecordResultUsesServedModel(t *testing.T) {
+	rec := &usageStub{}
+	stub := &chatStub{result: &backend.ChatResult{
+		Content:      "hi",
+		FinishReason: "stop",
+		Model:        "gpt-5",
+		Provider:     "codex",
+	}}
+	s := &Server{backend: stub, usage: rec}
+	body := `{"model":"combo/fast","messages":[{"role":"user","content":"hi"}]}`
+	w := httptest.NewRecorder()
+	s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("code %d body %s", w.Code, w.Body.String())
+	}
+	if rec.model != "gpt-5" || rec.provider != "codex" {
+		t.Fatalf("usage attribution = %q/%q", rec.provider, rec.model)
+	}
+	var resp struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Model != "combo/fast" {
+		t.Fatalf("response model = %q, want the requested combo ID", resp.Model)
+	}
+}
+
 const testPNGB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 func TestChatImageContent(t *testing.T) {

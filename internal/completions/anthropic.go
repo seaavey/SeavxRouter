@@ -257,8 +257,8 @@ func anthropicMessageObject(id, model string, result *backend.ChatResult) map[st
 
 func (s *Server) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	var req anthropicRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 10<<20)).Decode(&req); err != nil {
-		writeError(w, &apiError{http.StatusBadRequest, "invalid JSON body: " + err.Error(), "invalid_request_error", "invalid_json"})
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, err)
 		return
 	}
 	if len(req.Messages) == 0 {
@@ -269,6 +269,7 @@ func (s *Server) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	s.setRequestMeta(r, model, req.Stream)
 	cr, err := buildAnthropicChatRequest(req, model)
 	if err != nil {
 		writeError(w, err)

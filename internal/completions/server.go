@@ -26,7 +26,9 @@ type PriceTable interface {
 
 // LogEntry is the in-flight request log record the handlers annotate.
 type LogEntry interface {
+	SetRequestMeta(model string, stream bool)
 	SetModel(model, provider string)
+	SetAccount(account string)
 	SetResult(content string, toolCalls []backend.ToolCall, finishReason string)
 	SetUsage(u backend.Usage)
 	SetError(status int, message string)
@@ -153,6 +155,33 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// maxRequestBody bounds one completion request body.
+const maxRequestBody = 10 << 20
+
+// decodeBody decodes the request body, mapping oversized payloads to the same
+// 413 the logging middleware used to produce.
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return &apiError{http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error", "body_too_large"}
+		}
+		return &apiError{http.StatusBadRequest, "invalid JSON body: " + err.Error(), "invalid_request_error", "invalid_json"}
+	}
+	return nil
+}
+
+// setRequestMeta reports the model and streaming mode parsed by the handler so
+// the request log does not need to re-read the body.
+func (s *Server) setRequestMeta(r *http.Request, model string, stream bool) {
+	if s.logFromCtx == nil {
+		return
+	}
+	if entry := s.logFromCtx(r.Context()); entry != nil {
+		entry.SetRequestMeta(model, stream)
+	}
+}
+
 // ownerOf reports which provider serves a model ID, including provider-prefixed
 // IDs. It returns "" when the backend cannot say.
 func (s *Server) ownerOf(ctx context.Context, id string) string {
@@ -213,17 +242,27 @@ func (s *Server) applyCompression(r *http.Request, cr *backend.ChatRequest, endp
 }
 
 // recordResult reports a completed request to the usage recorder and the
-// in-flight log entry.
+// in-flight log entry. A router that served an alias (combo/<name>) fills
+// result.Model/Provider with the concrete model, which is what gets billed and
+// logged; the response still echoes the requested ID.
 func (s *Server) recordResult(r *http.Request, endpoint, model string, result *backend.ChatResult) {
-	provider := s.ownerOf(r.Context(), model)
+	served := model
+	provider := result.Provider
+	if result.Model != "" {
+		served = result.Model
+	}
+	if provider == "" {
+		provider = s.ownerOf(r.Context(), model)
+	}
 	if s.logFromCtx != nil {
 		if entry := s.logFromCtx(r.Context()); entry != nil {
-			entry.SetModel(model, provider)
+			entry.SetModel(served, provider)
+			entry.SetAccount(result.Account)
 			entry.SetUsage(result.Usage)
 			entry.SetResult(result.Content, result.ToolCalls, result.FinishReason)
 		}
 	}
 	if s.usage != nil {
-		s.usage.RecordUsage(endpoint, model, provider, UserFromContext(r.Context()), result.Usage, http.StatusOK)
+		s.usage.RecordUsage(endpoint, served, provider, UserFromContext(r.Context()), result.Usage, http.StatusOK)
 	}
 }

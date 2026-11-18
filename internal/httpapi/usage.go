@@ -6,12 +6,15 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -27,7 +30,14 @@ const usageTimestampLayout = "2006-01-02T15:04:05Z"
 const (
 	usageWalAutocheckpoint = 256
 	usageJournalSizeLimit  = 1 << 20
+
+	ledgerQueueDepth = 128
+	ledgerBatchMax   = 128
+	ledgerFlushEvery = 75 * time.Millisecond
+	ledgerPruneEvery = 10 * time.Second
 )
+
+var errUsageStoreClosed = errors.New("usage store closed")
 
 // UsageEntry is one recorded billable request.
 type UsageEntry struct {
@@ -94,9 +104,34 @@ type UsageFilter struct {
 	GroupBy  string
 }
 
-// UsageStore persists request usage in SQLite.
+// UsageStore persists request usage in SQLite. Writes are queued and committed
+// in batches off the request path; reads flush the queue first so callers keep
+// read-your-writes semantics.
 type UsageStore struct {
 	db *sql.DB
+
+	ops       chan ledgerOp
+	done      chan struct{}
+	lifeMu    sync.RWMutex
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
+	pending   atomic.Int64
+	overflow  atomic.Int64
+}
+
+// ledgerOp is one queued write. ack marks a Flush barrier: the writer commits
+// everything queued before it, then reports the transaction result.
+type ledgerOp struct {
+	usage       *UsageEntry
+	log         *RequestLog
+	compression *CompressionEntry
+	ack         chan error
+}
+
+// execer is satisfied by both *sql.DB and *sql.Tx.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
 }
 
 const usageSchema = `CREATE TABLE IF NOT EXISTS usage (
@@ -139,7 +174,7 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 			return nil, fmt.Errorf("creating usage db dir: %w", err)
 		}
 	}
-	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=wal_autocheckpoint(%d)&_pragma=journal_size_limit(%d)",
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(%d)&_pragma=journal_size_limit(%d)",
 		path, usageWalAutocheckpoint, usageJournalSizeLimit)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -157,6 +192,10 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 	if _, err := db.Exec(requestLogSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating request log table: %w", err)
+	}
+	if err := ensureColumn(db, "request_logs", "account", "ALTER TABLE request_logs ADD COLUMN account TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating request log table: %w", err)
 	}
 	if _, err := db.Exec(compressionSchema); err != nil {
 		db.Close()
@@ -178,21 +217,40 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("creating compression index: %w", err)
 	}
-	return &UsageStore{db: db}, nil
+	store := &UsageStore{
+		db:   db,
+		ops:  make(chan ledgerOp, ledgerQueueDepth),
+		done: make(chan struct{}),
+	}
+	go store.writer()
+	return store, nil
 }
 
-// Close truncates the WAL back into the main database before closing so the
-// -wal file does not linger at its capped size after shutdown.
+// Close stops accepting writes, drains the queue, then truncates the WAL back
+// into the main database so the -wal file does not linger after shutdown.
 func (s *UsageStore) Close() error {
-	var busy, log, checkpointed int
-	_ = s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &log, &checkpointed)
-	return s.db.Close()
+	s.closeOnce.Do(func() {
+		s.lifeMu.Lock()
+		s.closed = true
+		close(s.ops)
+		s.lifeMu.Unlock()
+		<-s.done
+		var busy, log, checkpointed int
+		_ = s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &log, &checkpointed)
+		s.closeErr = s.db.Close()
+	})
+	return s.closeErr
 }
 
 // ensureUsageCostColumn adds cost_usd to databases created before cost
 // tracking existed.
 func ensureUsageCostColumn(db *sql.DB) error {
-	rows, err := db.Query("PRAGMA table_info(usage)")
+	return ensureColumn(db, "usage", "cost_usd", "ALTER TABLE usage ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0")
+}
+
+// ensureColumn adds column to table when the table predates it.
+func ensureColumn(db *sql.DB, table, column, addSQL string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
 		return err
 	}
@@ -209,26 +267,180 @@ func ensureUsageCostColumn(db *sql.DB) error {
 		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
 			return err
 		}
-		if name == "cost_usd" {
+		if name == column {
 			return nil
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	_, err = db.Exec("ALTER TABLE usage ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0")
+	_, err = db.Exec(addSQL)
 	return err
 }
 
-// Record inserts one usage row, stamping TS with the current UTC time when unset.
+// Record queues one usage row, stamping TS with the current UTC time when unset.
 func (s *UsageStore) Record(e UsageEntry) error {
 	if e.TS == "" {
 		e.TS = time.Now().UTC().Format(usageTimestampLayout)
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO usage (ts, provider, model, endpoint, user,
-			prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens, cost_usd)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	return s.enqueue(ledgerOp{usage: &e})
+}
+
+// Flush waits until every write queued before the call is committed. Read paths
+// call it so callers keep read-your-writes semantics.
+func (s *UsageStore) Flush() error {
+	if s.pending.Load() == 0 {
+		return nil
+	}
+	ack := make(chan error, 1)
+	s.lifeMu.RLock()
+	if s.closed {
+		s.lifeMu.RUnlock()
+		return errUsageStoreClosed
+	}
+	s.ops <- ledgerOp{ack: ack}
+	s.lifeMu.RUnlock()
+	return <-ack
+}
+
+// enqueue appends one write to the queue. A full queue falls back to a
+// synchronous write so no row is lost while the database catches up.
+func (s *UsageStore) enqueue(op ledgerOp) error {
+	s.pending.Add(1)
+	s.lifeMu.RLock()
+	if s.closed {
+		s.lifeMu.RUnlock()
+		s.pending.Add(-1)
+		return errUsageStoreClosed
+	}
+	select {
+	case s.ops <- op:
+		s.lifeMu.RUnlock()
+		return nil
+	default:
+		err := s.writeOne(op)
+		s.lifeMu.RUnlock()
+		s.pending.Add(-1)
+		if n := s.overflow.Add(1); n == 1 || n%1000 == 0 {
+			slog.Warn("usage queue full; wrote synchronously", "count", n, "err", err)
+		}
+		return err
+	}
+}
+
+// writer commits queued writes in batches, flushing on size, timer, or a Flush
+// barrier. It exits after the queue is closed and drained.
+func (s *UsageStore) writer() {
+	defer close(s.done)
+	batch := make([]ledgerOp, 0, ledgerBatchMax)
+	var acks []chan error
+	lastPrune := time.Now()
+	timer := time.NewTimer(ledgerFlushEvery)
+	defer timer.Stop()
+
+	commit := func() {
+		if len(batch) == 0 && len(acks) == 0 {
+			return
+		}
+		n := len(batch)
+		err := s.commitBatch(batch, &lastPrune)
+		s.pending.Add(-int64(n))
+		for _, ack := range acks {
+			ack <- err
+		}
+		batch = batch[:0]
+		acks = acks[:0]
+		if err != nil {
+			slog.Error("usage batch write failed", "ops", n, "err", err)
+		}
+	}
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(ledgerFlushEvery)
+	}
+
+	for {
+		select {
+		case op, ok := <-s.ops:
+			if !ok {
+				commit()
+				return
+			}
+			if op.ack != nil {
+				acks = append(acks, op.ack)
+				commit()
+				resetTimer()
+				continue
+			}
+			batch = append(batch, op)
+			if len(batch) >= ledgerBatchMax {
+				commit()
+				resetTimer()
+			}
+		case <-timer.C:
+			commit()
+			timer.Reset(ledgerFlushEvery)
+		}
+	}
+}
+
+// commitBatch writes one batch in a single transaction to amortize the WAL
+// commit cost. Retention pruning is best-effort and rate-limited.
+func (s *UsageStore) commitBatch(batch []ledgerOp, lastPrune *time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	logs := 0
+	for i := range batch {
+		op := &batch[i]
+		switch {
+		case op.usage != nil:
+			err = insertUsage(tx, op.usage)
+		case op.log != nil:
+			err = insertRequestLog(tx, op.log)
+			logs++
+		case op.compression != nil:
+			err = insertCompression(tx, op.compression)
+		}
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if logs > 0 && time.Since(*lastPrune) >= ledgerPruneEvery {
+		if _, err := tx.Exec(pruneRequestLogsSQL, logRetention); err != nil {
+			slog.Warn("request log prune failed", "err", err)
+		}
+		*lastPrune = time.Now()
+	}
+	return tx.Commit()
+}
+
+// writeOne is the synchronous fallback used when the queue is full.
+func (s *UsageStore) writeOne(op ledgerOp) error {
+	switch {
+	case op.usage != nil:
+		return insertUsage(s.db, op.usage)
+	case op.log != nil:
+		return insertRequestLog(s.db, op.log)
+	case op.compression != nil:
+		return insertCompression(s.db, op.compression)
+	}
+	return nil
+}
+
+const insertUsageSQL = `INSERT INTO usage (ts, provider, model, endpoint, user,
+	prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens, cost_usd)
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+func insertUsage(db execer, e *UsageEntry) error {
+	_, err := db.Exec(insertUsageSQL,
 		e.TS, e.Provider, e.Model, e.Endpoint, e.User,
 		e.PromptTokens, e.CompletionTokens, e.ThinkingTokens, e.CachedTokens, e.TotalTokens, e.CostUSD,
 	)
@@ -297,6 +509,9 @@ func scanUsageTotals(row interface{ Scan(...any) error }, t *UsageTotals) error 
 
 // Query returns filtered totals plus one row per group.
 func (s *UsageStore) Query(f UsageFilter) (UsageTotals, []UsageGroup, error) {
+	if err := s.Flush(); err != nil {
+		return UsageTotals{}, nil, err
+	}
 	where, args := usageWhere(f)
 
 	var totals UsageTotals
@@ -357,6 +572,9 @@ func usageUser(r *http.Request) string {
 // SpendSince sums recorded cost and total tokens for one attributed user,
 // which is how tenant limits are enforced.
 func (s *UsageStore) SpendSince(ctx context.Context, user string, since time.Time) (costUSD float64, totalTokens int64, err error) {
+	if err := s.Flush(); err != nil {
+		return 0, 0, err
+	}
 	err = s.db.QueryRowContext(ctx,
 		"SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(total_tokens), 0) FROM usage WHERE user = ? AND ts >= ?",
 		user, since.UTC().Format(usageTimestampLayout),
@@ -367,15 +585,20 @@ func (s *UsageStore) SpendSince(ctx context.Context, user string, since time.Tim
 	return costUSD, totalTokens, nil
 }
 
-// RecordCompression inserts one compression event, stamping TS with the
-// current UTC time when unset.
+// RecordCompression queues one compression event, stamping TS with the current
+// UTC time when unset.
 func (s *UsageStore) RecordCompression(e CompressionEntry) error {
 	if e.TS == "" {
 		e.TS = time.Now().UTC().Format(usageTimestampLayout)
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO compression (ts, endpoint, tool_results, compressed, bytes_before, bytes_after)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+	return s.enqueue(ledgerOp{compression: &e})
+}
+
+const insertCompressionSQL = `INSERT INTO compression (ts, endpoint, tool_results, compressed, bytes_before, bytes_after)
+ VALUES (?, ?, ?, ?, ?, ?)`
+
+func insertCompression(db execer, e *CompressionEntry) error {
+	_, err := db.Exec(insertCompressionSQL,
 		e.TS, e.Endpoint, e.ToolResults, e.Compressed, e.BytesBefore, e.BytesAfter,
 	)
 	return err
@@ -384,6 +607,9 @@ func (s *UsageStore) RecordCompression(e CompressionEntry) error {
 // QueryCompressionTotals returns persisted compression totals since start
 // (nil = all time).
 func (s *UsageStore) QueryCompressionTotals(start *time.Time) (CompressionTotals, error) {
+	if err := s.Flush(); err != nil {
+		return CompressionTotals{}, err
+	}
 	where := ""
 	args := []any{}
 	if start != nil {
@@ -445,7 +671,7 @@ func (s *Server) recordResult(r *http.Request, endpoint, model string, result *b
 		ThinkingTokens:   u.ThinkingTokens,
 		CachedTokens:     u.CacheReadTokens,
 		TotalTokens:      total,
-		CostUSD:          s.pricing.Cost(model, u),
+		CostUSD:          s.pricing.Load().Cost(model, u),
 	}
 	if err := s.usage.Record(e); err != nil {
 		slog.Warn("usage record failed", "endpoint", endpoint, "model", model, "err", err)

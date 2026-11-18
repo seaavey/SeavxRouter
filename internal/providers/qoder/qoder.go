@@ -404,9 +404,7 @@ type QoderEngine struct {
 	next  int
 	acct  map[*auth.Auth]*qoderAccount
 
-	modelsMu  sync.Mutex
-	catalog   *qoderCatalog
-	catalogAt time.Time
+	catalogCache *backend.Catalog[*qoderCatalog]
 
 	quotaMu  sync.Mutex
 	quotaErr map[*auth.Auth]time.Time
@@ -426,7 +424,9 @@ func NewQoderEngine(store auth.AuthStore, auths []*auth.Auth) (*QoderEngine, err
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no qoder accounts")
 	}
-	return &QoderEngine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "qoder")}, nil
+	e := &QoderEngine{Store: store, HTTP: backend.NewHTTPClient(), auths: auths, cache: auth.NewAccountCache(store, "qoder")}
+	e.catalogCache = backend.NewCatalog("qoder", qoderCatalogTTL, e.fetchCatalogOrFallback)
+	return e, nil
 }
 
 func (e *QoderEngine) client() *http.Client {
@@ -511,10 +511,7 @@ func (e *QoderEngine) Default() string {
 	if e.DefaultModel != "" {
 		return e.DefaultModel
 	}
-	e.modelsMu.Lock()
-	cat := e.catalog
-	e.modelsMu.Unlock()
-	if cat != nil {
+	if cat, ok := e.catalogCache.Last(); ok {
 		return cat.defaultName
 	}
 	return qoderFallbackCatalog().defaultName
@@ -1017,23 +1014,18 @@ func (c *qoderCatalog) supported() string {
 }
 
 func (e *QoderEngine) catalogFor(ctx context.Context) *qoderCatalog {
-	e.modelsMu.Lock()
-	if e.catalog != nil && time.Since(e.catalogAt) < qoderCatalogTTL {
-		cat := e.catalog
-		e.modelsMu.Unlock()
-		return cat
-	}
-	e.modelsMu.Unlock()
+	cat, _ := e.catalogCache.Get(ctx)
+	return cat
+}
 
+// fetchCatalogOrFallback keeps the engine usable when the upstream catalog is
+// unreachable: the built-in list is cached exactly like a real one.
+func (e *QoderEngine) fetchCatalogOrFallback(ctx context.Context) (*qoderCatalog, error) {
 	cat, _ := e.fetchCatalog(ctx)
 	if cat == nil {
 		cat = qoderFallbackCatalog()
 	}
-	e.modelsMu.Lock()
-	e.catalog = cat
-	e.catalogAt = time.Now()
-	e.modelsMu.Unlock()
-	return cat
+	return cat, nil
 }
 
 func (e *QoderEngine) fetchCatalog(ctx context.Context) (*qoderCatalog, error) {
@@ -1872,6 +1864,7 @@ func (e *QoderEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelt
 		res, started, err := e.chatOnce(ctx, acct, plan, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
+			res.Account = a.Label()
 			return res, nil
 		}
 		lastErr = err

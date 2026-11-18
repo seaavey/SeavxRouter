@@ -4,7 +4,6 @@
 package upstream
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -41,12 +40,11 @@ type Engine struct {
 	Store        auth.AuthStore
 	HTTP         *http.Client
 
-	mu       sync.Mutex
-	auths    []*auth.Auth
-	cache    auth.AccountCache
-	next     int
-	models   []backend.Model
-	modelsAt time.Time
+	mu      sync.Mutex
+	auths   []*auth.Auth
+	cache   auth.AccountCache
+	next    int
+	catalog *backend.Catalog[[]backend.Model]
 }
 
 var _ backend.BackendAPI = (*Engine)(nil)
@@ -79,14 +77,16 @@ func NewEngine(name, baseURL string, store auth.AuthStore, auths []*auth.Auth) (
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no %s accounts", name)
 	}
-	return &Engine{
+	e := &Engine{
 		Name:    name,
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Store:   store,
-		HTTP:    &http.Client{},
+		HTTP:    backend.NewHTTPClient(),
 		auths:   auths,
 		cache:   auth.NewAccountCache(store, name),
-	}, nil
+	}
+	e.catalog = backend.NewCatalog(name, 5*time.Minute, e.fetchModels)
+	return e, nil
 }
 
 func (e *Engine) count() int {
@@ -125,22 +125,14 @@ type modelList struct {
 // Models discovers the catalog from GET /models. The list is account-specific,
 // so there is no static fallback.
 func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
-	e.mu.Lock()
-	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
-		models := e.models
-		e.mu.Unlock()
-		return models, nil
-	}
-	e.mu.Unlock()
+	return e.catalog.Get(ctx)
+}
 
+func (e *Engine) fetchModels(ctx context.Context) ([]backend.Model, error) {
 	var lastErr error
 	for i, n := 0, e.count(); i < n; i++ {
 		models, err := e.fetchModelsWith(ctx, e.pick())
 		if err == nil {
-			e.mu.Lock()
-			e.models = models
-			e.modelsAt = time.Now()
-			e.mu.Unlock()
 			return models, nil
 		}
 		lastErr = err
@@ -304,6 +296,7 @@ func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta fun
 		a := e.pick()
 		result, started, err := e.chatOnce(ctx, a, data, onDelta)
 		if err == nil {
+			result.Account = a.Label()
 			return result, nil
 		}
 		lastErr = err
@@ -475,16 +468,17 @@ func (e *Engine) chatOnce(ctx context.Context, a *auth.Auth, data []byte, onDelt
 		usage   backend.Usage
 		finish  string
 		started bool
-		all     []*backend.ToolCall
-		cur     = map[int]*backend.ToolCall{}
+		all     []*toolCallAcc
+		cur     = map[int]*toolCallAcc{}
 	)
-	reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+	reader := backend.AcquireSSEReader(resp.Body)
+	defer backend.ReleaseSSEReader(reader)
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if payload, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 			payload = bytes.TrimSpace(payload)
-			if string(payload) != "[DONE]" {
+			if !bytes.Equal(payload, []byte("[DONE]")) {
 				var ch chunk
 				if json.Unmarshal(payload, &ch) == nil {
 					if ch.Error != nil && ch.Error.Message != "" {
@@ -503,7 +497,7 @@ func (e *Engine) chatOnce(ctx context.Context, a *auth.Auth, data []byte, onDelt
 							// Some upstreams reuse index 0 for parallel calls; a
 							// fresh non-empty ID starts a new accumulator.
 							if acc == nil || (tc.ID != "" && acc.ID != "" && tc.ID != acc.ID) {
-								acc = &backend.ToolCall{Type: "function"}
+								acc = &toolCallAcc{ToolCall: &backend.ToolCall{Type: "function"}}
 								cur[tc.Index] = acc
 								all = append(all, acc)
 							}
@@ -516,7 +510,7 @@ func (e *Engine) chatOnce(ctx context.Context, a *auth.Auth, data []byte, onDelt
 							if tc.Function.Name != "" {
 								acc.Name = tc.Function.Name
 							}
-							acc.Arguments += tc.Function.Arguments
+							acc.args.WriteString(tc.Function.Arguments)
 						}
 						if c.FinishReason != "" {
 							finish = c.FinishReason
@@ -535,7 +529,7 @@ func (e *Engine) chatOnce(ctx context.Context, a *auth.Auth, data []byte, onDelt
 	if ctx.Err() != nil {
 		return nil, started, ctx.Err()
 	}
-	return finishResult(&full, all, usage, finish, started, onDelta), started, nil
+	return finishResult(&full, toToolCalls(all), usage, finish, started, onDelta), started, nil
 }
 
 // decodeJSONResponse handles the non-streaming wire form.
@@ -599,6 +593,23 @@ func toUsage(u *wireUsage) backend.Usage {
 		CacheReadTokens: u.PromptTokensDetails.CachedTokens,
 		TotalTokens:     u.TotalTokens,
 	}
+}
+
+// toolCallAcc accumulates streamed tool-call fragments without quadratic
+// string concatenation.
+type toolCallAcc struct {
+	*backend.ToolCall
+	args strings.Builder
+}
+
+func toToolCalls(all []*toolCallAcc) []*backend.ToolCall {
+	out := make([]*backend.ToolCall, 0, len(all))
+	for _, acc := range all {
+		tc := *acc.ToolCall
+		tc.Arguments = acc.args.String()
+		out = append(out, &tc)
+	}
+	return out
 }
 
 func finishResult(text *strings.Builder, all []*backend.ToolCall, usage backend.Usage, finish string, started bool, onDelta func(backend.ChatDelta)) *backend.ChatResult {

@@ -1056,13 +1056,24 @@ func TestQoderFallbackCatalogOnListFailure(t *testing.T) {
 	}
 }
 
+// seedFallbackCatalog replaces the engine's catalog with the built-in list so
+// tests avoid a network fetch.
+func seedFallbackCatalog(t *testing.T, e *QoderEngine) {
+	t.Helper()
+	e.catalogCache = backend.NewCatalog("qoder", time.Hour, func(context.Context) (*qoderCatalog, error) {
+		return qoderFallbackCatalog(), nil
+	})
+	if _, err := e.catalogCache.Get(context.Background()); err != nil {
+		t.Fatalf("seed catalog: %v", err)
+	}
+}
+
 func TestQoderChatUnsupportedModel(t *testing.T) {
 	e, err := NewQoderEngine(auth.AuthStore{}, []*auth.Auth{{Provider: "qoder", AccessToken: "pt-x"}})
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
-	e.catalog = qoderFallbackCatalog()
-	e.catalogAt = time.Now()
+	seedFallbackCatalog(t, e)
 	_, err = e.Chat(context.Background(), &backend.ChatRequest{
 		Model:    "mystery-model",
 		Messages: []backend.ChatMessage{{Role: "user", Content: "hi"}},
@@ -1079,8 +1090,7 @@ func TestQoderQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
-	e.catalog = qoderFallbackCatalog()
-	e.catalogAt = time.Now()
+	seedFallbackCatalog(t, e)
 
 	q := e.Quota()
 	if q.Provider != "qoder" || len(q.Accounts) != 1 {

@@ -62,8 +62,51 @@ func TestOpenCodeRouting(t *testing.T) {
 	if res.Content != "ok" || oc.calls != 1 || oc.lastModel != "big-pickle" {
 		t.Fatalf("result = %+v, calls = %d, model = %q", res, oc.calls, oc.lastModel)
 	}
+	if res.Model != "big-pickle" || res.Provider != "opencode" {
+		t.Fatalf("served attribution = %q/%q", res.Provider, res.Model)
+	}
 	if got := m.Provider(ctx, "opencode/big-pickle"); got != "opencode" {
 		t.Fatalf("provider = %q", got)
+	}
+}
+
+func TestCustomProviderRouting(t *testing.T) {
+	custom := &fakeBackend{models: map[string]bool{"deepseek-ai/deepseek-v3": true}, def: "deepseek-ai/deepseek-v3"}
+	m := &MultiBackend{Custom: map[string]backend.BackendAPI{"runcrate": custom}}
+	ctx := context.Background()
+
+	models, err := m.Models(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "runcrate/deepseek-ai/deepseek-v3" {
+		t.Fatalf("models = %+v", models)
+	}
+	res, err := m.Chat(ctx, &backend.ChatRequest{Model: "runcrate/deepseek-ai/deepseek-v3"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "ok" || custom.calls != 1 || custom.lastModel != "deepseek-ai/deepseek-v3" {
+		t.Fatalf("result = %+v, calls = %d, model = %q", res, custom.calls, custom.lastModel)
+	}
+	if got := m.Provider(ctx, "runcrate/deepseek-ai/deepseek-v3"); got != "runcrate" {
+		t.Fatalf("provider = %q", got)
+	}
+	if got := m.Default(); got != "deepseek-ai/deepseek-v3" {
+		t.Fatalf("default = %q", got)
+	}
+	// Bare IDs fall through to a custom provider when no built-in is set.
+	if _, id, err := m.resolve(ctx, "deepseek-ai/deepseek-v3"); err != nil || id != "deepseek-ai/deepseek-v3" {
+		t.Fatalf("bare resolve = %q, %v", id, err)
+	}
+}
+
+func TestCustomProviderKeepsModelIDsUnchanged(t *testing.T) {
+	custom := &fakeBackend{models: map[string]bool{"gemini-flash": true}}
+	m := &MultiBackend{Custom: map[string]backend.BackendAPI{"runcrate": custom}}
+	ctx := context.Background()
+	if _, id, err := m.resolve(ctx, "runcrate/gemini-flash"); err != nil || id != "gemini-flash" {
+		t.Fatalf("custom model alias was rewritten: id=%q err=%v", id, err)
 	}
 }
 
@@ -74,6 +117,11 @@ type fakeBackend struct {
 	calls     int
 	errs      []error
 	deltas    []backend.ChatDelta
+
+	completeErr   error
+	streamErr     error
+	completeCalls int
+	streamCalls   int
 }
 
 func (f *fakeBackend) Models(context.Context) ([]backend.Model, error) {
@@ -88,11 +136,19 @@ func (f *fakeBackend) HasModel(_ context.Context, id string) bool {
 	return f.models[id]
 }
 func (f *fakeBackend) Complete(_ context.Context, model, _ string) (*backend.Result, error) {
+	f.completeCalls++
 	f.lastModel = model
+	if f.completeErr != nil {
+		return nil, f.completeErr
+	}
 	return &backend.Result{Status: "SUCCESS", Response: "hello"}, nil
 }
 func (f *fakeBackend) Stream(_ context.Context, model, _ string, onDelta func(string)) (*backend.Result, error) {
+	f.streamCalls++
 	f.lastModel = model
+	if f.streamErr != nil {
+		return nil, f.streamErr
+	}
 	if onDelta != nil {
 		onDelta("hello")
 	}

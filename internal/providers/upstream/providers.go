@@ -5,11 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 
 	"seavxrouter/internal/auth"
+	"seavxrouter/internal/backend"
 )
 
 // Provider pins one vendor's endpoint, default model and key format. Every
@@ -167,7 +167,7 @@ func probeKey(ctx context.Context, p Provider, acct *auth.Auth) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	e.HTTP = &http.Client{}
+	e.HTTP = backend.NewHTTPClient()
 	models, err := e.fetchModelsWith(ctx, acct)
 	if err != nil {
 		return nil, err

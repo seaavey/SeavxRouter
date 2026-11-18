@@ -1,7 +1,6 @@
 package codex
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -39,12 +38,11 @@ type CodexEngine struct {
 	DefaultModel string
 	BaseURL      string
 
-	mu       sync.Mutex
-	auths    []*auth.Auth
-	cache    auth.AccountCache
-	next     int
-	models   []backend.Model
-	modelsAt time.Time
+	mu      sync.Mutex
+	auths   []*auth.Auth
+	cache   auth.AccountCache
+	next    int
+	catalog *backend.Catalog[[]backend.Model]
 
 	quotaMu    sync.Mutex
 	quotaErr   map[*auth.Auth]time.Time
@@ -62,7 +60,9 @@ func NewCodexEngine(store auth.AuthStore, auths []*auth.Auth) (*CodexEngine, err
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no codex accounts")
 	}
-	return &CodexEngine{Store: store, HTTP: &http.Client{}, auths: auths, cache: auth.NewAccountCache(store, "codex")}, nil
+	e := &CodexEngine{Store: store, HTTP: backend.NewHTTPClient(), auths: auths, cache: auth.NewAccountCache(store, "codex")}
+	e.catalog = backend.NewCatalog("codex", 5*time.Minute, e.fetchModels)
+	return e, nil
 }
 
 func (e *CodexEngine) Default() string { return e.DefaultModel }
@@ -329,23 +329,7 @@ func (e *CodexEngine) setHeaders(req *http.Request, token string, a *auth.Auth, 
 }
 
 func (e *CodexEngine) Models(ctx context.Context) ([]backend.Model, error) {
-	e.mu.Lock()
-	if e.models != nil && time.Since(e.modelsAt) < 5*time.Minute {
-		models := e.models
-		e.mu.Unlock()
-		return models, nil
-	}
-	e.mu.Unlock()
-
-	models, err := e.fetchModels(ctx)
-	if err != nil {
-		return nil, err
-	}
-	e.mu.Lock()
-	e.models = models
-	e.modelsAt = time.Now()
-	e.mu.Unlock()
-	return models, nil
+	return e.catalog.Get(ctx)
 }
 
 // Check verifies each account against upstream, bypassing the Models cache.
@@ -502,6 +486,7 @@ func (e *CodexEngine) Chat(ctx context.Context, req *backend.ChatRequest, onDelt
 		result, started, err := e.chatStreamOnce(ctx, a, data, sessionID, onDelta)
 		e.trackQuota(a, err)
 		if err == nil {
+			result.Account = a.Label()
 			return result, nil
 		}
 		lastErr = err
@@ -672,7 +657,8 @@ func (e *CodexEngine) chatStreamOnce(ctx context.Context, a *auth.Auth, data []b
 
 		full.Reset()
 		toolCalls = nil
-		reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+		reader := backend.AcquireSSEReader(resp.Body)
+		defer backend.ReleaseSSEReader(reader)
 		for {
 			line, readErr := reader.ReadBytes('\n')
 			if payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:")); ok {
@@ -843,7 +829,8 @@ func (e *CodexEngine) streamOnce(ctx context.Context, a *auth.Auth, data []byte,
 		}
 
 		full.Reset()
-		reader := bufio.NewReaderSize(resp.Body, 1024*1024)
+		reader := backend.AcquireSSEReader(resp.Body)
+		defer backend.ReleaseSSEReader(reader)
 		for {
 			line, readErr := reader.ReadBytes('\n')
 			if payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:")); ok {

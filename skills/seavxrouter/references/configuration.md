@@ -32,6 +32,13 @@ allowed, mode `0600`. Never commit it or paste its contents into an issue.
     "refresh_token": "",
     "expiry": "0001-01-01T00:00:00Z",
     "account_id": "REDACTED"
+  },
+  {
+    "provider": "runcrate",
+    "access_token": "rc_live_REDACTED",
+    "refresh_token": "",
+    "expiry": "0001-01-01T00:00:00Z",
+    "base_url": "https://api.runcrate.ai/v1"
   }
 ]
 ```
@@ -41,6 +48,13 @@ rotation pool. The running server watches this file; adding a provider or
 account through `seavxrouter login` takes effect without a restart. Entries whose
 credentials are unchanged keep their in-memory identity so per-account quota
 state survives the reload.
+
+Entries carrying `base_url` are custom OpenAI-compatible providers managed with
+`seavxrouter provider add|list|remove`. The bearer `access_token` is sent to that
+endpoint, and models use the `<provider>/<model>` prefix. Multiple keys for one
+custom provider rotate, but they must all use the same base URL. Unlike `login`,
+custom provider engines are built at startup: restart a running server after
+adding or removing one.
 
 ## Environment variables
 
@@ -63,16 +77,39 @@ ones also control how the running router reaches its local server:
 | Path | Purpose |
 | --- | --- |
 | `~/.seavx/auth.jsonc` | Provider credentials, mode `0600`. |
+| `~/.seavx/combos.jsonc` | Cross-provider model combos, mode `0600`. |
 | `~/.seavx/usage.db` | SQLite usage ledger and recent request logs. |
 | `~/.seavx/keys.db` | SQLite tenant API keys, monthly budgets, and token caps. |
 | `~/.seavx/hidden-models.txt` | Optional model blocklist. |
 | `~/.seavx/cache/models.json` | Cached models.dev pricing catalog. |
 | `~/.seavx/server.url` | URL of the running server, used by the TUI. |
+| `~/.config/systemd/user/seavxrouter.service` | Optional systemd user unit written by `seavxrouter service install`, mode `0600`. |
 
-Set `-auth-file` to move `auth.jsonc`; `hidden-models.txt` always sits next to
-it. Set `-usage-db` and `-keys-db` to relocate or disable their databases
-(`off` disables). Keys stay usable with usage tracking off, but budgets and
-token caps are not enforced in that case.
+Set `-auth-file` to move `auth.jsonc`; `hidden-models.txt` and `combos.jsonc`
+always sit next to it. Set `-usage-db` and `-keys-db` to relocate or disable
+their databases (`off` disables). Keys stay usable with usage tracking off, but
+budgets and token caps are not enforced in that case.
+
+## Model combos
+
+`combos.jsonc` defines ordered fallback lists requested as `combo/<name>`:
+
+```jsonc
+// ~/.seavx/combos.jsonc — managed by `seavxrouter combo`.
+{
+  "fast": ["groq/openai/gpt-oss-120b", "antigravity/gemini-3.8-flash"],
+  "deep": ["codex/gpt-5", "antigravity/claude-sonnet-4-6"]
+}
+```
+
+Members are full model IDs, tried left to right; bare IDs resolve like any
+other request. A quota, auth, or transient failure before the first streamed
+delta moves to the next member. A non-retryable error (for example a malformed
+request) or a partially streamed answer ends the request, because the client
+already saw output. Members pointing at unconfigured providers are skipped.
+Nested `combo/` members are not allowed. Usage, cost, and request logs attribute
+the member that actually answered; the response echoes `combo/<name>`. The file
+is re-read on mtime change; another path can be set with `-combos`.
 
 ## Hidden models
 
@@ -109,9 +146,11 @@ Prices are USD per one million tokens. Disable tracking with `-usage-db off`.
 ## Request logs and compression
 
 The newest 1,000 requests are retained with response bodies (up to 10 MB each),
-status, latency, provider, model, user, and token usage. Request bodies are read
-for routing hints but never persisted. Read them through `/v1/logging` or the
-TUI; live entries arrive over `/v1/logging/stream`.
+status, latency, provider, model, serving account, user, and token usage. Request
+bodies are read for routing hints but never persisted. The `account` field names
+the credential that answered: the account email when known, else the upstream
+account ID, else a short fingerprint of the API key. Read logs through
+`/v1/logging` or the TUI; live entries arrive over `/v1/logging/stream`.
 
 Large tool results in incoming requests are compressed before forwarding to
 reduce prompt tokens. Tune with `-compress` and `-compress-min-bytes`; inspect
@@ -120,8 +159,9 @@ cumulative savings at `/v1/compression`.
 ## Quotas
 
 Providers that expose quota report it at `/v1/quota`, aggregated per account.
-Quota errors rotate accounts and may fail over to another provider, as described
-in `references/providers.md`.
+Quota errors rotate accounts within the provider; a `combo/<name>` request is
+the explicit way to fail over across providers, as described in
+`references/providers.md`.
 
 ## Multi-tenant API keys (SaaS)
 
