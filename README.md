@@ -109,6 +109,11 @@ Credentials are written to `~/.seavx/auth.jsonc` with mode `0600`. Protect the
 endpoint with `-api-key` whenever it is reachable by anything other than your
 own user account.
 
+## Web dashboard
+
+The [Vite dashboard](frontend/README.md) shows request volume, token usage,
+estimated cost, recent logs, provider accounts, models, and tenant API keys.
+
 ## Multi-tenant (SaaS)
 
 Run with `-api-key` to make it the admin key, then mint revocable customer keys
