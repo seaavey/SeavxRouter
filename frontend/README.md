@@ -21,3 +21,14 @@ Vite proxies `/dashboard/api` and `/healthz` to the router. Set `SEAVX_ROUTER_OR
 Build with `npm run build` and try the result with `npm run preview`. Finish first-time setup over localhost before exposing the dashboard. For deployment, serve `dist/` over HTTPS and forward `/dashboard/api/*` and `/healthz` to Go on the same origin with the original Host header. Inference clients continue using `/v1` with their existing authentication.
 
 Overview and the first Requests page subscribe to `/dashboard/api/logging/stream`. Finished requests refresh the latest logs and usage totals in batches. Older request pages stay stable while you browse. Configure the reverse proxy to stream SSE without response buffering or a short read timeout. Login retries are throttled per connecting IP. Clients behind the same reverse proxy share that proxy’s throttle because the router ignores forwarded client IP headers.
+
+## CI and releases
+
+The **frontend** CI job installs locked dependencies with Node.js 24, type-checks
+the TypeScript code, and builds the Vite app. Download the
+`seavxrouter-dashboard` artifact from a successful run to inspect the static build.
+
+Pushing a release tag such as `v1.2.3` also builds the frontend. The GitHub
+Release includes `seavxrouter-dashboard.tar.gz` and its SHA-256 checksum in
+`checksums.txt`. Extract the archive into your web server's document root and
+use the same-origin proxy configuration described above.
