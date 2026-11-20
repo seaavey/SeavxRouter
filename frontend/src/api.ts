@@ -37,15 +37,14 @@ export interface TenantKey {
   limit_token: number
 }
 
-export async function api<T>(path: string, token: string, options?: RequestInit): Promise<T> {
+export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers)
-  if (token) headers.set('Authorization', `Bearer ${token}`)
   if (options?.body) headers.set('Content-Type', 'application/json')
   const response = await fetch(path, { ...options, headers, cache: 'no-store' })
   if (!response.ok) {
     const body = await response.json().catch(() => null)
-    if (response.status === 401 || body?.error?.code === 'admin_key_required') {
-      throw new Error('Enter the router admin API key in Connection to continue.')
+    if (response.status === 401 && path !== '/dashboard/api/login') {
+      window.dispatchEvent(new Event('dashboard-session-expired'))
     }
     throw new Error(body?.error?.message ?? `Router request failed (${response.status}).`)
   }

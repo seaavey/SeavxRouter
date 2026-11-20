@@ -125,3 +125,14 @@ footer a:hover { color: white; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0s !important; }
 }
+
+.auth-screen { min-height: 100dvh; display: grid; place-items: center; padding: 16px; }
+.auth-panel { width: min(100%, 410px); padding: 28px; }
+.auth-panel .brand { margin-bottom: 24px; }
+.auth-panel h1 { font-size: 29px; }
+.auth-panel > p { font-size: 14px; }
+.auth-panel form { display: grid; gap: 14px; margin-top: 20px; }
+.auth-panel label { display: grid; gap: 6px; font-size: 14px; }
+.auth-panel input { min-width: 0; border: 1px solid #434348; border-radius: 6px; background: #101011; padding: 8px 10px; }
+.auth-panel > button { margin-top: 12px; width: 100%; }
+.auth-panel .auth-error { color: #ecc28c; font-size: 14px; }

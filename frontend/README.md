@@ -1,6 +1,12 @@
 # SeavxRouter web dashboard
 
-Run the Go router on `127.0.0.1:20128`, then start the dashboard with Node.js 24:
+Start the Go router with a dedicated SQLite file for dashboard login:
+
+```sh
+./seavxrouter -listen 127.0.0.1:20128 -dashboard-db "$HOME/.seavx/dashboard.db"
+```
+
+In another terminal, use Node.js 24 to start Vite:
 
 ```sh
 cd frontend
@@ -8,10 +14,10 @@ npm ci
 npm run dev
 ```
 
-Open http://127.0.0.1:5173. If the router uses `-api-key`, open **Connection** and enter its admin key. The dashboard keeps the key in memory for the current page session. For a walkthrough with sample data, open http://127.0.0.1:5173/?demo=1 or choose **View demo**.
+Open http://127.0.0.1:5173 on the router host. Sign in with `seavx12345` on the first run, then set a new password of at least 12 characters before using the dashboard. The router stores the bcrypt hash in SQLite. Dashboard sessions are valid for 12 hours, and signing in again replaces the previous session. For a walkthrough with sample data, open http://127.0.0.1:5173/?demo=1 or choose **View demo**.
 
-Vite proxies `/v1` and `/healthz` to the router. Set `SEAVX_ROUTER_ORIGIN` in `frontend/.env.local` to override the upstream URL. Usage and request logs require the router's SQLite usage ledger. Tenant key management requires the key store and admin authentication.
+Vite proxies `/dashboard/api` and `/healthz` to the router. Set `SEAVX_ROUTER_ORIGIN` in `frontend/.env.local` to override the upstream URL. Usage and request logs require the SQLite usage ledger. Tenant key management requires the key store and the router's `-api-key` flag.
 
-Build with `npm run build` and try the result with `npm run preview`. To deploy, serve `dist/` behind an HTTPS reverse proxy and route `/v1/*` and `/healthz` on the same origin to the Go router. Keep the router admin key server-configured and enter it through the dashboard's connection dialog.
+Build with `npm run build` and try the result with `npm run preview`. Finish first-time setup over localhost before exposing the dashboard. For deployment, serve `dist/` over HTTPS and forward `/dashboard/api/*` and `/healthz` to Go on the same origin with the original Host header. Inference clients continue using `/v1` with their existing authentication.
 
-Overview and the first Requests page subscribe to `/v1/logging/stream`. Finished requests refresh the latest logs and usage totals in batches. Older request pages stay stable while you browse. Configure the production reverse proxy to stream this endpoint without response buffering or a short read timeout.
+Overview and the first Requests page subscribe to `/dashboard/api/logging/stream`. Finished requests refresh the latest logs and usage totals in batches. Older request pages stay stable while you browse. Configure the reverse proxy to stream SSE without response buffering or a short read timeout.

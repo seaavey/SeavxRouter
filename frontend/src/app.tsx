@@ -1,7 +1,6 @@
 import { useEffect, useEffectEvent, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Activity, ArrowDownToLine, Box, ChevronDown, ExternalLink, KeyRound, Layers3, LayoutDashboard, List, Plus, RefreshCw, Search, Terminal, Waypoints } from 'lucide-react'
+import { Activity, ArrowDownToLine, Box, ChevronDown, ExternalLink, KeyRound, Layers3, LayoutDashboard, List, Plus, RefreshCw, Search, LogOut, Waypoints } from 'lucide-react'
 import { animate } from 'motion/mini'
-import { EventSource } from 'eventsource'
 import { api, type Model, type Provider, type RequestLog, type TenantKey, type Usage } from './api'
 import { demoKeys, demoLogs, demoModels, demoProviders, demoUsage } from './demo'
 import { Button } from './components/ui/button'
@@ -16,14 +15,13 @@ const pages = {
 }
 
 type Page = keyof typeof pages
-type ModalName = 'connection' | 'request' | 'create' | 'revoke'
+type ModalName = 'request' | 'create' | 'revoke'
 type Result<T> = { value?: T; error?: string }
 const number = new Intl.NumberFormat('en-US')
 const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 })
 const dollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 })
 const time = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })
 const dayLabel = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
-const preview = new URLSearchParams(location.search).get('demo') === '1'
 
 async function result<T>(request: Promise<T>): Promise<Result<T>> {
   try {
@@ -80,10 +78,10 @@ function UsageChart({ usage, days }: { usage: Usage; days: number }) {
   </div>
 }
 
-export function App() {
+export function Dashboard({ demo, onExit }: { demo: boolean; onExit: () => Promise<void> }) {
   const [page, setPage] = useState<Page>('Overview')
-  const [demo, setDemo] = useState(preview)
-  const [token, setToken] = useState('')
+  const [exitError, setExitError] = useState('')
+  const [exiting, setExiting] = useState(false)
   const [days, setDays] = useState(7)
   const [refresh, setRefresh] = useState(0)
   const [filter, setFilter] = useState('')
@@ -121,23 +119,23 @@ export function App() {
     start.setUTCDate(start.getUTCDate() - (days - 1))
     async function load() {
       setLoading(true)
-      const health = result(api('/healthz', '', options)).then(state => {
+      const health = result(api('/healthz', options)).then(state => {
         if (!controller.signal.aborted) setOnline(!state.error)
       })
       const tasks: Promise<void>[] = [health]
-      if (page === 'Overview') tasks.push(result(api<Usage>(`/v1/usage?group_by=day&start=${encodeURIComponent(start.toISOString())}`, token, options)).then(state => {
+      if (page === 'Overview') tasks.push(result(api<Usage>(`/dashboard/api/usage?group_by=day&start=${encodeURIComponent(start.toISOString())}`, options)).then(state => {
         if (!controller.signal.aborted) setUsage(state)
       }))
-      if (page === 'Overview' || page === 'Requests') tasks.push(result(api<{ data: RequestLog[] }>(`/v1/logging?limit=${page === 'Overview' ? 5 : 26}&offset=${page === 'Overview' ? 0 : offset}`, token, options).then(value => value.data)).then(state => {
+      if (page === 'Overview' || page === 'Requests') tasks.push(result(api<{ data: RequestLog[] }>(`/dashboard/api/logging?limit=${page === 'Overview' ? 5 : 26}&offset=${page === 'Overview' ? 0 : offset}`, options).then(value => value.data)).then(state => {
         if (!controller.signal.aborted) setLogs(state)
       }))
-      if (page === 'Providers') tasks.push(result(api<{ data: Provider[] }>('/v1/quota', token, options).then(value => value.data ?? [])).then(state => {
+      if (page === 'Providers') tasks.push(result(api<{ data: Provider[] }>('/dashboard/api/quota', options).then(value => value.data ?? [])).then(state => {
         if (!controller.signal.aborted) setProviders(state)
       }))
-      if (page === 'Models') tasks.push(result(api<{ data: Model[] }>('/v1/models', token, options).then(value => value.data ?? [])).then(state => {
+      if (page === 'Models') tasks.push(result(api<{ data: Model[] }>('/dashboard/api/models', options).then(value => value.data ?? [])).then(state => {
         if (!controller.signal.aborted) setModels(state)
       }))
-      if (page === 'API Keys') tasks.push(result(api<{ keys: TenantKey[] | null }>('/v1/keys', token, options).then(value => value.keys ?? [])).then(state => {
+      if (page === 'API Keys') tasks.push(result(api<{ keys: TenantKey[] | null }>('/dashboard/api/keys', options).then(value => value.keys ?? [])).then(state => {
         if (!controller.signal.aborted) setKeys(state)
       }))
       await Promise.all(tasks)
@@ -145,7 +143,7 @@ export function App() {
     }
     void load()
     return () => controller.abort()
-  }, [days, demo, offset, page, refresh, token])
+  }, [days, demo, offset, page, refresh])
 
   const refreshFromStream = useEffectEvent(() => {
     if (loading) return false
@@ -158,26 +156,21 @@ export function App() {
 
     setStreamStatus('Connecting')
     let dirty = false
-    const stream = new EventSource('/v1/logging/stream', {
-      fetch: (url, options) => {
-        const headers = new Headers(options.headers)
-        if (token) headers.set('Authorization', `Bearer ${token}`)
-        return fetch(url, { ...options, headers, cache: 'no-store' })
-      },
-    })
+    const controller = new AbortController()
+    const stream = new EventSource('/dashboard/api/logging/stream')
     stream.addEventListener('ready', () => {
       setStreamStatus('Live')
       // The router does not replay events after a disconnect.
       dirty = true
     })
     stream.addEventListener('log', () => { dirty = true })
-    stream.onerror = event => {
-      if (event.code === 401 || event.code === 403 || event.code === 404 || stream.readyState === EventSource.CLOSED) {
-        stream.close()
-        setStreamStatus(event.code === 401 || event.code === 403 ? 'Admin key required' : 'Live updates unavailable')
-      } else {
-        setStreamStatus('Reconnecting')
-      }
+    stream.onerror = () => {
+      setStreamStatus(stream.readyState === EventSource.CLOSED ? 'Live updates unavailable' : 'Reconnecting')
+      void api<{ authenticated: boolean }>('/dashboard/api/session', { signal: controller.signal }).then(session => {
+        if (!session.authenticated && !controller.signal.aborted) {
+          window.dispatchEvent(new Event('dashboard-session-expired'))
+        }
+      }).catch(() => {})
     }
 
     // Batch bursts and wait for any in-flight snapshot before refreshing.
@@ -186,19 +179,20 @@ export function App() {
     }, 2000)
 
     return () => {
+      controller.abort()
       stream.close()
       window.clearInterval(timer)
     }
-  }, [token, watchRequests])
+  }, [watchRequests])
 
   useEffect(() => {
     if (modal !== 'request' || !selectedLog || demo) return
     const controller = new AbortController()
-    void result(api<{ response?: unknown }>(`/v1/logging/${encodeURIComponent(selectedLog.id)}`, token, { signal: controller.signal })).then(state => {
+    void result(api<{ response?: unknown }>(`/dashboard/api/logging/${encodeURIComponent(selectedLog.id)}`, { signal: controller.signal })).then(state => {
       if (!controller.signal.aborted) setDetail(state)
     })
     return () => controller.abort()
-  }, [demo, modal, selectedLog, token])
+  }, [demo, modal, selectedLog])
 
   function navigate(next: Page) {
     if (next !== page && (next === 'Overview' || next === 'Requests')) setLogs({})
@@ -219,18 +213,16 @@ export function App() {
     open('request')
   }
 
-  function connect(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const value = String(new FormData(event.currentTarget).get('token') ?? '').trim()
-    setUsage({})
-    setLogs({})
-    setModels({})
-    setProviders({})
-    setKeys({})
-    setToken(value)
-    setDemo(false)
-    setRefresh(previous => previous + 1)
-    setModal(null)
+  async function exit() {
+    setExiting(true)
+    setExitError('')
+    try {
+      await onExit()
+    } catch (error) {
+      setExitError(error instanceof Error ? error.message : 'Could not sign out.')
+    } finally {
+      setExiting(false)
+    }
   }
 
   async function manageKey(event: FormEvent<HTMLFormElement>) {
@@ -240,7 +232,7 @@ export function App() {
     try {
       if (modal === 'create') {
         const form = new FormData(event.currentTarget)
-        const created = await api<{ key: string }>('/v1/keys', token, {
+        const created = await api<{ key: string }>('/dashboard/api/keys', {
           method: 'POST',
           body: JSON.stringify({
             name: String(form.get('name')).trim(),
@@ -250,7 +242,7 @@ export function App() {
         })
         setCreatedKey(created.key)
       } else if (selectedKey) {
-        await api(`/v1/keys/${selectedKey.id}`, token, { method: 'DELETE' })
+        await api(`/dashboard/api/keys/${selectedKey.id}`, { method: 'DELETE' })
         setModal(null)
       }
       setRefresh(previous => previous + 1)
@@ -285,7 +277,7 @@ export function App() {
         <span className="workspace"><span className="separator">/</span> Workspace</span>
         <div className="top-actions">
           <Status tone={demo ? 'neutral' : online ? 'ready' : 'neutral'}>{demo ? 'Demo data' : online ? 'Router online' : loading ? 'Connecting' : 'Router offline'}</Status>
-          <Button variant="outline" className="connection" onClick={() => open('connection')}><Terminal size={15} /> Connection</Button>
+          <Button variant="outline" className="connection" disabled={exiting} onClick={exit}><LogOut size={15} />{demo ? 'Exit demo' : 'Sign out'}</Button>
         </div>
       </div>
       <nav className="navigation frame" aria-label="Dashboard">
@@ -310,7 +302,8 @@ export function App() {
         </div>
       </div>
 
-      {!demo && !loading && !online && <div className="offline"><span>Start the router to load live data.</span><Button variant="outline" onClick={() => { setModal(null); setDemo(true) }}>View demo</Button></div>}
+      {exitError && <div className="offline" role="alert">{exitError}</div>}
+      {!demo && !loading && !online && <div className="offline">The router is unavailable.</div>}
 
       {page === 'Overview' && <>
         <div className="metrics">
@@ -356,12 +349,6 @@ export function App() {
       <footer><span>SeavxRouter</span><a href="https://github.com/seaavey/SeavxRouter" target="_blank" rel="noreferrer">GitHub <ExternalLink size={13} /></a></footer>
     </main>
 
-    {modal === 'connection' && <Modal title="Router connection" description="Enter the admin API key if your router requires authentication." onClose={() => setModal(null)}>
-      <form onSubmit={connect}>
-        <label>Admin API key<input name="token" type="password" defaultValue={token} autoComplete="off" placeholder="Bearer token" /></label>
-        <div className="dialog-actions"><Button variant="outline" onClick={() => { setDemo(true); setModal(null) }}>View demo</Button><Button type="submit">Connect</Button></div>
-      </form>
-    </Modal>}
     {modal === 'request' && selectedLog && <Modal title={`Request #${selectedLog.id}`} description={selectedLog.model || 'Request details'} onClose={() => setModal(null)}>
       <dl className="detail-list"><dt>Endpoint</dt><dd>{selectedLog.endpoint}</dd><dt>Status</dt><dd>{selectedLog.status}</dd><dt>Latency</dt><dd>{number.format(selectedLog.duration_ms)} ms</dd><dt>Tokens</dt><dd>{number.format(selectedLog.usage.total_tokens)}</dd></dl>
       {!demo && <><h3>Response</h3>{detail ? render(detail, value => <pre>{value.response == null ? 'No response body recorded.' : typeof value.response === 'string' ? value.response : JSON.stringify(value.response, null, 2)}</pre>) : <Notice>Loading response…</Notice>}</>}
