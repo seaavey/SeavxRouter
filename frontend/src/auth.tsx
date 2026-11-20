@@ -7,6 +7,7 @@ import { Button } from './components/ui/button'
 interface Session {
   authenticated: boolean
   must_change: boolean
+  setup_required?: boolean
 }
 
 export function App() {
@@ -14,6 +15,7 @@ export function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [setupToken, setSetupToken] = useState('')
 
   useEffect(() => {
     if (demo) return
@@ -25,7 +27,7 @@ export function App() {
       }
     })
     const expire = () => {
-      setSession({ authenticated: false, must_change: false })
+      setSession(previous => ({ authenticated: false, must_change: false, setup_required: previous?.setup_required || previous?.must_change }))
       setError('Your session ended. Sign in again.')
     }
     window.addEventListener('dashboard-session-expired', expire)
@@ -47,10 +49,12 @@ export function App() {
     setError('')
     try {
       const endpoint = session?.must_change ? 'password' : 'login'
-      setSession(await api<Session>(`/dashboard/api/${endpoint}`, {
+      const next = await api<Session>(`/dashboard/api/${endpoint}`, {
         method: 'POST',
-        body: JSON.stringify({ password }),
-      }))
+        body: JSON.stringify({ password, setup_token: setupToken }),
+      })
+      if (!next.must_change) setSetupToken('')
+      setSession(next)
     } catch (error) {
       setError(error instanceof Error ? error.message : 'Could not sign in.')
     } finally {
@@ -85,6 +89,10 @@ export function App() {
         <label>{setup ? 'New password' : 'Password'}
           <input name="password" type="password" required minLength={setup ? 12 : undefined} autoComplete={setup ? 'new-password' : 'current-password'} />
         </label>
+        {setup && !setupToken && <p>Enter the setup token again to finish setup.</p>}
+        {(setup || session.setup_required) && <label>Setup token
+          <input name="setup_token" type="password" required autoComplete="off" value={setupToken} onChange={event => setSetupToken(event.target.value)} />
+        </label>}
         {setup && <label>Confirm new password<input name="confirmation" type="password" required minLength={12} autoComplete="new-password" /></label>}
         {error && <p className="auth-error" role="alert">{error}</p>}
         <Button type="submit" disabled={busy}>{busy ? 'Please wait…' : setup ? 'Save password' : 'Sign in'}</Button>

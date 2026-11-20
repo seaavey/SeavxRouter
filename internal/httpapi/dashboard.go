@@ -3,15 +3,19 @@ package httpapi
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,8 +32,10 @@ const (
 
 type DashboardStore struct {
 	db        *sql.DB
+	setupPath string
+	setupHash [32]byte
 	loginMu   sync.Mutex
-	nextLogin time.Time
+	attempts  map[string]dashboardLoginAttempt
 }
 
 func OpenDashboardStore(path string) (*DashboardStore, error) {
@@ -52,7 +58,21 @@ func OpenDashboardStore(path string) (*DashboardStore, error) {
 		db.Close()
 		return nil, err
 	}
-	return &DashboardStore{db: db}, nil
+	store := &DashboardStore{db: db, setupPath: path + ".setup-token", attempts: make(map[string]dashboardLoginAttempt)}
+	var pending bool
+	if err := db.QueryRow("SELECT must_change FROM dashboard_admin WHERE id = 1").Scan(&pending); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if pending {
+		if err := store.loadSetupToken(); err != nil {
+			db.Close()
+			return nil, err
+		}
+	} else if err := os.Remove(store.setupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("could not remove consumed dashboard setup token file", "err", err)
+	}
+	return store, nil
 }
 
 func initDashboard(db *sql.DB) error {
@@ -77,6 +97,92 @@ func initDashboard(db *sql.DB) error {
 	}
 	_, err = db.Exec("INSERT OR IGNORE INTO dashboard_admin (id, password_hash) VALUES (1, ?)", hash)
 	return err
+}
+
+func (d *DashboardStore) loadSetupToken() error {
+	token, _ := dashboardToken()
+	file, err := os.OpenFile(d.setupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		_, writeErr := file.WriteString(token + "\n")
+		if err := errors.Join(writeErr, file.Close()); err != nil {
+			_ = os.Remove(d.setupPath)
+			return err
+		}
+	} else if errors.Is(err, os.ErrExist) {
+		info, err := os.Lstat(d.setupPath)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > 128 {
+			return fmt.Errorf("dashboard setup token must be a private regular file: %s", d.setupPath)
+		}
+		data, err := os.ReadFile(d.setupPath)
+		if err != nil {
+			return err
+		}
+		token = strings.TrimSpace(string(data))
+	} else {
+		return err
+	}
+	if raw, err := base64.RawURLEncoding.DecodeString(token); err != nil || len(raw) != 32 {
+		return fmt.Errorf("invalid dashboard setup token file: %s", d.setupPath)
+	}
+	d.setupHash = sha256.Sum256([]byte(token))
+	slog.Info("dashboard setup token file ready", "path", d.setupPath)
+	return nil
+}
+
+func (d *DashboardStore) validSetupToken(token string) bool {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return subtle.ConstantTimeCompare(digest[:], d.setupHash[:]) == 1
+}
+
+type dashboardLoginAttempt struct {
+	failures int
+	next     time.Time
+	busy     bool
+}
+
+func (d *DashboardStore) startLogin(peer string, now time.Time) (time.Duration, bool) {
+	d.loginMu.Lock()
+	defer d.loginMu.Unlock()
+	attempt := d.attempts[peer]
+	if attempt.busy {
+		return time.Second, false
+	}
+	if now.Before(attempt.next) {
+		return attempt.next.Sub(now), false
+	}
+	if len(d.attempts) >= 1024 {
+		for ip, entry := range d.attempts {
+			if !entry.busy && now.Sub(entry.next) > 10*time.Minute {
+				delete(d.attempts, ip)
+			}
+		}
+		if _, exists := d.attempts[peer]; !exists && len(d.attempts) >= 1024 {
+			return time.Second, false
+		}
+	}
+	if now.Sub(attempt.next) > 10*time.Minute {
+		attempt.failures = 0
+	}
+	attempt.busy = true
+	d.attempts[peer] = attempt
+	return 0, true
+}
+
+func (d *DashboardStore) finishLogin(peer string, failed bool) {
+	d.loginMu.Lock()
+	defer d.loginMu.Unlock()
+	if !failed {
+		delete(d.attempts, peer)
+		return
+	}
+	attempt := d.attempts[peer]
+	attempt.failures = min(attempt.failures+1, 6)
+	attempt.next = time.Now().Add(time.Second << (attempt.failures - 1))
+	attempt.busy = false
+	d.attempts[peer] = attempt
 }
 
 func (d *DashboardStore) Close() error { return d.db.Close() }
@@ -146,35 +252,43 @@ func dashboardToken() (string, [32]byte) {
 	return token, sha256.Sum256([]byte(token))
 }
 
-func readDashboardPassword(w http.ResponseWriter, r *http.Request) (string, bool) {
-	var form struct {
-		Password string `json:"password"`
-	}
+type dashboardPasswordForm struct {
+	Password        string `json:"password"`
+	CurrentPassword string `json:"current_password"`
+	SetupToken      string `json:"setup_token"`
+}
+
+func readDashboardPassword(w http.ResponseWriter, r *http.Request) (dashboardPasswordForm, bool) {
+	var form dashboardPasswordForm
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2048)).Decode(&form); err != nil || len(form.Password) == 0 || len(form.Password) > 72 {
 		dashboardError(w, http.StatusBadRequest, "Enter a password of 1 to 72 bytes.")
-		return "", false
+		return dashboardPasswordForm{}, false
 	}
-	return form.Password, true
+	return form, true
 }
 
 func (d *DashboardStore) login(w http.ResponseWriter, r *http.Request) {
-	password, ok := readDashboardPassword(w, r)
+	form, ok := readDashboardPassword(w, r)
 	if !ok {
 		return
 	}
-	d.loginMu.Lock()
-	if time.Now().Before(d.nextLogin) {
-		d.loginMu.Unlock()
-		w.Header().Set("Retry-After", "1")
-		dashboardError(w, http.StatusTooManyRequests, "Wait a moment before trying again.")
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = "unknown"
+	}
+	wait, allowed := d.startLogin(peer, time.Now())
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.FormatInt(int64((wait+time.Second-1)/time.Second), 10))
+		dashboardError(w, http.StatusTooManyRequests, "Wait before trying again.")
 		return
 	}
-	d.nextLogin = time.Now().Add(time.Second)
-	d.loginMu.Unlock()
+	failed := false
+	defer func() { d.finishLogin(peer, failed) }()
+
 
 	var hash []byte
 	var mustChange bool
-	err := d.db.QueryRowContext(r.Context(), "SELECT password_hash, must_change FROM dashboard_admin WHERE id = 1").Scan(&hash, &mustChange)
+	err = d.db.QueryRowContext(r.Context(), "SELECT password_hash, must_change FROM dashboard_admin WHERE id = 1").Scan(&hash, &mustChange)
 	if err != nil {
 		dashboardInternalError(w, err)
 		return
@@ -184,7 +298,13 @@ func (d *DashboardStore) login(w http.ResponseWriter, r *http.Request) {
 		dashboardError(w, http.StatusForbidden, "Set up the dashboard through localhost first.")
 		return
 	}
-	if bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil {
+	if mustChange && !d.validSetupToken(form.SetupToken) {
+		failed = true
+		dashboardError(w, http.StatusUnauthorized, "A valid setup token is required.")
+		return
+	}
+	if bcrypt.CompareHashAndPassword(hash, []byte(form.Password)) != nil {
+		failed = true
 		dashboardError(w, http.StatusUnauthorized, "Incorrect password.")
 		return
 	}
@@ -220,7 +340,11 @@ func dashboardUpdated(w http.ResponseWriter, res sql.Result, err error) bool {
 }
 
 func (d *DashboardStore) changePassword(w http.ResponseWriter, r *http.Request) {
-	mustChange, err := d.session(r)
+	oldSession := dashboardSession(r)
+	var currentHash []byte
+	var mustChange bool
+	err := d.db.QueryRowContext(r.Context(), `SELECT password_hash, must_change FROM dashboard_admin
+		WHERE session_hash = ? AND session_expires > ?`, oldSession[:], time.Now().Unix()).Scan(&currentHash, &mustChange)
 	if errors.Is(err, sql.ErrNoRows) {
 		dashboardError(w, http.StatusUnauthorized, "Sign in to the dashboard.")
 		return
@@ -229,31 +353,39 @@ func (d *DashboardStore) changePassword(w http.ResponseWriter, r *http.Request) 
 		dashboardInternalError(w, err)
 		return
 	}
-	if !mustChange {
-		dashboardError(w, http.StatusConflict, "Initial setup has already finished.")
-		return
-	}
-	password, ok := readDashboardPassword(w, r)
+	form, ok := readDashboardPassword(w, r)
 	if !ok {
 		return
 	}
-	if len([]rune(password)) < 12 {
+	if len([]rune(form.Password)) < 12 {
 		dashboardError(w, http.StatusBadRequest, "Use a new password with at least 12 characters.")
 		return
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if mustChange && !d.validSetupToken(form.SetupToken) {
+		dashboardError(w, http.StatusForbidden, "A valid setup token is required.")
+		return
+	}
+	if !mustChange && (len(form.CurrentPassword) > 72 || bcrypt.CompareHashAndPassword(currentHash, []byte(form.CurrentPassword)) != nil) {
+		dashboardError(w, http.StatusForbidden, "Incorrect current password.")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(form.Password), bcrypt.DefaultCost)
 	if err != nil {
 		dashboardInternalError(w, err)
 		return
 	}
-	oldSession := dashboardSession(r)
 	token, digest := dashboardToken()
 	res, err := d.db.ExecContext(r.Context(), `UPDATE dashboard_admin SET
 		password_hash = ?, must_change = 0, session_hash = ?, session_expires = ?
-		WHERE id = 1 AND must_change = 1 AND session_hash = ? AND session_expires > ?`,
-		hash, digest[:], time.Now().Add(dashboardSessionTTL).Unix(), oldSession[:], time.Now().Unix())
+		WHERE id = 1 AND must_change = ? AND session_hash = ? AND session_expires > ?`,
+		hash, digest[:], time.Now().Add(dashboardSessionTTL).Unix(), mustChange, oldSession[:], time.Now().Unix())
 	if !dashboardUpdated(w, res, err) {
 		return
+	}
+	if mustChange {
+		if err := os.Remove(d.setupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("could not remove consumed dashboard setup token file", "err", err)
+		}
 	}
 	http.SetCookie(w, dashboardCookieFor(r, token, int(dashboardSessionTTL.Seconds())))
 	writeJSON(w, map[string]bool{"authenticated": true, "must_change": false})
@@ -283,7 +415,14 @@ func (s *Server) dashboardHandler() http.Handler {
 			dashboardInternalError(w, err)
 			return
 		}
-		writeJSON(w, map[string]bool{"authenticated": err == nil, "must_change": mustChange})
+		authenticated := err == nil
+		if !authenticated {
+			if err := d.db.QueryRowContext(r.Context(), "SELECT must_change FROM dashboard_admin WHERE id = 1").Scan(&mustChange); err != nil {
+				dashboardInternalError(w, err)
+				return
+			}
+		}
+		writeJSON(w, map[string]bool{"authenticated": authenticated, "must_change": authenticated && mustChange, "setup_required": mustChange})
 	})
 	admin := func(pattern string, handler http.HandlerFunc) {
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {

@@ -15,7 +15,7 @@ const pages = {
 }
 
 type Page = keyof typeof pages
-type ModalName = 'request' | 'create' | 'revoke'
+type ModalName = 'request' | 'create' | 'revoke' | 'password'
 type Result<T> = { value?: T; error?: string }
 const number = new Intl.NumberFormat('en-US')
 const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 })
@@ -225,6 +225,30 @@ export function Dashboard({ demo, onExit }: { demo: boolean; onExit: () => Promi
     }
   }
 
+  async function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const password = String(form.get('password') ?? '')
+    if (password !== form.get('confirmation')) {
+      setActionError('The passwords do not match.')
+      return
+    }
+    setSaving(true)
+    setActionError('')
+    try {
+      await api('/dashboard/api/password', {
+        method: 'POST',
+        body: JSON.stringify({ password, current_password: form.get('current_password') }),
+      })
+      setModal(null)
+      setRefresh(previous => previous + 1)
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Could not change the password.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   async function manageKey(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setSaving(true)
@@ -346,9 +370,18 @@ export function Dashboard({ demo, onExit }: { demo: boolean; onExit: () => Promi
         <tbody>{value.map(key => <tr key={key.id}><td>{key.name}</td><td><code>{key.prefix}…</code></td><td>{key.budget_usd ? dollars.format(key.budget_usd) : 'Unlimited'}</td><td>{key.limit_token ? number.format(key.limit_token) : 'Unlimited'}</td><td><Status tone={key.revoked_at ? 'neutral' : 'ready'}>{key.revoked_at ? 'Revoked' : 'Active'}</Status></td><td>{!key.revoked_at && <Button variant="ghost" disabled={demo} onClick={() => { setSelectedKey(key); open('revoke') }}>Revoke</Button>}</td></tr>)}</tbody>
       </table></div> : <Notice>No tenant keys created.</Notice>)}</section>}
 
-      <footer><span>SeavxRouter</span><a href="https://github.com/seaavey/SeavxRouter" target="_blank" rel="noreferrer">GitHub <ExternalLink size={13} /></a></footer>
+      <footer><span>SeavxRouter</span>{!demo && <button className="row-link" onClick={() => open('password')}>Change password</button>}<a href="https://github.com/seaavey/SeavxRouter" target="_blank" rel="noreferrer">GitHub <ExternalLink size={13} /></a></footer>
     </main>
 
+    {modal === 'password' && <Modal title="Change password" description="Use at least 12 characters for your new password." onClose={() => { if (!saving) setModal(null) }}>
+      <form onSubmit={changePassword}>
+        <label>Current password<input name="current_password" type="password" autoComplete="current-password" required /></label>
+        <label>New password<input name="password" type="password" autoComplete="new-password" minLength={12} required /></label>
+        <label>Confirm new password<input name="confirmation" type="password" autoComplete="new-password" minLength={12} required /></label>
+        {actionError && <p role="alert">{actionError}</p>}
+        <div className="dialog-actions"><Button type="submit" disabled={saving}>{saving ? 'Saving…' : 'Save password'}</Button></div>
+      </form>
+    </Modal>}
     {modal === 'request' && selectedLog && <Modal title={`Request #${selectedLog.id}`} description={selectedLog.model || 'Request details'} onClose={() => setModal(null)}>
       <dl className="detail-list"><dt>Endpoint</dt><dd>{selectedLog.endpoint}</dd><dt>Status</dt><dd>{selectedLog.status}</dd><dt>Latency</dt><dd>{number.format(selectedLog.duration_ms)} ms</dd><dt>Tokens</dt><dd>{number.format(selectedLog.usage.total_tokens)}</dd></dl>
       {!demo && <><h3>Response</h3>{detail ? render(detail, value => <pre>{value.response == null ? 'No response body recorded.' : typeof value.response === 'string' ? value.response : JSON.stringify(value.response, null, 2)}</pre>) : <Notice>Loading response…</Notice>}</>}
