@@ -285,7 +285,6 @@ func (d *DashboardStore) login(w http.ResponseWriter, r *http.Request) {
 	failed := false
 	defer func() { d.finishLogin(peer, failed) }()
 
-
 	var hash []byte
 	var mustChange bool
 	err = d.db.QueryRowContext(r.Context(), "SELECT password_hash, must_change FROM dashboard_admin WHERE id = 1").Scan(&hash, &mustChange)
