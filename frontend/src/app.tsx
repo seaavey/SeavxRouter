@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useEffectEvent, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Activity, ArrowDownToLine, Box, ChevronDown, ExternalLink, KeyRound, Layers3, LayoutDashboard, List, Plus, RefreshCw, Search, Terminal, Waypoints } from 'lucide-react'
 import { animate } from 'motion/mini'
+import { EventSource } from 'eventsource'
 import { api, type Model, type Provider, type RequestLog, type TenantKey, type Usage } from './api'
 import { demoKeys, demoLogs, demoModels, demoProviders, demoUsage } from './demo'
 import { Button } from './components/ui/button'
@@ -96,6 +97,8 @@ export function App() {
   const [detail, setDetail] = useState<Result<{ response?: unknown }> | null>(null)
   const [loading, setLoading] = useState(true)
   const [online, setOnline] = useState(false)
+  const [streamStatus, setStreamStatus] = useState('Connecting')
+  const watchRequests = !demo && (page === 'Overview' || (page === 'Requests' && offset === 0))
   const [usage, setUsage] = useState<Result<Usage>>({})
   const [logs, setLogs] = useState<Result<RequestLog[]>>({})
   const [models, setModels] = useState<Result<Model[]>>({})
@@ -143,6 +146,50 @@ export function App() {
     void load()
     return () => controller.abort()
   }, [days, demo, offset, page, refresh, token])
+
+  const refreshFromStream = useEffectEvent(() => {
+    if (loading) return false
+    setRefresh(previous => previous + 1)
+    return true
+  })
+
+  useEffect(() => {
+    if (!watchRequests) return
+
+    setStreamStatus('Connecting')
+    let dirty = false
+    const stream = new EventSource('/v1/logging/stream', {
+      fetch: (url, options) => {
+        const headers = new Headers(options.headers)
+        if (token) headers.set('Authorization', `Bearer ${token}`)
+        return fetch(url, { ...options, headers, cache: 'no-store' })
+      },
+    })
+    stream.addEventListener('ready', () => {
+      setStreamStatus('Live')
+      // The router does not replay events after a disconnect.
+      dirty = true
+    })
+    stream.addEventListener('log', () => { dirty = true })
+    stream.onerror = event => {
+      if (event.code === 401 || event.code === 403 || event.code === 404 || stream.readyState === EventSource.CLOSED) {
+        stream.close()
+        setStreamStatus(event.code === 401 || event.code === 403 ? 'Admin key required' : 'Live updates unavailable')
+      } else {
+        setStreamStatus('Reconnecting')
+      }
+    }
+
+    // Batch bursts and wait for any in-flight snapshot before refreshing.
+    const timer = window.setInterval(() => {
+      if (dirty && refreshFromStream()) dirty = false
+    }, 2000)
+
+    return () => {
+      stream.close()
+      window.clearInterval(timer)
+    }
+  }, [token, watchRequests])
 
   useEffect(() => {
     if (modal !== 'request' || !selectedLog || demo) return
@@ -281,13 +328,15 @@ export function App() {
           {render(currentUsage, value => <UsageChart usage={value} days={days} />)}
         </section>
         <section className="panel">
-          <div className="panel-heading"><div><h2>Recent requests</h2><p>Latest activity across your gateway.</p></div><Button variant="outline" onClick={() => navigate('Requests')}>View requests</Button></div>
+          <div className="panel-heading"><div><div className="flex flex-wrap items-center gap-2"><h2>Recent requests</h2>{watchRequests && <Status tone={streamStatus === 'Live' ? 'ready' : 'neutral'}>{streamStatus}</Status>}</div><p>Latest activity across your gateway.</p></div><Button variant="outline" onClick={() => navigate('Requests')}>View requests</Button></div>
           {render(currentLogs, () => <RequestTable rows={requestRows} onOpen={openRequest} />)}
         </section>
       </>}
 
       {(page === 'Requests' || page === 'Models') && <section className="panel">
-        <div className="panel-heading"><label className="search"><Search size={15} /><input aria-label={`Filter ${page.toLowerCase()}`} placeholder={page === 'Requests' ? 'Filter this page…' : 'Find a model…'} value={filter} onChange={event => setFilter(event.target.value)} /></label></div>
+        <div className="panel-heading flex-wrap"><label className="search"><Search size={15} /><input aria-label={`Filter ${page.toLowerCase()}`} placeholder={page === 'Requests' ? 'Filter this page…' : 'Find a model…'} value={filter} onChange={event => setFilter(event.target.value)} /></label>
+          {page === 'Requests' && !demo && <Status tone={watchRequests && streamStatus === 'Live' ? 'ready' : 'neutral'}>{watchRequests ? streamStatus : 'Live updates paused'}</Status>}
+        </div>
         {page === 'Requests' ? render(currentLogs, value => <>
           <RequestTable rows={requestRows} onOpen={openRequest} />
           {!demo && (offset > 0 || value.length > 25) && <div className="pagination"><Button variant="outline" disabled={offset === 0 || loading} onClick={() => { setLogs({}); setOffset(previous => previous - 25) }}>Previous</Button><Button variant="outline" disabled={value.length <= 25 || loading} onClick={() => { setLogs({}); setOffset(previous => previous + 25) }}>Next</Button></div>}

@@ -13,3 +13,5 @@ Open http://127.0.0.1:5173. If the router uses `-api-key`, open **Connection** a
 Vite proxies `/v1` and `/healthz` to the router. Set `SEAVX_ROUTER_ORIGIN` in `frontend/.env.local` to override the upstream URL. Usage and request logs require the router's SQLite usage ledger. Tenant key management requires the key store and admin authentication.
 
 Build with `npm run build` and try the result with `npm run preview`. To deploy, serve `dist/` behind an HTTPS reverse proxy and route `/v1/*` and `/healthz` on the same origin to the Go router. Keep the router admin key server-configured and enter it through the dashboard's connection dialog.
+
+Overview and the first Requests page subscribe to `/v1/logging/stream`. Finished requests refresh the latest logs and usage totals in batches. Older request pages stay stable while you browse. Configure the production reverse proxy to stream this endpoint without response buffering or a short read timeout.
