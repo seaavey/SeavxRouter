@@ -27,6 +27,13 @@ Some backend and embedding changes were started locally before the workspace dis
 - [ ] Add CI for a clean dependency install, frontend type checking and build, a Go build with embedded assets, and Playwright E2E.
 - [ ] Use approximately 60% dark graphite, 30% dark gray, and 10% cyan. Use shadcn/ui components and keep transitions brief with reduced-motion support.
 
+## Authentication fixes required before merge
+
+- [ ] Require a random, single-use setup token alongside the initial password. Store the token in a local file with mode `0600`, consume it on successful setup, and verify that the default password alone cannot initialize the dashboard behind a proxy.
+- [ ] Add password rotation after setup. Verify the current password, update its bcrypt hash, rotate the session, and verify that the old password and session are rejected.
+- [ ] Replace the global login throttle with bounded per-client backoff. Trust forwarded client addresses only from explicitly trusted proxies. Test isolated backoff, successful login after the retry window, and proxy-header handling.
+- [ ] Cover all three fixes in Go tests and the Playwright authentication flow.
+
 ## Pre-merge verification
 
 | Viewport | What to check |
