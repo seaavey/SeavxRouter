@@ -178,6 +178,7 @@ func main() {
 	apiKey := fs.String("api-key", "", "require this bearer token on /v1/* (empty = no auth)")
 	defaultModel := fs.String("default-model", "", "model used when the request omits one")
 	usageDB := fs.String("usage-db", httpapi.DefaultUsageDBPath(), `SQLite file for token usage tracking (empty or "off" disables)`)
+	dashboardDB := fs.String("dashboard-db", "", "SQLite file for dashboard login (empty disables web dashboard authentication routes)")
 	keysDB := fs.String("keys-db", httpapi.DefaultKeysDBPath(), `SQLite file for tenant API keys (empty or "off" disables)`)
 	compressFlag := fs.String("compress", "on", "compress large tool-result output: on|off")
 	compressMinBytes := fs.Int("compress-min-bytes", 2000, "minimum tool-result bytes to compress")
@@ -483,6 +484,15 @@ func main() {
 	serverOpts := []httpapi.ServerOption{httpapi.WithCompression(compressor)}
 	if keyStore != nil {
 		serverOpts = append(serverOpts, httpapi.WithKeys(keyStore))
+	}
+	if *dashboardDB != "" {
+		store, err := httpapi.OpenDashboardStore(*dashboardDB)
+		if err != nil {
+			slog.Error("cannot open dashboard db", "err", err)
+			os.Exit(1)
+		}
+		defer store.Close()
+		serverOpts = append(serverOpts, httpapi.WithDashboard(store))
 	}
 	srv := httpapi.NewServer(provider, *apiKey, usageStore, serverOpts...)
 

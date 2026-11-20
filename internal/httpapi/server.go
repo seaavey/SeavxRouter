@@ -22,6 +22,7 @@ type Server struct {
 	backend    backend.BackendAPI
 	apiKey     string
 	keys       *KeyStore
+	dashboard  *DashboardStore
 	usage      *UsageStore
 	logs       *logBroker
 	compressor *compress.Engine
@@ -160,6 +161,9 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("PATCH /v1/keys/{id}", s.auth(s.requireKeysAdmin(s.handlePatchKey)))
 		mux.HandleFunc("DELETE /v1/keys/{id}", s.auth(s.requireKeysAdmin(s.handleDeleteKey)))
 	}
+	if s.dashboard != nil {
+		mux.Handle(dashboardPath+"/", s.dashboardHandler())
+	}
 	return mux
 }
 
@@ -207,10 +211,10 @@ func bearerToken(r *http.Request) (string, bool) {
 }
 
 // requireMaster keeps operator routes (usage, logs, quotas) on the master key.
-// With no master key configured the server stays open, as before.
+// When dashboard login is enabled, the bearer-only operator routes need a master key.
 func (s *Server) requireMaster(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if tenantKeyFromContext(r.Context()) != nil {
+		if (s.dashboard != nil && s.apiKey == "") || tenantKeyFromContext(r.Context()) != nil {
 			writeError(w, &apiError{http.StatusForbidden, "admin API key required", "invalid_request_error", "admin_key_required"})
 			return
 		}

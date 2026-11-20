@@ -485,6 +485,10 @@ func (s *Server) handleLogging(w http.ResponseWriter, r *http.Request) {
 
 // handleLogStream live-tails request logs as Server-Sent Events.
 func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
+	s.streamLogs(w, r, nil)
+}
+
+func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request, valid func() bool) {
 	if s.usage == nil {
 		writeError(w, &apiError{http.StatusNotFound, "logging is disabled", "invalid_request_error", "logging_disabled"})
 		return
@@ -503,20 +507,23 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &apiError{http.StatusInternalServerError, "streaming unsupported", "server_error", "streaming_unsupported"})
 		return
 	}
+	ch := s.logs.subscribe()
+	defer s.logs.unsubscribe(ch)
+
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "retry: 3000\n\nevent: ready\ndata: {}\n\n")
 	flusher.Flush()
-
-	ch := s.logs.subscribe()
-	defer s.logs.unsubscribe(ch)
 
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
 		select {
 		case e := <-ch:
+			if valid != nil && !valid() {
+				return
+			}
 			var view map[string]any
 			if include == "all" {
 				view = requestLogView(e)
@@ -531,6 +538,9 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
 			flusher.Flush()
 		case <-ping.C:
+			if valid != nil && !valid() {
+				return
+			}
 			fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
 		case <-r.Context().Done():
