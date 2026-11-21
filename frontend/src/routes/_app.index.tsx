@@ -85,8 +85,8 @@ function OverviewPage() {
 
       <Card className="gap-0 py-0">
         <CardHeader className="border-b border-border py-4">
-          <CardTitle>Request volume</CardTitle>
-          <CardDescription>{range.group === 'day' ? 'Daily' : range.group === 'hour' ? 'Hourly' : 'Per-minute'} totals across every provider, in your local time.</CardDescription>
+          <CardTitle>Token volume</CardTitle>
+          <CardDescription>{range.group === 'day' ? 'Daily' : range.group === 'hour' ? 'Hourly' : 'Per-minute'} tokens across every provider, in your local time.</CardDescription>
         </CardHeader>
         <CardContent className="px-0">
           {usage.data

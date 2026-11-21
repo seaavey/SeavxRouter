@@ -30,13 +30,13 @@ export const format = {
 /**
  * Buckets for the chart, oldest first, so gaps render as zero. They start at the
  * range's own boundary and step forward to the bucket that is running now, which
- * is why the last bar is often short: it holds only what has happened so far.
+ * is why the last point is often short: it holds only what has happened so far.
  */
 export function bucketsFor(
-  rows: { key: string; requests: number }[] | null,
+  rows: { key: string; requests: number; total_tokens: number }[] | null,
   range: { group: 'minute' | 'hour' | 'day'; buckets: number; start: () => Date },
 ) {
-  const byKey = new Map((rows ?? []).map(row => [row.key, row.requests]))
+  const byKey = new Map((rows ?? []).map(row => [row.key, row]))
   const from = range.start()
   const stepMs = range.group === 'day' ? 86_400_000 : range.group === 'hour' ? 3_600_000 : 60_000
   return Array.from({ length: range.buckets }, (_, index) => {
@@ -46,10 +46,12 @@ export function bucketsFor(
       : range.group === 'hour'
         ? `${localDateKey(at)}T${String(at.getHours()).padStart(2, '0')}`
         : `${localDateKey(at)}T${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+    const row = byKey.get(key)
     return {
       label: range.group === 'day' ? format.day(at) : range.group === 'hour' ? format.hour(at) : format.hourMinute(at),
       date: key,
-      requests: byKey.get(key) ?? 0,
+      tokens: row?.total_tokens ?? 0,
+      requests: row?.requests ?? 0,
     }
   })
 }
