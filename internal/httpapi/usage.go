@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,6 +102,9 @@ type UsageFilter struct {
 	Model    string
 	User     string
 	GroupBy  string
+	// OffsetMinutes is the reader's UTC offset, used to cut day and hour
+	// buckets on their clock instead of UTC.
+	OffsetMinutes int
 }
 
 // UsageStore persists request usage in SQLite. Writes are queued and committed
@@ -200,6 +204,10 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("dropping stored request bodies: %w", err)
 	}
+	if err := netUsageCache(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("netting cached tokens from usage: %w", err)
+	}
 	if _, err := db.Exec(compressionSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating compression table: %w", err)
@@ -298,6 +306,39 @@ func migrateRequestLogs(db *sql.DB) error {
 		slog.Warn("could not vacuum usage database after dropping request bodies", "err", err)
 	}
 	return nil
+}
+
+// netUsageCache rewrites rows written before input was stored net of the cache.
+// Those rows count the cached prefix twice: once inside prompt_tokens and again
+// in cached_tokens, which is how the dashboard ended up showing 81,869 in and
+// 81,536 cached for one request. It runs once, guarded by user_version, because
+// subtracting twice would underflow the input figure to zero.
+func netUsageCache(db *sql.DB) error {
+	const version = 1
+	var current int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
+		return err
+	}
+	if current >= version {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"usage", "request_logs"} {
+		if _, err := tx.Exec(`UPDATE ` + table + ` SET
+			prompt_tokens = prompt_tokens - MIN(cached_tokens, prompt_tokens),
+			cached_tokens = MIN(cached_tokens, prompt_tokens)
+			WHERE cached_tokens > 0`); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // tableColumns lists a table's column names so a migration can test for them.
@@ -554,12 +595,21 @@ func usageWhere(f UsageFilter) (string, []any) {
 }
 
 // usageGroupExpr maps group_by values to an allowlisted SQL expression.
-func usageGroupExpr(groupBy string) (string, bool) {
+// Timestamps are stored in UTC, so the caller's offset shifts them onto the
+// reader's clock before the bucket is cut: a "day" is their day, and an hour
+// block runs from their :00 to the next :00 rather than from a UTC boundary.
+func usageGroupExpr(groupBy string, offsetMinutes int) (string, bool) {
+	// offsetMinutes is a bounded integer taken from the query string, so writing
+	// it into the expression is safe and keeps the GROUP BY free of parameters
+	// that would reorder the filter arguments.
+	local := fmt.Sprintf("datetime(substr(ts, 1, 19), '%+d minutes')", offsetMinutes)
 	switch groupBy {
 	case "", "day":
-		return "substr(ts, 1, 10)", true
+		return "strftime('%Y-%m-%d', " + local + ")", true
 	case "hour":
-		return "substr(ts, 1, 13)", true
+		return "strftime('%Y-%m-%dT%H', " + local + ")", true
+	case "minute":
+		return "strftime('%Y-%m-%dT%H:%M', " + local + ")", true
 	case "provider":
 		return "provider", true
 	case "model":
@@ -597,7 +647,7 @@ func (s *UsageStore) Query(f UsageFilter) (UsageTotals, []UsageGroup, error) {
 		return UsageTotals{}, nil, fmt.Errorf("summing usage: %w", err)
 	}
 
-	expr, ok := usageGroupExpr(f.GroupBy)
+	expr, ok := usageGroupExpr(f.GroupBy, f.OffsetMinutes)
 	if !ok {
 		return UsageTotals{}, nil, fmt.Errorf("invalid group_by %q", f.GroupBy)
 	}
@@ -776,6 +826,16 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		User:     q.Get("user"),
 		GroupBy:  q.Get("group_by"),
 	}
+	// A UTC offset is minutes east of UTC, so UTC+7 is 420. Anything outside a
+	// real timezone is rejected rather than silently shifting the chart.
+	if raw := q.Get("offset"); raw != "" {
+		minutes, err := strconv.Atoi(raw)
+		if err != nil || minutes < -12*60 || minutes > 14*60 {
+			writeError(w, &apiError{http.StatusBadRequest, "invalid offset: want minutes east of UTC between -720 and 840", "invalid_request_error", "invalid_offset"})
+			return
+		}
+		f.OffsetMinutes = minutes
+	}
 	var err error
 	if f.Start, err = parseUsageTime(q.Get("start")); err != nil {
 		writeError(w, &apiError{http.StatusBadRequest, "invalid start: " + err.Error(), "invalid_request_error", "invalid_time"})
@@ -785,8 +845,8 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &apiError{http.StatusBadRequest, "invalid end: " + err.Error(), "invalid_request_error", "invalid_time"})
 		return
 	}
-	if _, ok := usageGroupExpr(f.GroupBy); !ok {
-		writeError(w, &apiError{http.StatusBadRequest, `invalid group_by (want day, hour, provider, model, user or endpoint)`, "invalid_request_error", "invalid_group_by"})
+	if _, ok := usageGroupExpr(f.GroupBy, f.OffsetMinutes); !ok {
+		writeError(w, &apiError{http.StatusBadRequest, `invalid group_by (want day, hour, minute, provider, model, user or endpoint)`, "invalid_request_error", "invalid_group_by"})
 		return
 	}
 	totals, groups, err := s.usage.Query(f)

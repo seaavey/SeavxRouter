@@ -3,7 +3,9 @@ const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFra
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 })
 const shortMoney = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const shortTime = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })
-const dayLabel = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+const hourOnly = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false })
+const hourMinute = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', hour12: false })
+const dayLabel = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' })
 const fullTime = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'medium' })
 
 export const format = {
@@ -13,6 +15,9 @@ export const format = {
   /** Two decimals for a headline figure; four stay in tables where cents matter. */
   moneyShort: (value: number) => shortMoney.format(value),
   time: (value: string) => shortTime.format(new Date(value)),
+  /** Hour bucket labels follow the reader's clock, matching the offset sent. */
+  hour: (value: Date) => hourOnly.format(value),
+  hourMinute: (value: Date) => hourMinute.format(value),
   fullTime: (value: string) => fullTime.format(new Date(value)),
   day: (value: Date) => dayLabel.format(value),
   latency: (value: number) => `${integer.format(value)} ms`,
@@ -22,16 +27,36 @@ export const format = {
   budget: (value: number) => (value ? money.format(value) : 'Unlimited'),
 }
 
-/** UTC day buckets for the chart, oldest first, so gaps render as zero. */
-export function dayBuckets(rows: { key: string; requests: number }[] | null, days: number) {
-  const byDay = new Map((rows ?? []).map(row => [row.key, row.requests]))
-  const end = new Date()
-  end.setUTCHours(0, 0, 0, 0)
-  return Array.from({ length: days }, (_, index) => {
-    const date = new Date(end)
-    date.setUTCDate(end.getUTCDate() - (days - 1 - index))
-    return { label: format.day(date), date: date.toISOString().slice(0, 10), requests: byDay.get(date.toISOString().slice(0, 10)) ?? 0 }
+/**
+ * Buckets for the chart, oldest first, so gaps render as zero. They start at the
+ * range's own boundary and step forward to the bucket that is running now, which
+ * is why the last bar is often short: it holds only what has happened so far.
+ */
+export function bucketsFor(
+  rows: { key: string; requests: number }[] | null,
+  range: { group: 'minute' | 'hour' | 'day'; buckets: number; start: () => Date },
+) {
+  const byKey = new Map((rows ?? []).map(row => [row.key, row.requests]))
+  const from = range.start()
+  const stepMs = range.group === 'day' ? 86_400_000 : range.group === 'hour' ? 3_600_000 : 60_000
+  return Array.from({ length: range.buckets }, (_, index) => {
+    const at = new Date(from.getTime() + index * stepMs)
+    const key = range.group === 'day'
+      ? localDateKey(at)
+      : range.group === 'hour'
+        ? `${localDateKey(at)}T${String(at.getHours()).padStart(2, '0')}`
+        : `${localDateKey(at)}T${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+    return {
+      label: range.group === 'day' ? format.day(at) : range.group === 'hour' ? format.hour(at) : format.hourMinute(at),
+      date: key,
+      requests: byKey.get(key) ?? 0,
+    }
   })
+}
+
+/** YYYY-MM-DD on the local clock, matching the offset the query was cut with. */
+function localDateKey(at: Date) {
+  return `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, '0')}-${String(at.getDate()).padStart(2, '0')}`
 }
 
 export function statusTone(status: number) {

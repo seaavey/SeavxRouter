@@ -1,17 +1,23 @@
-import { dayBuckets, format } from '@/lib/format'
+import { bucketsFor, format } from '@/lib/format'
 import type { Usage } from '@/lib/api'
+import type { Range } from '@/lib/queries'
 
 /**
- * Daily request volume. One series, no legend: the newest day is filled and the
- * rest sit in a quiet step so the rhythm reads without a colour key.
+ * One series, no legend: the newest bucket is filled and the rest sit in a
+ * quiet step so the rhythm reads without a colour key. A 30-day range draws
+ * one bar per day, an hourly range one per hour, and the last hour one per
+ * minute, so the shape always answers the range the reader picked.
  */
-export function VolumeChart({ usage, days }: { usage: Usage; days: number }) {
-  const buckets = dayBuckets(usage.data, days)
+export function VolumeChart({ usage, range }: { usage: Usage; range: Range }) {
+  const buckets = bucketsFor(usage.data, range)
   const peak = Math.max(...buckets.map(bucket => bucket.requests), 1)
   const step = Math.max(1, Math.ceil(peak / 4))
   const ceiling = step * 4
   const last = buckets.at(-1)?.date
   const busiest = buckets.reduce((best, bucket) => (bucket.requests > best.requests ? bucket : best), buckets[0])
+  // Only every nth label is drawn once the count would otherwise collide.
+  const labelEvery = Math.ceil(buckets.length / 8)
+  const peakLabel = range.group === 'day' ? 'Busiest day' : range.group === 'hour' ? 'Busiest hour' : 'Busiest minute'
 
   return (
     <div className="px-6 pb-5">
@@ -23,10 +29,10 @@ export function VolumeChart({ usage, days }: { usage: Usage; days: number }) {
           <div aria-hidden className="absolute inset-x-0 top-0 flex h-48 flex-col justify-between">
             {[0, 1, 2, 3, 4].map(line => <i key={line} className="border-t border-border" />)}
           </div>
-          <div className="relative flex h-48 items-end gap-1.5" role="group" aria-label={`Daily requests over ${days} days, UTC`}>
+          <div className="relative flex h-48 items-end gap-px" role="group" aria-label={`Requests per ${range.group}, local time`}>
             {buckets.map(bucket => {
               const measured = Math.max((bucket.requests / ceiling) * 100, bucket.requests ? 3 : 0)
-              const today = bucket.date === last
+              const current = bucket.date === last
               return (
                 <div
                   key={bucket.date}
@@ -36,7 +42,7 @@ export function VolumeChart({ usage, days }: { usage: Usage; days: number }) {
                 >
                   <div
                     style={{ height: `${measured}%` }}
-                    className={`w-full max-w-14 rounded-t-sm transition-colors ${today
+                    className={`w-full rounded-t-sm transition-colors ${current
                       ? 'bg-foreground'
                       : 'bg-chart-3 group-hover/bar:bg-chart-2'
                       }`}
@@ -46,14 +52,14 @@ export function VolumeChart({ usage, days }: { usage: Usage; days: number }) {
             })}
           </div>
           <div className="mt-3 flex justify-between text-xs text-muted-foreground">
-            <span>{buckets[0]?.label}</span>
-            {days > 7 && <span className="hidden sm:inline">{buckets[Math.floor(days / 2)]?.label}</span>}
-            <span>{buckets.at(-1)?.label}</span>
+            {buckets
+              .filter((_, index) => index % labelEvery === 0 || index === buckets.length - 1)
+              .map(bucket => <span key={bucket.date}>{bucket.label}</span>)}
           </div>
         </div>
       </div>
       <p className="mt-4 ml-14 text-xs text-muted-foreground">
-        Busiest day was {busiest?.label} with {format.count(busiest?.requests ?? 0)} requests
+        {peakLabel} was {busiest?.label} with {format.count(busiest?.requests ?? 0)} requests
       </p>
     </div>
   )

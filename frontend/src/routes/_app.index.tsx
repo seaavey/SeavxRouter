@@ -11,22 +11,22 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useLiveLogs } from '@/hooks/use-live-logs'
-import { logsQuery, usageQuery } from '@/lib/queries'
+import { logsQuery, rangeFromParam, ranges, usageQuery } from '@/lib/queries'
 import { format } from '@/lib/format'
 import type { RequestLog } from '@/lib/api'
 
 export const Route = createFileRoute('/_app/')({
-  validateSearch: (search: Record<string, unknown>): { days?: number } => ({
-    days: Number(search.days) === 30 ? 30 : undefined,
+  validateSearch: (search: Record<string, unknown>): { range?: string } => ({
+    range: typeof search.range === 'string' && ranges.some(option => option.label === search.range) ? search.range : undefined,
   }),
   component: OverviewPage,
 })
 
 function OverviewPage() {
-  const { days: selectedDays } = Route.useSearch()
-  const days = selectedDays ?? 7
+  const { range: selectedRange } = Route.useSearch()
+  const range = rangeFromParam(selectedRange)
   const navigate = useNavigate({ from: Route.fullPath })
-  const usage = useQuery(usageQuery(days))
+  const usage = useQuery(usageQuery(range))
   const logs = useQuery(logsQuery(0, 8))
   // Keeps the table fresh; the feed has no UI of its own.
   useLiveLogs()
@@ -39,15 +39,14 @@ function OverviewPage() {
         description="What this gateway handled, and what it cost."
         actions={
           <Select
-            value={String(days)}
-            onValueChange={value => navigate({ search: { days: Number(value) === 30 ? 30 : undefined } })}
+            value={range.label}
+            onValueChange={label => navigate({ search: { range: label === ranges[2].label ? undefined : label } })}
           >
-            <SelectTrigger className="h-8 w-36" aria-label="Time range">
+            <SelectTrigger className="h-8 w-40" aria-label="Time range">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="7">Last 7 days</SelectItem>
-              <SelectItem value="30">Last 30 days</SelectItem>
+              {ranges.map(option => <SelectItem key={option.label} value={option.label}>{option.label}</SelectItem>)}
             </SelectContent>
           </Select>
         }
@@ -65,7 +64,7 @@ function OverviewPage() {
           label="Requests"
           value={usage.data?.totals.requests}
           format={format.count}
-          hint={`in the last ${days} days`}
+          hint={`in the ${range.label.toLowerCase()}`}
           loading={usage.isPending}
         />
         <Metric
@@ -87,11 +86,11 @@ function OverviewPage() {
       <Card className="gap-0 py-0">
         <CardHeader className="border-b border-border py-4">
           <CardTitle>Request volume</CardTitle>
-          <CardDescription>Daily totals across every provider, in UTC.</CardDescription>
+          <CardDescription>{range.group === 'day' ? 'Daily' : range.group === 'hour' ? 'Hourly' : 'Per-minute'} totals across every provider, in your local time.</CardDescription>
         </CardHeader>
         <CardContent className="px-0">
           {usage.data
-            ? <VolumeChart usage={usage.data} days={days} />
+            ? <VolumeChart usage={usage.data} range={range} />
             : <div className="p-6"><Skeleton className="h-48 w-full" /></div>}
         </CardContent>
       </Card>
