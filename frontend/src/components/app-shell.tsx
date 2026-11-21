@@ -1,6 +1,5 @@
 import { Link, Outlet, useRouterState } from '@tanstack/react-router'
-import { useIsFetching, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronRight, KeyRound, LayoutDashboard, ListFilter, LogOut, Plug, RefreshCw, Waypoints } from 'lucide-react'
+import { ChevronRight, KeyRound, LayoutDashboard, ListFilter, LogOut, Plug, Waypoints } from 'lucide-react'
 import { useState } from 'react'
 import {
   Sidebar,
@@ -17,12 +16,8 @@ import {
   SidebarTrigger,
 } from '@/components/ui/sidebar'
 import { Separator } from '@/components/ui/separator'
-import { Button } from '@/components/ui/button'
-import { StatusLabel } from '@/components/status'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { ChangePasswordDialog } from '@/features/auth/change-password-dialog'
-import { healthQuery } from '@/lib/queries'
-import { cn } from '@/lib/utils'
 
 const navigation = [
   { to: '/', label: 'Overview', icon: LayoutDashboard },
@@ -34,9 +29,7 @@ const navigation = [
 /** Sidebar plus topbar: the frame every signed-in page renders inside. */
 export function AppShell({ signingOut, onSignOut }: { signingOut: boolean; onSignOut: () => void }) {
   const pathname = useRouterState({ select: state => state.location.pathname })
-  const queryClient = useQueryClient()
   const current = navigation.find(item => (item.to === '/' ? pathname === '/' : pathname.startsWith(item.to)))
-  const refreshing = useIsFetching() > 0
   const [passwordOpen, setPasswordOpen] = useState(false)
 
   return (
@@ -115,11 +108,7 @@ export function AppShell({ signingOut, onSignOut }: { signingOut: boolean; onSig
             <span className="truncate font-medium">{current?.label ?? 'Overview'}</span>
           </nav>
           <div className="ml-auto flex items-center gap-1">
-            <GatewayStatus />
             <ThemeToggle />
-            <Button variant="ghost" size="icon-sm" aria-label="Refresh" onClick={() => queryClient.invalidateQueries()}>
-              <RefreshCw className={cn('size-4', refreshing && 'animate-spin')} />
-            </Button>
           </div>
         </header>
 
@@ -136,12 +125,4 @@ export function AppShell({ signingOut, onSignOut }: { signingOut: boolean; onSig
       </SidebarInset>
     </SidebarProvider>
   )
-}
-
-/** One dot that answers the first question a reader has: is the gateway up? */
-function GatewayStatus() {
-  const health = useQuery(healthQuery)
-  const tone = health.isError ? 'negative' : health.isSuccess ? 'positive' : 'muted'
-  const label = health.isError ? 'Offline' : health.isSuccess ? 'Online' : 'Checking'
-  return <StatusLabel tone={tone}>{label}</StatusLabel>
 }

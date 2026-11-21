@@ -4,7 +4,6 @@ import { api, type Model, type ProviderQuota, type RequestLog, type Session, typ
 /** One place for every query key, so invalidation stays honest. */
 export const keys = {
   session: ['session'] as const,
-  health: ['health'] as const,
   usage: (days: number) => ['usage', days] as const,
   logs: (offset: number) => ['logs', offset] as const,
   providers: ['providers'] as const,
@@ -18,13 +17,6 @@ export const sessionQuery = queryOptions({
   queryKey: keys.session,
   queryFn: () => api<Session>('/dashboard/api/session'),
   staleTime: 30_000,
-})
-
-export const healthQuery = queryOptions({
-  queryKey: keys.health,
-  queryFn: () => api<{ status: string }>('/healthz'),
-  refetchInterval: 15_000,
-  retry: false,
 })
 
 export const usageQuery = (days: number) => {
