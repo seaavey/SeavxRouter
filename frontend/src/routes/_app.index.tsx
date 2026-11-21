@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useQuery } from '@tanstack/react-query'
-import { Activity, CircleDollarSign, Coins } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { RequestTable } from '@/components/request-table'
 import { RequestDetail } from '@/features/requests/request-detail'
@@ -25,11 +24,11 @@ export const Route = createFileRoute('/_app/')({
   component: OverviewPage,
 })
 
-const streamCopy: Record<StreamStatus, { tone: 'positive' | 'muted' | 'warning' | 'destructive'; label: string }> = {
+const streamCopy: Record<StreamStatus, { tone: 'positive' | 'muted' | 'warning' | 'negative'; label: string }> = {
   connecting: { tone: 'muted', label: 'Connecting' },
   live: { tone: 'positive', label: 'Live' },
   reconnecting: { tone: 'warning', label: 'Reconnecting' },
-  unavailable: { tone: 'destructive', label: 'Live updates unavailable' },
+  unavailable: { tone: 'negative', label: 'Updates paused' },
 }
 
 function OverviewPage() {
@@ -42,16 +41,16 @@ function OverviewPage() {
   const [selected, setSelected] = useState<RequestLog | null>(null)
 
   return (
-    <>
+    <div className="flex flex-col gap-6">
       <PageHeader
         title="Overview"
-        description="Request volume, token usage, and spend recorded by this gateway."
+        description="What this gateway handled, and what it cost."
         actions={
           <Select
             value={String(days)}
             onValueChange={value => navigate({ search: { days: Number(value) === 30 ? 30 : undefined } })}
           >
-            <SelectTrigger className="h-8 w-36" aria-label="Usage period">
+            <SelectTrigger className="h-8 w-36" aria-label="Time range">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -69,53 +68,52 @@ function OverviewPage() {
         </Alert>
       )}
 
-      <section aria-label="Totals" className="grid gap-px overflow-hidden rounded-xl bg-border sm:grid-cols-3">
+      <section aria-label="Totals" className="grid gap-4 sm:grid-cols-3">
         <Metric
           label="Requests"
-          value={usage.data && format.count(usage.data.totals.requests)}
-          hint={`Handled in the last ${days} days`}
-          icon={<Activity className="size-3.5" />}
+          value={usage.data?.totals.requests}
+          format={format.count}
+          hint={`in the last ${days} days`}
           loading={usage.isPending}
         />
         <Metric
           label="Tokens"
-          value={usage.data && format.compact(usage.data.totals.total_tokens)}
-          hint={usage.data ? `${format.count(usage.data.totals.prompt_tokens)} in · ${format.count(usage.data.totals.completion_tokens)} out` : undefined}
-          icon={<Coins className="size-3.5" />}
+          value={usage.data?.totals.total_tokens}
+          format={format.compact}
+          hint={usage.data ? `${format.compact(usage.data.totals.prompt_tokens)} in, ${format.compact(usage.data.totals.completion_tokens)} out` : undefined}
           loading={usage.isPending}
         />
         <Metric
           label="Estimated cost"
-          value={usage.data && format.moneyShort(usage.data.totals.cost_usd)}
+          value={usage.data?.totals.cost_usd}
+          format={format.moneyShort}
           hint="Priced from the model catalog"
-          icon={<CircleDollarSign className="size-3.5" />}
           loading={usage.isPending}
-          accent
         />
       </section>
 
-      <Card className="py-0">
+      <Card className="gap-0 py-0">
         <CardHeader className="border-b border-border py-4">
           <CardTitle>Request volume</CardTitle>
-          <CardDescription>Daily requests across every provider, in UTC.</CardDescription>
+          <CardDescription>Daily totals across every provider, in UTC.</CardDescription>
         </CardHeader>
         <CardContent className="px-0">
           {usage.data
             ? <VolumeChart usage={usage.data} days={days} />
-            : <div className="grid gap-2 p-5"><Skeleton className="h-44 w-full" /></div>}
+            : <div className="p-6"><Skeleton className="h-48 w-full" /></div>}
         </CardContent>
       </Card>
 
-      <Card className="py-0">
+      <Card className="gap-0 py-0">
         <CardHeader className="border-b border-border py-4">
-          <div className="flex items-start justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="grid gap-1">
               <CardTitle>Latest requests</CardTitle>
-              <CardDescription>The newest traffic the gateway recorded.</CardDescription>
+              <CardDescription>The newest traffic this gateway recorded.</CardDescription>
             </div>
             <div className="flex items-center gap-3">
-              <StatusLabel tone={stream.tone} pulse={stream.tone === 'positive'}>{stream.label}</StatusLabel>
-              <Button variant="ghost" size="sm" asChild>
+              <StatusLabel tone={stream.tone}>{stream.label}</StatusLabel>
+              <Button variant="outline" size="sm" asChild>
                 <Link to="/requests">View all</Link>
               </Button>
             </div>
@@ -127,30 +125,26 @@ function OverviewPage() {
       </Card>
 
       <RequestDetail log={selected} onClose={() => setSelected(null)} />
-    </>
+    </div>
   )
 }
 
-function Metric({ label, value, hint, icon, loading, accent }: {
+function Metric({ label, value, format: render, hint, loading }: {
   label: string
-  value?: string | false
+  value?: number
+  format: (value: number) => string
   hint?: string
-  icon: React.ReactNode
   loading?: boolean
-  accent?: boolean
 }) {
   return (
-    <div className="bg-card p-5">
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        {icon}
-        {label}
-      </div>
+    <div className="rounded-xl border border-border bg-card p-5">
+      <p className="text-sm text-muted-foreground">{label}</p>
       {loading
-        ? <Skeleton className="mt-3 h-8 w-28" />
-        : <p className={`mt-3 font-heading text-3xl leading-none font-medium tabular tracking-tight ${accent ? 'text-signal' : ''}`}>
-            {value || '—'}
+        ? <Skeleton className="mt-2 h-9 w-28" />
+        : <p className="mt-1 text-3xl leading-tight font-medium tabular tracking-tight">
+            {value === undefined ? '—' : render(value)}
           </p>}
-      {hint && <p className="mt-2 font-mono text-[11px] text-muted-foreground/70">{hint}</p>}
+      {hint && <p className="mt-1 text-xs text-muted-foreground">{hint}</p>}
     </div>
   )
 }

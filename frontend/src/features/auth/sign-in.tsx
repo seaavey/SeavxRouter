@@ -53,12 +53,12 @@ export function SignInPage() {
     <main className="grid min-h-svh place-items-center px-6 py-12">
       <div className="w-full max-w-sm">
         <div className="mb-8 flex items-center gap-2.5">
-          <span className="grid size-8 place-items-center rounded-md bg-signal text-signal-foreground">
+          <span className="grid size-8 place-items-center rounded-md bg-foreground text-background">
             <Waypoints className="size-4" />
           </span>
           <span className="grid leading-tight">
             <span className="text-sm font-medium">SeavxRouter</span>
-            <span className="font-mono text-[11px] text-muted-foreground">gateway dashboard</span>
+            <span className="text-xs text-muted-foreground">Gateway dashboard</span>
           </span>
         </div>
 

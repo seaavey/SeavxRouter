@@ -12,9 +12,8 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as SignInRouteImport } from './routes/sign-in'
 import { Route as AppIndexRouteImport } from './routes/_app.index'
+import { Route as AppConnectionsRouteImport } from './routes/_app.connections'
 import { Route as AppKeysRouteImport } from './routes/_app.keys'
-import { Route as AppModelsRouteImport } from './routes/_app.models'
-import { Route as AppProvidersRouteImport } from './routes/_app.providers'
 import { Route as AppRequestsRouteImport } from './routes/_app.requests'
 
 const AppRoute = AppRouteImport.update({
@@ -31,19 +30,14 @@ const AppIndexRoute = AppIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppConnectionsRoute = AppConnectionsRouteImport.update({
+  id: '/connections',
+  path: '/connections',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppKeysRoute = AppKeysRouteImport.update({
   id: '/keys',
   path: '/keys',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppModelsRoute = AppModelsRouteImport.update({
-  id: '/models',
-  path: '/models',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppProvidersRoute = AppProvidersRouteImport.update({
-  id: '/providers',
-  path: '/providers',
   getParentRoute: () => AppRoute,
 } as any)
 const AppRequestsRoute = AppRequestsRouteImport.update({
@@ -55,16 +49,14 @@ const AppRequestsRoute = AppRequestsRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/sign-in': typeof SignInRoute
+  '/connections': typeof AppConnectionsRoute
   '/keys': typeof AppKeysRoute
-  '/models': typeof AppModelsRoute
-  '/providers': typeof AppProvidersRoute
   '/requests': typeof AppRequestsRoute
 }
 export interface FileRoutesByTo {
   '/sign-in': typeof SignInRoute
+  '/connections': typeof AppConnectionsRoute
   '/keys': typeof AppKeysRoute
-  '/models': typeof AppModelsRoute
-  '/providers': typeof AppProvidersRoute
   '/requests': typeof AppRequestsRoute
   '/': typeof AppIndexRoute
 }
@@ -72,24 +64,22 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/sign-in': typeof SignInRoute
+  '/_app/connections': typeof AppConnectionsRoute
   '/_app/keys': typeof AppKeysRoute
-  '/_app/models': typeof AppModelsRoute
-  '/_app/providers': typeof AppProvidersRoute
   '/_app/requests': typeof AppRequestsRoute
   '/_app/': typeof AppIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/sign-in' | '/keys' | '/models' | '/providers' | '/requests'
+  fullPaths: '/' | '/sign-in' | '/connections' | '/keys' | '/requests'
   fileRoutesByTo: FileRoutesByTo
-  to: '/sign-in' | '/keys' | '/models' | '/providers' | '/requests' | '/'
+  to: '/sign-in' | '/connections' | '/keys' | '/requests' | '/'
   id:
     | '__root__'
     | '/_app'
     | '/sign-in'
+    | '/_app/connections'
     | '/_app/keys'
-    | '/_app/models'
-    | '/_app/providers'
     | '/_app/requests'
     | '/_app/'
   fileRoutesById: FileRoutesById
@@ -122,25 +112,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/connections': {
+      id: '/_app/connections'
+      path: '/connections'
+      fullPath: '/connections'
+      preLoaderRoute: typeof AppConnectionsRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/keys': {
       id: '/_app/keys'
       path: '/keys'
       fullPath: '/keys'
       preLoaderRoute: typeof AppKeysRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/models': {
-      id: '/_app/models'
-      path: '/models'
-      fullPath: '/models'
-      preLoaderRoute: typeof AppModelsRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/providers': {
-      id: '/_app/providers'
-      path: '/providers'
-      fullPath: '/providers'
-      preLoaderRoute: typeof AppProvidersRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/requests': {
@@ -154,17 +137,15 @@ declare module '@tanstack/react-router' {
 }
 
 interface AppRouteChildren {
+  AppConnectionsRoute: typeof AppConnectionsRoute
   AppKeysRoute: typeof AppKeysRoute
-  AppModelsRoute: typeof AppModelsRoute
-  AppProvidersRoute: typeof AppProvidersRoute
   AppRequestsRoute: typeof AppRequestsRoute
   AppIndexRoute: typeof AppIndexRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
+  AppConnectionsRoute: AppConnectionsRoute,
   AppKeysRoute: AppKeysRoute,
-  AppModelsRoute: AppModelsRoute,
-  AppProvidersRoute: AppProvidersRoute,
   AppRequestsRoute: AppRequestsRoute,
   AppIndexRoute: AppIndexRoute,
 }

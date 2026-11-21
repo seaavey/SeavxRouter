@@ -35,7 +35,25 @@ export function dayBuckets(rows: { key: string; requests: number }[] | null, day
 }
 
 export function statusTone(status: number) {
-  if (status >= 500) return 'destructive' as const
+  if (status >= 500) return 'negative' as const
   if (status >= 400) return 'warning' as const
   return 'positive' as const
 }
+
+/** A short human label, so a table cell never needs a colour to be read. */
+export function statusLabel(status: number) {
+  if (status >= 500) return 'Server error'
+  if (status >= 400) return 'Client error'
+  return 'Success'
+}
+
+/** Relative time for lists: "just now", "4m ago", "3h ago", then the date. */
+export function since(value: string) {
+  const then = new Date(value).getTime()
+  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000))
+  if (seconds < 45) return 'just now'
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`
+  if (seconds < 86_400) return `${Math.round(seconds / 3600)}h ago`
+  return format.day(new Date(value))
+}
+

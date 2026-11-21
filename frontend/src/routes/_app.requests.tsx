@@ -16,11 +16,11 @@ import type { StreamStatus } from '@/hooks/use-live-logs'
 
 const PAGE_SIZE = 25
 
-const streamCopy: Record<StreamStatus, { tone: 'positive' | 'muted' | 'warning' | 'destructive'; label: string }> = {
+const streamCopy: Record<StreamStatus, { tone: 'positive' | 'muted' | 'warning' | 'negative'; label: string }> = {
   connecting: { tone: 'muted', label: 'Connecting' },
   live: { tone: 'positive', label: 'Live' },
   reconnecting: { tone: 'warning', label: 'Reconnecting' },
-  unavailable: { tone: 'destructive', label: 'Live updates unavailable' },
+  unavailable: { tone: 'negative', label: 'Updates paused' },
 }
 
 export const Route = createFileRoute('/_app/requests')({
@@ -45,28 +45,28 @@ function RequestsPage() {
   const hasNext = rows.length === PAGE_SIZE
 
   return (
-    <>
+    <div className="flex flex-col gap-6">
       <PageHeader
         title="Requests"
-        description="Every request the gateway recorded, newest first."
-        actions={page === 1 ? <StatusLabel tone={stream.tone} pulse={stream.tone === 'positive'}>{stream.label}</StatusLabel> : undefined}
+        description="Pick a row to see the full request, provider, and token breakdown."
+        actions={page === 1 ? <StatusLabel tone={stream.tone}>{stream.label}</StatusLabel> : undefined}
       />
 
       {logs.isError && (
         <Alert variant="destructive">
-          <AlertTitle>Log unavailable</AlertTitle>
+          <AlertTitle>Requests unavailable</AlertTitle>
           <AlertDescription>{logs.error.message}</AlertDescription>
         </Alert>
       )}
 
-      <Card className="py-0">
+      <Card className="gap-0 py-0">
         <CardContent className="px-0">
           <RequestTable rows={rows} loading={logs.isPending} onSelect={setSelected} pageSize={PAGE_SIZE} />
         </CardContent>
         {(offset > 0 || hasNext) && !logs.isPending && (
           <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-3">
-            <span className="font-mono text-[11px] text-muted-foreground/70">
-              Rows {offset + 1}–{offset + rows.length}
+            <span className="text-xs text-muted-foreground">
+              Showing {offset + 1}–{offset + rows.length}
             </span>
             <div className="flex gap-2">
               <Button
@@ -93,6 +93,6 @@ function RequestsPage() {
       </Card>
 
       <RequestDetail log={selected} onClose={() => setSelected(null)} />
-    </>
+    </div>
   )
 }

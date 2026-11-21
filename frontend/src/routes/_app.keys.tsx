@@ -5,7 +5,6 @@ import { KeyRound, Plus, Trash2 } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
@@ -35,10 +34,10 @@ function KeysPage() {
   })
 
   return (
-    <>
+    <div className="flex flex-col gap-6">
       <PageHeader
         title="API keys"
-        description="Tenant credentials that call the gateway, with their monthly limits."
+        description="Credentials your clients use to call the gateway, each with its own monthly limits."
         actions={
           <Button size="sm" onClick={() => setCreating(true)} disabled={!available}>
             <Plus className="size-4" />
@@ -47,69 +46,73 @@ function KeysPage() {
         }
       />
 
-      <Card className="py-0">
+      <Card className="gap-0 py-0">
         <CardContent className="px-0">
           {tenantKeys.isPending
-            ? <div className="grid gap-2 p-4">{Array.from({ length: 4 }, (_, index) => <Skeleton key={index} className="h-9 w-full" />)}</div>
+            ? <div className="grid gap-2 p-4">{Array.from({ length: 4 }, (_, index) => <Skeleton key={index} className="h-14 w-full" />)}</div>
             : tenantKeys.isError
               ? (
-                <Empty className="border-0 py-12">
+                <Empty className="py-12">
                   <EmptyHeader>
                     <EmptyMedia variant="icon"><KeyRound /></EmptyMedia>
                     <EmptyTitle>Key management is disabled</EmptyTitle>
-                    <EmptyDescription>{tenantKeys.error.message}Start the router with <code className="font-mono text-xs">-api-key</code> to enable tenant keys.</EmptyDescription>
+                    <EmptyDescription>
+                      Start the router with <code className="text-xs">-api-key</code> to manage tenant keys here.
+                    </EmptyDescription>
                   </EmptyHeader>
                 </Empty>
               )
               : rows.length === 0
                 ? (
-                  <Empty className="border-0 py-12">
+                  <Empty className="py-12">
                     <EmptyHeader>
                       <EmptyMedia variant="icon"><KeyRound /></EmptyMedia>
-                      <EmptyTitle>No tenant keys yet</EmptyTitle>
-                      <EmptyDescription>Create a key to let a client call the gateway with its own budget.</EmptyDescription>
+                      <EmptyTitle>No keys yet</EmptyTitle>
+                      <EmptyDescription>Create a key so a client can call the gateway with its own budget.</EmptyDescription>
                     </EmptyHeader>
                   </Empty>
                 )
                 : (
-                  <Table>
-                    <TableHeader>
-                      <TableRow className="hover:bg-transparent">
-                        {['Name', 'Prefix', 'Budget', 'Token limit', 'Created', 'Status', ''].map(head => (
-                          <TableHead key={head} className="px-4 text-xs font-normal text-muted-foreground">{head}</TableHead>
-                        ))}
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {rows.map(key => (
-                        <TableRow key={key.id} className="group/row">
-                          <TableCell className="px-4 py-2 font-medium">{key.name}</TableCell>
-                          <TableCell className="px-4 py-2"><code className="font-mono text-xs text-muted-foreground">{key.prefix}…</code></TableCell>
-                          <TableCell className="px-4 py-2 font-mono text-xs tabular text-muted-foreground">{format.budget(key.budget_usd)}</TableCell>
-                          <TableCell className="px-4 py-2 font-mono text-xs tabular text-muted-foreground">{format.limit(key.limit_token)}</TableCell>
-                          <TableCell className="px-4 py-2 font-mono text-xs tabular text-muted-foreground">{format.fullTime(key.created_at)}</TableCell>
-                          <TableCell className="px-4 py-2">
+                  <ul className="divide-y divide-border">
+                    {rows.map(key => (
+                      <li key={key.id} className="group/row flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
+                        <div className="grid min-w-40 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">{key.name}</span>
                             <Badge variant={key.revoked_at ? 'outline' : 'secondary'} className="font-normal">
                               {key.revoked_at ? 'Revoked' : 'Active'}
                             </Badge>
-                          </TableCell>
-                          <TableCell className="px-4 py-2 text-right">
-                            {!key.revoked_at && (
-                              <Button
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label={`Revoke ${key.name}`}
-                                className="opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
-                                onClick={() => setRevoking(key)}
-                              >
-                                <Trash2 className="size-3.5" />
-                              </Button>
-                            )}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+                          </div>
+                          <code className="text-xs text-muted-foreground">{key.prefix}…</code>
+                        </div>
+
+                        <div className="grid gap-0.5">
+                          <span className="text-xs text-muted-foreground">Monthly budget</span>
+                          <span className="text-sm tabular">{format.budget(key.budget_usd)}</span>
+                        </div>
+                        <div className="grid gap-0.5">
+                          <span className="text-xs text-muted-foreground">Token limit</span>
+                          <span className="text-sm tabular">{format.limit(key.limit_token)}</span>
+                        </div>
+                        <div className="hidden grid-cols-1 gap-0.5 sm:grid">
+                          <span className="text-xs text-muted-foreground">Created</span>
+                          <span className="text-sm">{format.fullTime(key.created_at)}</span>
+                        </div>
+
+                        {!key.revoked_at && (
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label={`Revoke ${key.name}`}
+                            className="ml-auto text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
+                            onClick={() => setRevoking(key)}
+                          >
+                            <Trash2 className="size-4" />
+                          </Button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
                 )}
         </CardContent>
       </Card>
@@ -122,6 +125,6 @@ function KeysPage() {
         onClose={() => setRevoking(null)}
         onConfirm={() => { if (revoking) revoke.mutate(revoking.id) }}
       />
-    </>
+    </div>
   )
 }
