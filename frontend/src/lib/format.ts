@@ -61,12 +61,6 @@ function localDateKey(at: Date) {
   return `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, '0')}-${String(at.getDate()).padStart(2, '0')}`
 }
 
-export function statusTone(status: number) {
-  if (status >= 500) return 'negative' as const
-  if (status >= 400) return 'warning' as const
-  return 'positive' as const
-}
-
 /** A short human label, so a table cell never needs a colour to be read. */
 export function statusLabel(status: number) {
   if (status >= 500) return 'Server error'

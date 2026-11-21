@@ -10,22 +10,18 @@ import {
 } from '@tanstack/react-table'
 import { ArrowDown, ArrowUp, ChevronsUpDown } from 'lucide-react'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Dot } from '@/components/status'
 import { useNewRowIds } from '@/hooks/use-live-logs'
-import { format, since, statusLabel, statusTone } from '@/lib/format'
+import { format, since, statusLabel } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import type { RequestLog } from '@/lib/api'
 
-const dotFor = { positive: 'positive', warning: 'warning', negative: 'negative' } as const
-
 /** A right-aligned figure, so tokens and latency line up in one column. */
-function Num({ value, muted = true, title }: { value: string; muted?: boolean; title?: string }) {
+function Num({ value, muted = true, title, className }: { value: string; muted?: boolean; title?: string; className?: string }) {
   return (
-    <span className={cn('tabular', muted ? 'text-muted-foreground' : 'text-foreground')} title={title}>
+    <span className={cn('tabular', muted ? 'text-muted-foreground' : 'text-foreground', className)} title={title}>
       {value}
     </span>
   )
@@ -65,11 +61,16 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10, detailed 
         header: 'Status',
         cell: ({ getValue }) => {
           const status = getValue<number>()
+          // The code itself is the label. A success needs no colour: four
+          // hundred of them in a row should look like a tidy column of numbers,
+          // and only a failure earns attention.
           return (
-            <span className="inline-flex items-center gap-2 text-sm">
-              <Dot tone={dotFor[statusTone(status)]} />
-              {statusLabel(status)}
-            </span>
+            <Num
+              value={String(status)}
+              muted={status < 400}
+              className={status >= 400 ? 'text-negative' : undefined}
+              title={statusLabel(status)}
+            />
           )
         },
       },
@@ -165,7 +166,7 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10, detailed 
     )
   }
 
-  const shown = table.getFilteredRowModel().rows.slice(0, pageSize)
+  const shown = table.getRowModel().rows.slice(0, pageSize)
   const cellPad = detailed ? 'px-3' : 'px-4'
 
   return (
@@ -189,20 +190,23 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10, detailed 
               {group.headers.map(header => (
                 <TableHead
                   key={header.id}
-                  className={cn(cellPad, 'text-xs font-normal text-muted-foreground', header.column.id !== 'model' && 'text-right')}
+                  className={cn(cellPad, 'h-9 select-none text-xs font-normal text-muted-foreground', header.column.id !== 'model' && 'text-right')}
                 >
                   {header.column.getCanSort() ? (
-                    <Button
-                      variant="ghost"
-                      size="xs"
-                      className={cn('gap-1 px-2 font-normal text-muted-foreground', header.column.id === 'model' ? '-ml-2' : '-mr-2 ml-auto')}
+                    <button
+                      type="button"
+                      className={cn(
+                        'inline-flex h-7 cursor-pointer items-center gap-1 rounded px-2 font-normal text-muted-foreground transition-colors select-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+                        header.column.id === 'model' ? '-ml-2' : '-mr-2 ml-auto',
+                      )}
                       onClick={header.column.getToggleSortingHandler()}
+                      aria-label={`Sort by ${String(header.column.columnDef.header)}`}
                     >
                       {flexRender(header.column.columnDef.header, header.getContext())}
                       {header.column.getIsSorted() === 'asc' ? <ArrowUp className="size-3" />
                         : header.column.getIsSorted() === 'desc' ? <ArrowDown className="size-3" />
                           : <ChevronsUpDown className="size-3 opacity-40" />}
-                    </Button>
+                    </button>
                   ) : flexRender(header.column.columnDef.header, header.getContext())}
                 </TableHead>
               ))}
