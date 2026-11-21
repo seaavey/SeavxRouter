@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -20,12 +19,13 @@ import (
 const (
 	// logRetention bounds the request log table to the newest entries.
 	logRetention = 1000
-	// maxLogBody caps captured response bodies. Request bodies are never read
-	// or persisted: they dwarf everything else in the DB.
-	maxLogBody = 10 << 20
+	// maxErrorLength caps the stored failure message. Response bodies are not
+	// kept at all: they dominated the database and nobody read them twice.
+	maxErrorLength = 500
 )
 
-// RequestLog is one captured API request with its response and token usage.
+// RequestLog is one captured API request with its token usage. Bodies are not
+// stored; only a short failure message, when the request failed.
 type RequestLog struct {
 	ID         string
 	TS         string
@@ -37,8 +37,7 @@ type RequestLog struct {
 	Status     int
 	DurationMS int64
 	Stream     bool
-	Request    string
-	Response   string
+	Error      string
 	backend.Usage
 }
 
@@ -53,8 +52,7 @@ const requestLogSchema = `CREATE TABLE IF NOT EXISTS request_logs (
 	status INTEGER NOT NULL DEFAULT 0,
 	duration_ms INTEGER NOT NULL DEFAULT 0,
 	stream INTEGER NOT NULL DEFAULT 0,
-	request TEXT NOT NULL DEFAULT '',
-	response TEXT NOT NULL DEFAULT '',
+	error TEXT NOT NULL DEFAULT '',
 	prompt_tokens INTEGER NOT NULL DEFAULT 0,
 	completion_tokens INTEGER NOT NULL DEFAULT 0,
 	thinking_tokens INTEGER NOT NULL DEFAULT 0,
@@ -72,13 +70,13 @@ func (s *UsageStore) RecordLog(e RequestLog) error {
 }
 
 const insertRequestLogSQL = `INSERT INTO request_logs (id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
-	request, response, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens)
- VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	error, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func insertRequestLog(db execer, e *RequestLog) error {
 	_, err := db.Exec(insertRequestLogSQL,
 		e.ID, e.TS, e.Endpoint, e.Provider, e.Model, e.Account, e.User, e.Status, e.DurationMS, e.Stream,
-		e.Request, e.Response,
+		e.Error,
 		e.InputTokens, e.OutputTokens, e.ThinkingTokens, e.CacheReadTokens, e.TotalTokens,
 	)
 	return err
@@ -88,17 +86,17 @@ const pruneRequestLogsSQL = `DELETE FROM request_logs WHERE rowid IN
 	(SELECT rowid FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?)`
 
 const requestLogColumns = `id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
-	request, response, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens`
+	error, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens`
 
 func scanRequestLog(row interface{ Scan(...any) error }) (RequestLog, error) {
 	var e RequestLog
 	err := row.Scan(&e.ID, &e.TS, &e.Endpoint, &e.Provider, &e.Model, &e.Account, &e.User,
-		&e.Status, &e.DurationMS, &e.Stream, &e.Request, &e.Response,
+		&e.Status, &e.DurationMS, &e.Stream, &e.Error,
 		&e.InputTokens, &e.OutputTokens, &e.ThinkingTokens, &e.CacheReadTokens, &e.TotalTokens)
 	return e, err
 }
 
-// QueryLogs returns the newest logs first, including request and response bodies.
+// QueryLogs returns the newest logs first.
 func (s *UsageStore) QueryLogs(limit, offset int) ([]RequestLog, error) {
 	if err := s.Flush(); err != nil {
 		return nil, err
@@ -123,44 +121,13 @@ func (s *UsageStore) QueryLogs(limit, offset int) ([]RequestLog, error) {
 	return out, rows.Err()
 }
 
-// LogSummary is a list row: request/response bodies are replaced by their sizes
-// so a dozen screenshot-sized bodies do not dominate the response payload.
-type LogSummary struct {
-	RequestLog
-	RequestBytes  int64
-	ResponseBytes int64
-}
+// LogSummary is the list row the dashboard renders. Bodies are no longer
+// stored, so it carries no size fields.
+type LogSummary = RequestLog
 
-const requestLogSummaryColumns = `id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
-	length(CAST(request AS BLOB)), length(CAST(response AS BLOB)),
-	prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens`
-
-// QueryLogSummaries returns the newest logs first without body payloads.
+// QueryLogSummaries returns the newest logs first.
 func (s *UsageStore) QueryLogSummaries(limit, offset int) ([]LogSummary, error) {
-	if err := s.Flush(); err != nil {
-		return nil, err
-	}
-	rows, err := s.db.Query(
-		"SELECT "+requestLogSummaryColumns+" FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
-		limit, offset,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []LogSummary{}
-	for rows.Next() {
-		var e LogSummary
-		err := rows.Scan(&e.ID, &e.TS, &e.Endpoint, &e.Provider, &e.Model, &e.Account, &e.User,
-			&e.Status, &e.DurationMS, &e.Stream, &e.RequestBytes, &e.ResponseBytes,
-			&e.InputTokens, &e.OutputTokens, &e.ThinkingTokens, &e.CacheReadTokens, &e.TotalTokens)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
+	return s.QueryLogs(limit, offset)
 }
 
 // QueryLog returns one log by ID; (nil, nil) when it does not exist.
@@ -209,16 +176,7 @@ func logFailure(r *http.Request, status int, err error) {
 	if entry == nil {
 		return
 	}
-	entry.statusOverride = status
-	if entry.Response != "" {
-		return
-	}
-	data, mErr := json.Marshal(map[string]any{
-		"error": map[string]any{"message": err.Error(), "type": "backend_error"},
-	})
-	if mErr == nil {
-		entry.Response = string(data)
-	}
+	entry.SetError(status, err.Error())
 }
 
 // SetRequestMeta records the model and streaming mode parsed by the handler.
@@ -238,53 +196,51 @@ func (e *logEntry) SetAccount(account string) {
 	e.Account = account
 }
 
-// SetUsage stores the token accounting reported for the request.
+// SetUsage stores the token accounting reported for the request. Input is kept
+// net of the cached prefix, matching what the usage ledger stores, so the two
+// views never disagree.
 func (e *logEntry) SetUsage(u backend.Usage) {
+	cached := min(u.CacheReadTokens, u.InputTokens)
+	u.InputTokens -= cached
+	u.CacheReadTokens = cached
 	e.Usage = u
 }
 
-// SetResult stores the response body captured from the completed chat result.
+// SetResult is kept so the completions package can report a finished result;
+// the body itself is not stored, only the failure message is.
 func (e *logEntry) SetResult(content string, toolCalls []backend.ToolCall, finishReason string) {
-	if e.Response != "" {
-		return
-	}
-	resp := struct {
-		Content      string             `json:"content,omitempty"`
-		ToolCalls    []backend.ToolCall `json:"tool_calls,omitempty"`
-		FinishReason string             `json:"finish_reason,omitempty"`
-	}{Content: content, ToolCalls: toolCalls, FinishReason: finishReason}
-	if b, err := json.Marshal(resp); err == nil {
-		e.Response = string(b)
-	}
 }
 
 // SetError marks the log entry failed with the upstream status and message.
 func (e *logEntry) SetError(status int, message string) {
 	e.statusOverride = status
-	if e.Response != "" {
+	if e.Error != "" {
 		return
 	}
-	data, err := json.Marshal(map[string]any{
-		"error": map[string]any{"message": message, "type": "backend_error"},
-	})
-	if err == nil {
-		e.Response = string(data)
-	}
+	e.Error = truncateError(message)
 }
 
-// logResponseWriter records status and buffered body (non-stream only).
+// truncateError keeps only the opening of a failure message, which is where the
+// useful part lives.
+func truncateError(message string) string {
+	message = strings.TrimSpace(message)
+	if len(message) <= maxErrorLength {
+		return message
+	}
+	return message[:maxErrorLength] + "…"
+}
+
+// logResponseWriter records the status code so the log reports what was sent.
+// Bodies are not stored; a failed response keeps a short prefix in memory only
+// long enough to pull its error message out.
 type logResponseWriter struct {
 	http.ResponseWriter
-	status  int
-	body    bytes.Buffer
-	capture bool
+	status int
+	tail   []byte
 }
 
 func (w *logResponseWriter) WriteHeader(status int) {
 	w.status = status
-	if strings.HasPrefix(w.Header().Get("Content-Type"), "text/event-stream") {
-		w.capture = false
-	}
 	w.ResponseWriter.WriteHeader(status)
 }
 
@@ -292,12 +248,12 @@ func (w *logResponseWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	if w.capture && w.body.Len() < maxLogBody {
-		n := maxLogBody - w.body.Len()
-		if n > len(b) {
-			n = len(b)
+	if w.status >= 400 && len(w.tail) < maxErrorLength {
+		room := maxErrorLength - len(w.tail)
+		if room > len(b) {
+			room = len(b)
 		}
-		w.body.Write(b[:n])
+		w.tail = append(w.tail, b[:room]...)
 	}
 	return w.ResponseWriter.Write(b)
 }
@@ -308,23 +264,40 @@ func (w *logResponseWriter) Flush() {
 	}
 }
 
-// logged captures the final status and, for completion endpoints, the
-// structured result recorded by the handler. Request bodies are never read
-// here; handlers report the model and stream flag via SetRequestMeta.
+// errorMessage pulls the message out of an error response body. Providers and
+// the gateway both answer with {"error":{"message":"…"}}, but a plain string is
+// accepted too so nothing is lost when the shape differs.
+func (w *logResponseWriter) errorMessage() string {
+	if len(w.tail) == 0 {
+		return ""
+	}
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.tail, &body); err == nil && body.Error.Message != "" {
+		return body.Error.Message
+	}
+	return strings.TrimSpace(string(w.tail))
+}
+
+// logged captures the final status, the model reported by the handler, and the
+// message of a failed response. Request and response bodies are never stored.
 func (s *Server) logged(endpoint string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		entry := &logEntry{
 			RequestLog: RequestLog{ID: backend.UUID(), Endpoint: endpoint, User: usageUser(r)},
 			started:    time.Now(),
 		}
-		lw := &logResponseWriter{ResponseWriter: w, capture: true}
+		lw := &logResponseWriter{ResponseWriter: w}
 		next(lw, r.WithContext(withUser(context.WithValue(r.Context(), logKey{}, entry), r)))
 		entry.Status = lw.status
 		if entry.statusOverride != 0 {
 			entry.Status = entry.statusOverride
 		}
-		if entry.Response == "" && lw.body.Len() > 0 {
-			entry.Response = lw.body.String()
+		if entry.Error == "" && entry.Status >= 400 {
+			entry.Error = truncateError(lw.errorMessage())
 		}
 		if entry.Provider == "" && entry.Model != "" {
 			entry.Provider = s.ownerOf(r.Context(), entry.Model)
@@ -412,17 +385,7 @@ func requestLogMeta(e RequestLog) map[string]any {
 }
 
 func requestLogView(e RequestLog) map[string]any {
-	v := requestLogMeta(e)
-	v["request"] = rawOrString(e.Request)
-	v["response"] = rawOrString(e.Response)
-	return v
-}
-
-func requestLogSummaryView(e LogSummary) map[string]any {
-	v := requestLogMeta(e.RequestLog)
-	v["request_bytes"] = e.RequestBytes
-	v["response_bytes"] = e.ResponseBytes
-	return v
+	return requestLogMeta(e)
 }
 
 func (s *Server) handleLogging(w http.ResponseWriter, r *http.Request) {
@@ -454,27 +417,17 @@ func (s *Server) handleLogging(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &apiError{http.StatusBadRequest, `invalid include (want "all")`, "invalid_request_error", "invalid_include"})
 		return
 	}
-	data := []map[string]any{}
-	if include == "all" {
-		logs, err := s.usage.QueryLogs(limit, offset)
-		if err != nil {
-			slog.Warn("log query failed", "err", err)
-			writeError(w, &apiError{http.StatusInternalServerError, "log query failed", "server_error", "log_query_failed"})
-			return
-		}
-		for _, e := range logs {
-			data = append(data, requestLogView(e))
-		}
-	} else {
-		logs, err := s.usage.QueryLogSummaries(limit, offset)
-		if err != nil {
-			slog.Warn("log query failed", "err", err)
-			writeError(w, &apiError{http.StatusInternalServerError, "log query failed", "server_error", "log_query_failed"})
-			return
-		}
-		for _, e := range logs {
-			data = append(data, requestLogSummaryView(e))
-		}
+	// Bodies are no longer stored, so `include` changes nothing; it is still
+	// accepted so older clients keep working.
+	logs, err := s.usage.QueryLogs(limit, offset)
+	if err != nil {
+		slog.Warn("log query failed", "err", err)
+		writeError(w, &apiError{http.StatusInternalServerError, "log query failed", "server_error", "log_query_failed"})
+		return
+	}
+	data := make([]map[string]any, 0, len(logs))
+	for _, e := range logs {
+		data = append(data, requestLogView(e))
 	}
 	writeJSON(w, map[string]any{
 		"object":       "logging",
@@ -524,16 +477,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request, valid func()
 			if valid != nil && !valid() {
 				return
 			}
-			var view map[string]any
-			if include == "all" {
-				view = requestLogView(e)
-			} else {
-				view = requestLogSummaryView(LogSummary{
-					RequestLog:    e,
-					RequestBytes:  int64(len(e.Request)),
-					ResponseBytes: int64(len(e.Response)),
-				})
-			}
+			view := requestLogView(e)
 			data, _ := json.Marshal(view)
 			fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
 			flusher.Flush()

@@ -22,61 +22,119 @@ import type { RequestLog } from '@/lib/api'
 
 const dotFor = { positive: 'positive', warning: 'warning', negative: 'negative' } as const
 
+/** A right-aligned figure, so tokens and latency line up in one column. */
+function Num({ value, muted = true, title }: { value: string; muted?: boolean; title?: string }) {
+  return (
+    <span className={cn('tabular', muted ? 'text-muted-foreground' : 'text-foreground')} title={title}>
+      {value}
+    </span>
+  )
+}
+
 /**
- * Recent requests, kept to four columns: what ran, whether it worked, how long
- * it took, and when. Provider, endpoint and token counts live in the detail
- * panel so the row stays scannable.
+ * Requests table. The overview shows four scannable columns; `/requests` adds
+ * the per-request token breakdown (input, output, cache, total) as separate
+ * sortable columns, since that is the question that page is opened to answer.
  */
-export function RequestTable({ rows, loading, onSelect, pageSize = 10 }: {
+export function RequestTable({ rows, loading, onSelect, pageSize = 10, detailed = false }: {
   rows: RequestLog[]
   loading?: boolean
   onSelect?: (row: RequestLog) => void
   pageSize?: number
+  detailed?: boolean
 }) {
   const [sorting, setSorting] = useState<SortingState>([])
   const [filter, setFilter] = useState('')
 
-  const columns = useMemo<ColumnDef<RequestLog>[]>(() => [
-    {
-      accessorKey: 'model',
-      header: 'Request',
-      cell: ({ row }) => (
-        <div className="grid gap-0.5">
-          <span className="text-sm font-medium">{row.original.model || 'Unnamed model'}</span>
-          <span className="text-xs text-muted-foreground">
-            {[row.original.provider, row.original.endpoint].filter(Boolean).join(' · ') || 'no provider recorded'}
-          </span>
-        </div>
-      ),
-    },
-    {
-      accessorKey: 'status',
-      header: 'Status',
-      cell: ({ getValue }) => {
-        const status = getValue<number>()
-        return (
-          <span className="inline-flex items-center gap-2 text-sm">
-            <Dot tone={dotFor[statusTone(status)]} />
-            {statusLabel(status)}
-          </span>
-        )
+  const columns = useMemo<ColumnDef<RequestLog>[]>(() => {
+    const base: ColumnDef<RequestLog>[] = [
+      {
+        accessorKey: 'model',
+        header: 'Request',
+        cell: ({ row }) => (
+          <div className="grid gap-0.5">
+            <span className="text-sm font-medium">{row.original.model || 'Unnamed model'}</span>
+            <span className="text-xs text-muted-foreground">
+              {[row.original.provider, row.original.endpoint].filter(Boolean).join(' · ') || 'no provider recorded'}
+            </span>
+          </div>
+        ),
       },
-    },
-    {
-      accessorKey: 'duration_ms',
-      header: 'Latency',
-      cell: ({ getValue }) => <span className="text-sm tabular text-muted-foreground">{format.latency(getValue<number>())}</span>,
-    },
-    {
-      accessorKey: 'timestamp',
-      header: 'Time',
-      cell: ({ getValue }) => (
-        <span className="text-sm text-muted-foreground" title={since(getValue<string>())}>
-          {format.time(getValue<string>())}
-        </span>
-      ),
-    },
-  ], [])
+      {
+        accessorKey: 'status',
+        header: 'Status',
+        cell: ({ getValue }) => {
+          const status = getValue<number>()
+          return (
+            <span className="inline-flex items-center gap-2 text-sm">
+              <Dot tone={dotFor[statusTone(status)]} />
+              {statusLabel(status)}
+            </span>
+          )
+        },
+      },
+    ]
+
+    const tokens: ColumnDef<RequestLog>[] = detailed
+      ? [
+          {
+            id: 'input',
+            accessorFn: row => row.usage.prompt_tokens,
+            header: 'Input',
+            cell: ({ getValue }) => <Num value={format.count(getValue<number>())} title="Prompt tokens" />,
+          },
+          {
+            id: 'output',
+            accessorFn: row => row.usage.completion_tokens,
+            header: 'Output',
+            cell: ({ getValue }) => <Num value={format.count(getValue<number>())} title="Completion tokens" />,
+          },
+          {
+            id: 'cached',
+            accessorFn: row => row.usage.cached_tokens,
+            header: 'Cache',
+            cell: ({ getValue }) => {
+              const cached = getValue<number>()
+              return cached > 0
+                ? <Num value={format.count(cached)} title="Tokens served from the provider cache" />
+                : <span className="text-muted-foreground/50">—</span>
+            },
+          },
+          {
+            id: 'total',
+            accessorFn: row => row.usage.total_tokens,
+            header: 'Total',
+            cell: ({ getValue }) => <Num value={format.count(getValue<number>())} muted={false} />,
+          },
+        ]
+      : [
+          {
+            id: 'total',
+            accessorFn: row => row.usage.total_tokens,
+            header: 'Tokens',
+            cell: ({ getValue }) => <Num value={format.count(getValue<number>())} />,
+          },
+        ]
+
+    return [
+      ...base,
+      ...tokens,
+      {
+        accessorKey: 'duration_ms',
+        header: 'Latency',
+        cell: ({ getValue }) => <Num value={format.latency(getValue<number>())} />,
+      },
+      {
+        accessorKey: 'timestamp',
+        header: 'Time',
+        cell: ({ getValue }) => (
+          <span className="text-sm whitespace-nowrap text-muted-foreground" title={since(getValue<string>())}>
+            {format.time(getValue<string>())}
+          </span>
+        ),
+      },
+    ]
+  }, [detailed])
 
   const table = useReactTable({
     data: rows,
@@ -108,6 +166,7 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10 }: {
   }
 
   const shown = table.getFilteredRowModel().rows.slice(0, pageSize)
+  const cellPad = detailed ? 'px-3' : 'px-4'
 
   return (
     <div>
@@ -128,12 +187,15 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10 }: {
           {table.getHeaderGroups().map(group => (
             <TableRow key={group.id} className="hover:bg-transparent">
               {group.headers.map(header => (
-                <TableHead key={header.id} className="px-4 text-xs font-normal text-muted-foreground">
+                <TableHead
+                  key={header.id}
+                  className={cn(cellPad, 'text-xs font-normal text-muted-foreground', header.column.id !== 'model' && 'text-right')}
+                >
                   {header.column.getCanSort() ? (
                     <Button
                       variant="ghost"
                       size="xs"
-                      className="-ml-2 gap-1 px-2 font-normal text-muted-foreground"
+                      className={cn('gap-1 px-2 font-normal text-muted-foreground', header.column.id === 'model' ? '-ml-2' : '-mr-2 ml-auto')}
                       onClick={header.column.getToggleSortingHandler()}
                     >
                       {flexRender(header.column.columnDef.header, header.getContext())}
@@ -162,7 +224,10 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10 }: {
               className={cn(onSelect && 'cursor-pointer', fresh.has(row.original.id) && 'row-enter')}
             >
               {row.getVisibleCells().map(cell => (
-                <TableCell key={cell.id} className="px-4 py-3">
+                <TableCell
+                  key={cell.id}
+                  className={cn(cellPad, 'py-3', cell.column.id !== 'model' && 'text-right text-sm')}
+                >
                   {flexRender(cell.column.columnDef.cell, cell.getContext())}
                 </TableCell>
               ))}

@@ -5,7 +5,6 @@ import { PageHeader } from '@/components/page-header'
 import { RequestTable } from '@/components/request-table'
 import { RequestDetail } from '@/features/requests/request-detail'
 import { VolumeChart } from '@/components/volume-chart'
-import { StatusLabel } from '@/components/status'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -15,7 +14,6 @@ import { useLiveLogs } from '@/hooks/use-live-logs'
 import { logsQuery, usageQuery } from '@/lib/queries'
 import { format } from '@/lib/format'
 import type { RequestLog } from '@/lib/api'
-import type { StreamStatus } from '@/hooks/use-live-logs'
 
 export const Route = createFileRoute('/_app/')({
   validateSearch: (search: Record<string, unknown>): { days?: number } => ({
@@ -24,21 +22,14 @@ export const Route = createFileRoute('/_app/')({
   component: OverviewPage,
 })
 
-const streamCopy: Record<StreamStatus, { tone: 'positive' | 'muted' | 'warning' | 'negative'; label: string }> = {
-  connecting: { tone: 'muted', label: 'Connecting' },
-  live: { tone: 'positive', label: 'Live' },
-  reconnecting: { tone: 'warning', label: 'Reconnecting' },
-  unavailable: { tone: 'negative', label: 'Updates paused' },
-}
-
 function OverviewPage() {
   const { days: selectedDays } = Route.useSearch()
   const days = selectedDays ?? 7
   const navigate = useNavigate({ from: Route.fullPath })
   const usage = useQuery(usageQuery(days))
   const logs = useQuery(logsQuery(0, 8))
-  const { status: streamStatus } = useLiveLogs()
-  const stream = streamCopy[streamStatus]
+  // Keeps the table fresh; the feed has no UI of its own.
+  useLiveLogs()
   const [selected, setSelected] = useState<RequestLog | null>(null)
 
   return (
@@ -112,12 +103,9 @@ function OverviewPage() {
               <CardTitle>Latest requests</CardTitle>
               <CardDescription>The newest traffic this gateway recorded.</CardDescription>
             </div>
-            <div className="flex items-center gap-3">
-              <StatusLabel tone={stream.tone}>{stream.label}</StatusLabel>
-              <Button variant="outline" size="sm" asChild>
-                <Link to="/requests">View all</Link>
-              </Button>
-            </div>
+            <Button variant="outline" size="sm" asChild>
+              <Link to="/requests">View all</Link>
+            </Button>
           </div>
         </CardHeader>
         <CardContent className="px-0">

@@ -1,5 +1,5 @@
 import { queryOptions } from '@tanstack/react-query'
-import { api, type Model, type ProviderQuota, type RequestLog, type RequestLogDetail, type Session, type TenantKey, type Usage } from './api'
+import { api, type Model, type ProviderQuota, type RequestLog, type Session, type TenantKey, type Usage } from './api'
 
 /** One place for every query key, so invalidation stays honest. */
 export const keys = {
@@ -7,7 +7,6 @@ export const keys = {
   health: ['health'] as const,
   usage: (days: number) => ['usage', days] as const,
   logs: (offset: number) => ['logs', offset] as const,
-  log: (id: string) => ['log', id] as const,
   providers: ['providers'] as const,
   models: ['models'] as const,
   tenantKeys: ['tenant-keys'] as const,
@@ -44,13 +43,6 @@ export const logsQuery = (offset: number, limit: number) =>
     queryKey: keys.logs(offset),
     queryFn: ({ signal }) => api<{ data: RequestLog[] }>(`/dashboard/api/logging?limit=${limit}&offset=${offset}`, { signal }).then(value => value.data ?? []),
     staleTime: 10_000,
-  })
-
-export const logQuery = (id: string) =>
-  queryOptions({
-    queryKey: keys.log(id),
-    queryFn: ({ signal }) => api<RequestLogDetail>(`/dashboard/api/logging/${encodeURIComponent(id)}`, { signal }),
-    staleTime: 60_000,
   })
 
 export const providersQuery = queryOptions({

@@ -24,14 +24,10 @@ export interface RequestLog {
   status: number
   duration_ms: number
   stream: boolean
+  /** Failure message, empty when the request succeeded. Bodies are not stored. */
+  error?: string
+  /** prompt_tokens is net of cached_tokens: they never overlap. */
   usage: { prompt_tokens: number; completion_tokens: number; thinking_tokens: number; cached_tokens: number; total_tokens: number }
-  request_bytes?: number
-  response_bytes?: number
-}
-
-export interface RequestLogDetail extends RequestLog {
-  request?: unknown
-  response?: unknown
 }
 
 export interface ProviderAccount {

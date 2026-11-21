@@ -178,12 +178,9 @@ func testSnapshot() Snapshot {
 			SavedPercent: 93.3, EstTokensSaved: 14000,
 		},
 		Recent: []httpapi.LogSummary{{
-			RequestLog: httpapi.RequestLog{
-				ID: "log_1", TS: "2026-11-13T10:00:00Z", Endpoint: "chat",
-				Model: "claude-sonnet-4-6", User: "alice", Status: 200,
-				DurationMS: 1234, Usage: backend.Usage{TotalTokens: 1579},
-			},
-			RequestBytes: 100,
+			ID: "log_1", TS: "2026-11-13T10:00:00Z", Endpoint: "chat",
+			Model: "claude-sonnet-4-6", User: "alice", Status: 200,
+			DurationMS: 1234, Usage: backend.Usage{TotalTokens: 1579},
 		}},
 		Live:     true,
 		LiveNote: "sse live",
@@ -237,10 +234,10 @@ func TestRenderEmpty(t *testing.T) {
 
 func TestPrependRecent(t *testing.T) {
 	list := []httpapi.LogSummary{
-		{RequestLog: httpapi.RequestLog{ID: "a"}},
-		{RequestLog: httpapi.RequestLog{ID: "b"}},
+		{ID: "a"},
+		{ID: "b"},
 	}
-	out := prependRecent(list, httpapi.LogSummary{RequestLog: httpapi.RequestLog{ID: "b"}})
+	out := prependRecent(list, httpapi.LogSummary{ID: "b"})
 	if len(out) != 2 || out[0].ID != "b" || out[1].ID != "a" {
 		t.Fatalf("prependRecent = %+v", out)
 	}
@@ -333,9 +330,6 @@ func TestStreamLogs(t *testing.T) {
 	}
 	if e.InputTokens != 5 || e.OutputTokens != 2 || e.TotalTokens != 7 || e.CacheReadTokens != 3 {
 		t.Fatalf("usage = %+v", e.Usage)
-	}
-	if e.RequestBytes != 10 || e.ResponseBytes != 20 {
-		t.Fatalf("bytes = %+v", e)
 	}
 }
 

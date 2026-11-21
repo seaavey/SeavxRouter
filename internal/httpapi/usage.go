@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -197,6 +196,10 @@ func OpenUsageStore(path string) (*UsageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrating request log table: %w", err)
 	}
+	if err := migrateRequestLogs(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("dropping stored request bodies: %w", err)
+	}
 	if _, err := db.Exec(compressionSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating compression table: %w", err)
@@ -246,6 +249,80 @@ func (s *UsageStore) Close() error {
 // tracking existed.
 func ensureUsageCostColumn(db *sql.DB) error {
 	return ensureColumn(db, "usage", "cost_usd", "ALTER TABLE usage ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0")
+}
+
+// migrateRequestLogs drops the stored bodies from an older request_logs table
+// and adds the error column. Bodies dominated the file, so the table is rebuilt
+// once instead of keeping dead columns forever.
+func migrateRequestLogs(db *sql.DB) error {
+	columns, err := tableColumns(db, "request_logs")
+	if err != nil {
+		return err
+	}
+	_, hasRequest := columns["request"]
+	_, hasResponse := columns["response"]
+	if !hasRequest && !hasResponse {
+		return ensureColumn(db, "request_logs", "error", "ALTER TABLE request_logs ADD COLUMN error TEXT NOT NULL DEFAULT ''")
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// SQLite resolves table names at parse time, so the old table is renamed
+	// aside first and the surviving columns are copied into the fresh one.
+	if _, err := tx.Exec(`ALTER TABLE request_logs RENAME TO request_logs_old`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(requestLogSchema); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO request_logs (id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
+		error, prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens)
+		SELECT id, ts, endpoint, provider, model, account, user, status, duration_ms, stream,
+		'', prompt_tokens, completion_tokens, thinking_tokens, cached_tokens, total_tokens FROM request_logs_old`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE request_logs_old`); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// The freed pages stay in the file until the database is rebuilt, which is
+	// the whole point of dropping the bodies: give the space back.
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		// A busy database cannot vacuum; the space returns on the next open.
+		slog.Warn("could not vacuum usage database after dropping request bodies", "err", err)
+	}
+	return nil
+}
+
+// tableColumns lists a table's column names so a migration can test for them.
+func tableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := map[string]struct{}{}
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notnull int
+			dflt    any
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = struct{}{}
+	}
+	return columns, rows.Err()
 }
 
 // ensureColumn adds column to table when the table predates it.
@@ -645,14 +722,6 @@ func (s *Server) recordResult(r *http.Request, endpoint, model string, result *b
 		entry.Model = model
 		entry.Provider = s.ownerOf(r.Context(), model)
 		entry.Usage = u
-		resp := struct {
-			Content      string             `json:"content,omitempty"`
-			ToolCalls    []backend.ToolCall `json:"tool_calls,omitempty"`
-			FinishReason string             `json:"finish_reason,omitempty"`
-		}{Content: result.Content, ToolCalls: result.ToolCalls, FinishReason: result.FinishReason}
-		if b, err := json.Marshal(resp); err == nil {
-			entry.Response = string(b)
-		}
 	}
 	if s.usage == nil {
 		return
@@ -661,15 +730,19 @@ func (s *Server) recordResult(r *http.Request, endpoint, model string, result *b
 	if total == 0 {
 		total = u.InputTokens + u.OutputTokens
 	}
+	// Providers report input tokens inclusive of the cached prefix. Store the
+	// uncached part so the figure is what you actually paid full price for, and
+	// cached_tokens carries the rest.
+	cached := min(u.CacheReadTokens, u.InputTokens)
 	e := UsageEntry{
 		Provider:         s.ownerOf(r.Context(), model),
 		Model:            model,
 		Endpoint:         endpoint,
 		User:             usageUser(r),
-		PromptTokens:     u.InputTokens,
+		PromptTokens:     u.InputTokens - cached,
 		CompletionTokens: u.OutputTokens,
 		ThinkingTokens:   u.ThinkingTokens,
-		CachedTokens:     u.CacheReadTokens,
+		CachedTokens:     cached,
 		TotalTokens:      total,
 		CostUSD:          s.pricing.Load().Cost(model, u),
 	}

@@ -2,16 +2,13 @@ import { useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { keyPrefix, keys } from '@/lib/queries'
 
-export type StreamStatus = 'connecting' | 'live' | 'reconnecting' | 'unavailable'
-
 /**
  * Tails the router's SSE log feed and refreshes what it can stale. Bursts are
  * batched so a fast request stream does not refetch on every event, and the
- * event count lets the UI show that something actually arrived.
+ * event count lets the UI react to something actually arriving.
  */
 export function useLiveLogs(enabled = true) {
   const queryClient = useQueryClient()
-  const [status, setStatus] = useState<StreamStatus>('connecting')
   const [events, setEvents] = useState(0)
   const dirty = useRef(false)
 
@@ -20,7 +17,6 @@ export function useLiveLogs(enabled = true) {
     const source = new EventSource('/dashboard/api/logging/stream')
 
     source.addEventListener('ready', () => {
-      setStatus('live')
       // The router does not replay events missed while disconnected.
       dirty.current = true
       setEvents(count => count + 1)
@@ -32,8 +28,9 @@ export function useLiveLogs(enabled = true) {
     })
 
     source.onerror = () => {
-      setStatus(source.readyState === EventSource.CLOSED ? 'unavailable' : 'reconnecting')
-      void queryClient.invalidateQueries({ queryKey: keys.session })
+      if (source.readyState === EventSource.CLOSED) {
+        void queryClient.invalidateQueries({ queryKey: keys.session })
+      }
     }
 
     const timer = window.setInterval(() => {
@@ -49,7 +46,7 @@ export function useLiveLogs(enabled = true) {
     }
   }, [enabled, queryClient])
 
-  return { status, events }
+  return { events }
 }
 
 /**
