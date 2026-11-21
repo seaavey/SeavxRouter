@@ -37,7 +37,8 @@ function OverviewPage() {
   const navigate = useNavigate({ from: Route.fullPath })
   const usage = useQuery(usageQuery(days))
   const logs = useQuery(logsQuery(0, 8))
-  const stream = streamCopy[useLiveLogs()]
+  const { status: streamStatus } = useLiveLogs()
+  const stream = streamCopy[streamStatus]
   const [selected, setSelected] = useState<RequestLog | null>(null)
 
   return (

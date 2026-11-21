@@ -39,7 +39,8 @@ function RequestsPage() {
   const logs = useQuery(logsQuery(offset, PAGE_SIZE))
   const [selected, setSelected] = useState<RequestLog | null>(null)
   // Older pages stay stable while you read them; only page one follows the feed.
-  const stream = streamCopy[useLiveLogs(page === 1)]
+  const { status: streamStatus } = useLiveLogs(page === 1)
+  const stream = streamCopy[streamStatus]
 
   const rows = logs.data ?? []
   const hasNext = rows.length === PAGE_SIZE

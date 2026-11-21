@@ -19,6 +19,7 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { StatusLabel } from '@/components/status'
+import { ThemeToggle } from '@/components/theme-toggle'
 import { ChangePasswordDialog } from '@/features/auth/change-password-dialog'
 import { healthQuery } from '@/lib/queries'
 import { cn } from '@/lib/utils'
@@ -115,6 +116,7 @@ export function AppShell({ signingOut, onSignOut }: { signingOut: boolean; onSig
           </nav>
           <div className="ml-auto flex items-center gap-1">
             <GatewayStatus />
+            <ThemeToggle />
             <Button variant="ghost" size="icon-sm" aria-label="Refresh" onClick={() => queryClient.invalidateQueries()}>
               <RefreshCw className={cn('size-4', refreshing && 'animate-spin')} />
             </Button>

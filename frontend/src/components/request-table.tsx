@@ -15,6 +15,7 @@ import { Input } from '@/components/ui/input'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Dot } from '@/components/status'
+import { useNewRowIds } from '@/hooks/use-live-logs'
 import { format, since, statusLabel, statusTone } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import type { RequestLog } from '@/lib/api'
@@ -88,6 +89,9 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10 }: {
     getFilteredRowModel: getFilteredRowModel(),
   })
 
+  // New ids animate in; the hook runs before any early return so the order holds.
+  const fresh = useNewRowIds(rows.map(row => row.id))
+
   if (loading) {
     return <div className="grid gap-2 p-4">{Array.from({ length: 5 }, (_, index) => <Skeleton key={index} className="h-11 w-full" />)}</div>
   }
@@ -155,7 +159,7 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10 }: {
                   onSelect(row.original)
                 }
               } : undefined}
-              className={cn(onSelect && 'cursor-pointer')}
+              className={cn(onSelect && 'cursor-pointer', fresh.has(row.original.id) && 'row-enter')}
             >
               {row.getVisibleCells().map(cell => (
                 <TableCell key={cell.id} className="px-4 py-3">

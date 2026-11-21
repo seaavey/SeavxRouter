@@ -6,11 +6,13 @@ export type StreamStatus = 'connecting' | 'live' | 'reconnecting' | 'unavailable
 
 /**
  * Tails the router's SSE log feed and refreshes what it can stale. Bursts are
- * batched so a fast request stream does not refetch on every event.
+ * batched so a fast request stream does not refetch on every event, and the
+ * event count lets the UI show that something actually arrived.
  */
 export function useLiveLogs(enabled = true) {
   const queryClient = useQueryClient()
   const [status, setStatus] = useState<StreamStatus>('connecting')
+  const [events, setEvents] = useState(0)
   const dirty = useRef(false)
 
   useEffect(() => {
@@ -21,10 +23,12 @@ export function useLiveLogs(enabled = true) {
       setStatus('live')
       // The router does not replay events missed while disconnected.
       dirty.current = true
+      setEvents(count => count + 1)
     })
 
     source.addEventListener('log', () => {
       dirty.current = true
+      setEvents(count => count + 1)
     })
 
     source.onerror = () => {
@@ -45,5 +49,31 @@ export function useLiveLogs(enabled = true) {
     }
   }, [enabled, queryClient])
 
-  return status
+  return { status, events }
+}
+
+/**
+ * Ids that were not in the previous render. Used to animate rows in, so a new
+ * request visibly lands instead of the table quietly reshuffling.
+ */
+export function useNewRowIds(ids: string[]) {
+  const seen = useRef<Set<string> | null>(null)
+  const key = ids.join('\u0000')
+  const [fresh, setFresh] = useState<Set<string>>(() => new Set())
+
+  useEffect(() => {
+    const next = new Set(ids)
+    if (seen.current === null) {
+      // First paint: everything is already there, nothing to announce.
+      seen.current = next
+      setFresh(new Set())
+      return
+    }
+    const added = ids.filter(id => !seen.current!.has(id))
+    seen.current = next
+    if (added.length) setFresh(new Set(added))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key])
+
+  return fresh
 }
