@@ -11,11 +11,12 @@ import (
 )
 
 type chatStub struct {
-	gotReq     *backend.ChatRequest
-	result     *backend.ChatResult
-	deltas     []backend.ChatDelta
-	hasNoModel string
-	err        error
+	defaultModel string
+	gotReq       *backend.ChatRequest
+	result       *backend.ChatResult
+	deltas       []backend.ChatDelta
+	hasNoModel   string
+	err          error
 }
 
 func (c *chatStub) Models(context.Context) ([]backend.Model, error) {
@@ -39,7 +40,12 @@ func (c *chatStub) Chat(_ context.Context, req *backend.ChatRequest, onDelta fun
 	}
 	return c.result, c.err
 }
-func (c *chatStub) Default() string { return "m" }
+func (c *chatStub) Default() string {
+	if c.defaultModel != "" {
+		return c.defaultModel
+	}
+	return "m"
+}
 
 func TestOpenAIToolCalls(t *testing.T) {
 	t.Run("non-streaming", func(t *testing.T) {
@@ -499,5 +505,38 @@ func TestResponsesImageInput(t *testing.T) {
 	user := stub.gotReq.Messages[1]
 	if user.Content != "describe" || len(user.Images) != 1 || user.Images[0].Data != testPNGB64 {
 		t.Fatalf("user message = %+v", user)
+	}
+}
+
+// TestOmittedModelWithUnresolvableDefault pins the behaviour that a caller who
+// names no model is never rejected because the backend default is unavailable.
+// The default can point at a model the operator blocklisted, or one an
+// account-specific catalog no longer lists; the backend resolves the empty model
+// against its own catalog, so the request must not fail before reaching it.
+func TestOmittedModelWithUnresolvableDefault(t *testing.T) {
+	stub := &chatStub{
+		result:     &backend.ChatResult{},
+		hasNoModel: "stale-default",
+	}
+	stub.defaultModel = "stale-default"
+	s := &Server{backend: stub}
+	body := `{"messages":[{"role":"user","content":"hi"}]}`
+	w := httptest.NewRecorder()
+	s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("omitted model rejected: code %d body %s", w.Code, w.Body.String())
+	}
+}
+
+// TestExplicitUnknownModelStillRejected keeps the 404 contract for a model the
+// caller named explicitly: only the omitted-model path gets the lenient fallback.
+func TestExplicitUnknownModelStillRejected(t *testing.T) {
+	stub := &chatStub{result: &backend.ChatResult{}, hasNoModel: "nope"}
+	s := &Server{backend: stub}
+	body := `{"model":"nope","messages":[{"role":"user","content":"hi"}]}`
+	w := httptest.NewRecorder()
+	s.HandleChat(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if w.Code != 404 {
+		t.Fatalf("explicit unknown model: code %d, want 404", w.Code)
 	}
 }

@@ -69,7 +69,25 @@ func NewCodexEngine(store auth.AuthStore, auths []*auth.Auth) (*CodexEngine, err
 	return e, nil
 }
 
-func (e *CodexEngine) Default() string { return e.DefaultModel }
+// Default reports the model a request gets when it names none. The startup
+// warm-up fills DefaultModel, but it runs off the critical path, so this fetches
+// the catalog on first use rather than let an empty model reach upstream.
+func (e *CodexEngine) Default() string {
+	if e.DefaultModel != "" {
+		return e.DefaultModel
+	}
+	if e.catalog != nil {
+		if models, ok := e.catalog.Last(); ok && len(models) > 0 {
+			return models[0].ID
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), backend.DefaultFetchTimeout)
+		defer cancel()
+		if models, err := e.catalog.Get(ctx); err == nil && len(models) > 0 {
+			return models[0].ID
+		}
+	}
+	return ""
+}
 
 func (e *CodexEngine) count() int {
 	e.mu.Lock()

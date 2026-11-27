@@ -331,104 +331,56 @@ func (m *MultiBackend) providerBackend(name string) (backend.BackendAPI, bool) {
 	}
 }
 
+// providerList is one provider's slot in the parallel catalog aggregation.
+// Results land in slot order, so the response keeps its historical ordering.
+type providerList struct {
+	name    string
+	backend backend.BackendAPI
+}
+
 func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
+	lists := m.providerLists()
+	fetched := make([][]backend.Model, len(lists))
+	errs := make([]error, len(lists))
+
+	var wg sync.WaitGroup
+	for i, p := range lists {
+		wg.Add(1)
+		go func(i int, p providerList) {
+			defer wg.Done()
+			// WithoutCancel keeps a client disconnect from aborting a fetch whose
+			// result still serves the shared catalog cache.
+			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), backend.DefaultFetchTimeout)
+			defer cancel()
+			fetched[i], errs[i] = m.ProviderModels(cctx, p.name)
+		}(i, p)
+	}
+	wg.Wait()
+
 	out := []backend.Model{}
 	seen := map[string]bool{}
 	var lastErr error
-	if m.Antigravity != nil {
-		models, err := m.ProviderModels(ctx, "antigravity")
-		if err != nil {
-			lastErr = err
-			slog.Warn("antigravity models unavailable", "err", err)
+	for i, p := range lists {
+		if errs[i] != nil {
+			lastErr = errs[i]
+			slog.Warn(p.name+" models unavailable", "err", errs[i])
 		}
-		for _, mo := range models {
-			out = append(out, mo)
-			seen[mo.ID] = true
-		}
-	}
-	if m.Codex != nil {
-		models, err := m.ProviderModels(ctx, "codex")
-		if err != nil {
-			lastErr = err
-			slog.Warn("codex models unavailable", "err", err)
-		}
-		for _, mo := range models {
+		for _, mo := range fetched[i] {
+			// antigravity and codex advertise bare IDs; codex is only prefixed when
+			// antigravity already claimed the same ID. Every other provider is
+			// always namespaced so its IDs stay unambiguous.
 			id := mo.ID
-			if seen[id] {
-				id = "codex/" + id
+			switch {
+			case p.name == "antigravity":
+			case p.name == "codex":
+				if seen[id] {
+					id = "codex/" + id
+				}
+			default:
+				id = p.name + "/" + id
 			}
 			out = append(out, backend.Model{ID: id, Name: mo.Name})
-		}
-	}
-	if m.CodeBuddy != nil {
-		models, err := m.ProviderModels(ctx, "codebuddy")
-		if err != nil {
-			lastErr = err
-			slog.Warn("codebuddy models unavailable", "err", err)
-		}
-		for _, mo := range models {
-			out = append(out, backend.Model{ID: "codebuddy/" + mo.ID, Name: mo.Name})
-		}
-	}
-	if m.Qoder != nil {
-		models, err := m.ProviderModels(ctx, "qoder")
-		if err != nil {
-			lastErr = err
-			slog.Warn("qoder models unavailable", "err", err)
-		}
-		for _, mo := range models {
-			out = append(out, backend.Model{ID: "qoder/" + mo.ID, Name: mo.Name})
-		}
-	}
-	if m.Kiro != nil {
-		models, err := m.ProviderModels(ctx, "kiro")
-		if err != nil {
-			lastErr = err
-			slog.Warn("kiro models unavailable", "err", err)
-		}
-		for _, mo := range models {
-			out = append(out, backend.Model{ID: "kiro/" + mo.ID, Name: mo.Name})
-		}
-	}
-	if m.Verboo != nil {
-		models, err := m.ProviderModels(ctx, "verboo")
-		if err != nil {
-			lastErr = err
-			slog.Warn("verboo models unavailable", "err", err)
-		}
-		for _, mo := range models {
-			out = append(out, backend.Model{ID: "verboo/" + mo.ID, Name: mo.Name})
-		}
-	}
-	for _, p := range []struct {
-		name    string
-		backend backend.BackendAPI
-	}{
-		{"nvidia", m.NVIDIA},
-		{"groq", m.Groq},
-		{"cloudflare", m.Cloudflare},
-		{"opencode", m.OpenCode},
-	} {
-		if p.backend == nil {
-			continue
-		}
-		models, err := m.ProviderModels(ctx, p.name)
-		if err != nil {
-			lastErr = err
-			slog.Warn(p.name+" models unavailable", "err", err)
-		}
-		for _, mo := range models {
-			out = append(out, backend.Model{ID: p.name + "/" + mo.ID, Name: mo.Name})
-		}
-	}
-	for _, name := range m.customNames() {
-		models, err := m.ProviderModels(ctx, name)
-		if err != nil {
-			lastErr = err
-			slog.Warn(name+" models unavailable", "err", err)
-		}
-		for _, mo := range models {
-			out = append(out, backend.Model{ID: name + "/" + mo.ID, Name: mo.Name})
+			seen[mo.ID] = true
 		}
 	}
 	for _, name := range m.Combos.Names() {
@@ -438,6 +390,31 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		return nil, lastErr
 	}
 	return out, nil
+}
+
+// providerLists returns the configured providers in the order their models are
+// concatenated. Providers that are not configured are omitted.
+func (m *MultiBackend) providerLists() []providerList {
+	lists := make([]providerList, 0, 16)
+	add := func(name string, b backend.BackendAPI) {
+		if b != nil {
+			lists = append(lists, providerList{name: name, backend: b})
+		}
+	}
+	add("antigravity", m.Antigravity)
+	add("codex", m.Codex)
+	add("codebuddy", m.CodeBuddy)
+	add("qoder", m.Qoder)
+	add("kiro", m.Kiro)
+	add("verboo", m.Verboo)
+	add("nvidia", m.NVIDIA)
+	add("groq", m.Groq)
+	add("cloudflare", m.Cloudflare)
+	add("opencode", m.OpenCode)
+	for _, name := range m.customNames() {
+		add(name, m.Custom[name])
+	}
+	return lists
 }
 
 func (m *MultiBackend) HasModel(ctx context.Context, id string) bool {

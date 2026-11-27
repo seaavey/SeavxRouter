@@ -63,7 +63,26 @@ func (e *Engine) anthropic() bool {
 
 var _ backend.BackendAPI = (*Engine)(nil)
 
-func (e *Engine) Default() string { return e.DefaultModel }
+// ProviderFallback gives Default a value when the catalog has not been warmed
+// up yet, so a request that omits the model never goes out with an empty name.
+func (e *Engine) ProviderFallback() string {
+	if p, ok := Providers[e.Name]; ok {
+		return p.DefaultModel
+	}
+	return ""
+}
+
+func (e *Engine) Default() string {
+	if e.DefaultModel != "" {
+		return e.DefaultModel
+	}
+	if e.catalog != nil {
+		if models, ok := e.catalog.Last(); ok && len(models) > 0 {
+			return models[0].ID
+		}
+	}
+	return e.ProviderFallback()
+}
 
 func (e *Engine) ProbeChat(ctx context.Context, model string) error {
 	maxTokens := 256
