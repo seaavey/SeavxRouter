@@ -31,6 +31,9 @@ type Auth struct {
 	// BaseURL marks a custom OpenAI-compatible provider: the endpoint the
 	// bearer key talks to. Empty for built-in providers.
 	BaseURL string `json:"base_url,omitempty"`
+	// SDK names the wire protocol a custom provider speaks: "" or "openai"
+	// for the OpenAI-compatible surface, "anthropic" for the Messages API.
+	SDK string `json:"sdk,omitempty"`
 }
 
 // Label identifies the account for request logs: email when the provider

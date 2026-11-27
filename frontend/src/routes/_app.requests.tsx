@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { RequestTable } from '@/components/request-table'
@@ -27,7 +27,7 @@ function RequestsPage() {
   const page = selectedPage ?? 1
   const navigate = useNavigate({ from: Route.fullPath })
   const offset = (page - 1) * PAGE_SIZE
-  const logs = useQuery(logsQuery(offset, PAGE_SIZE))
+  const logs = useQuery({ ...logsQuery(offset, PAGE_SIZE), placeholderData: keepPreviousData })
   const [selected, setSelected] = useState<RequestLog | null>(null)
   // Older pages stay stable while you read them; only page one follows the feed.
   useLiveLogs(page === 1)
@@ -62,8 +62,8 @@ function RequestsPage() {
               <Button
                 variant="outline"
                 size="sm"
-                disabled={page === 1}
-                onClick={() => navigate({ search: { page: page === 2 ? undefined : page - 1 } })}
+                disabled={page === 1 || logs.isFetching}
+                onClick={() => navigate({ resetScroll: false, search: { page: page === 2 ? undefined : page - 1 } })}
               >
                 <ChevronLeft className="size-4" />
                 Previous
@@ -71,8 +71,8 @@ function RequestsPage() {
               <Button
                 variant="outline"
                 size="sm"
-                disabled={!hasNext}
-                onClick={() => navigate({ search: { page: page + 1 } })}
+                disabled={!hasNext || logs.isFetching}
+                onClick={() => navigate({ resetScroll: false, search: { page: page + 1 } })}
               >
                 Next
                 <ChevronRight className="size-4" />

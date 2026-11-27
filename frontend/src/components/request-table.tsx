@@ -152,7 +152,17 @@ export function RequestTable({ rows, loading, onSelect, pageSize = 10, detailed 
   const fresh = useNewRowIds(rows.map(row => row.id))
 
   if (loading) {
-    return <div className="grid gap-2 p-4">{Array.from({ length: 5 }, (_, index) => <Skeleton key={index} className="h-11 w-full" />)}</div>
+    return (
+      <div aria-busy="true" aria-label="Loading requests">
+        <div className="flex h-14 items-center px-4"><Skeleton className="h-8 w-64" /></div>
+        <div className="flex h-9 items-center border-b border-border px-4"><Skeleton className="h-3 w-full" /></div>
+        {Array.from({ length: pageSize }, (_, index) => (
+          <div key={index} className="flex h-[66px] items-center border-b border-border px-4 last:border-b-0">
+            <Skeleton className="h-9 w-full" />
+          </div>
+        ))}
+      </div>
+    )
   }
 
   if (!rows.length) {

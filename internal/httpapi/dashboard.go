@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"seavxrouter/internal/backend"
 )
 
 const (
@@ -193,7 +195,7 @@ func WithDashboard(store *DashboardStore) ServerOption {
 
 func dashboardError(w http.ResponseWriter, status int, message string) {
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": message}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": message}})
 }
 
 func dashboardInternalError(w http.ResponseWriter, err error) {
@@ -265,6 +267,61 @@ func readDashboardPassword(w http.ResponseWriter, r *http.Request) (dashboardPas
 		return dashboardPasswordForm{}, false
 	}
 	return form, true
+}
+
+type providerModelForm struct {
+	Model string `json:"model"`
+}
+
+func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
+	models, err := s.modelManager.ProviderModels(r.Context(), r.PathValue("provider"))
+	if err != nil {
+		dashboardError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	data := make([]map[string]string, 0, len(models))
+	for _, m := range models {
+		data = append(data, map[string]string{"id": m.ID})
+	}
+	writeJSON(w, map[string]any{"data": data})
+}
+func readProviderModel(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var form providerModelForm
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&form); err != nil || strings.TrimSpace(form.Model) == "" || strings.TrimSpace(form.Model) != form.Model {
+		dashboardError(w, http.StatusBadRequest, "A model ID is required.")
+		return "", false
+	}
+	return form.Model, true
+}
+func (s *Server) handleAddProviderModel(w http.ResponseWriter, r *http.Request) {
+	model, ok := readProviderModel(w, r)
+	if !ok {
+		return
+	}
+	if err := s.modelManager.AddModel(r.Context(), r.PathValue("provider"), model); err != nil {
+		status := http.StatusBadRequest
+		body := map[string]any{"message": err.Error()}
+		var upstream *backend.HTTPError
+		if errors.As(err, &upstream) && upstream.Status >= 400 && upstream.Status <= 599 {
+			body["upstream_status"] = upstream.Status
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": body})
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+func (s *Server) handleDeleteProviderModel(w http.ResponseWriter, r *http.Request) {
+	model, ok := readProviderModel(w, r)
+	if !ok {
+		return
+	}
+	if err := s.modelManager.DeleteModel(r.Context(), r.PathValue("provider"), model); err != nil {
+		dashboardError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (d *DashboardStore) login(w http.ResponseWriter, r *http.Request) {
@@ -431,7 +488,16 @@ func (s *Server) dashboardHandler() http.Handler {
 		})
 	}
 	admin("GET "+dashboardPath+"/models", s.wire.HandleModels)
+	if s.modelManager != nil {
+		admin("GET "+dashboardPath+"/connections/{provider}/models", s.handleProviderModels)
+		admin("POST "+dashboardPath+"/connections/{provider}/models", s.handleAddProviderModel)
+		admin("DELETE "+dashboardPath+"/connections/{provider}/models", s.handleDeleteProviderModel)
+	}
 	admin("GET "+dashboardPath+"/quota", s.handleQuota)
+	if s.customProviders != nil {
+		admin("POST "+dashboardPath+"/connections", s.handleAddCustomProvider)
+		admin("POST "+dashboardPath+"/connections/validate", s.handleProbeCustomProvider)
+	}
 	admin("GET "+dashboardPath+"/usage", s.handleUsage)
 	admin("GET "+dashboardPath+"/logging", s.handleLogging)
 	admin("GET "+dashboardPath+"/logging/{id}", s.handleLog)

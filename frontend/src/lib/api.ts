@@ -43,6 +43,8 @@ export interface ProviderAccount {
 
 export interface ProviderQuota {
   provider: string
+  base_url?: string
+  sdk?: string
   default_model?: string
   accounts: ProviderAccount[] | null
 }
@@ -81,7 +83,9 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     if (response.status === 401 && path !== '/dashboard/api/login') {
       window.dispatchEvent(new Event('dashboard-session-expired'))
     }
-    throw new Error(body?.error?.message ?? `Request failed (${response.status}).`)
+    const message = body?.error?.message ?? `Request failed (${response.status}).`
+    const upstreamStatus = body?.error?.upstream_status
+    throw new Error(typeof upstreamStatus === 'number' ? `${message} (upstream HTTP ${upstreamStatus})` : message)
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>

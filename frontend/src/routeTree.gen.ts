@@ -15,6 +15,8 @@ import { Route as AppIndexRouteImport } from './routes/_app.index'
 import { Route as AppConnectionsRouteImport } from './routes/_app.connections'
 import { Route as AppKeysRouteImport } from './routes/_app.keys'
 import { Route as AppRequestsRouteImport } from './routes/_app.requests'
+import { Route as AppConnectionsIndexRouteImport } from './routes/_app.connections.index'
+import { Route as AppConnectionsProviderIdRouteImport } from './routes/_app.connections.$providerId'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -45,35 +47,64 @@ const AppRequestsRoute = AppRequestsRouteImport.update({
   path: '/requests',
   getParentRoute: () => AppRoute,
 } as any)
+const AppConnectionsIndexRoute = AppConnectionsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppConnectionsRoute,
+} as any)
+const AppConnectionsProviderIdRoute =
+  AppConnectionsProviderIdRouteImport.update({
+    id: '/$providerId',
+    path: '/$providerId',
+    getParentRoute: () => AppConnectionsRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/sign-in': typeof SignInRoute
-  '/connections': typeof AppConnectionsRoute
+  '/connections': typeof AppConnectionsRouteWithChildren
   '/keys': typeof AppKeysRoute
   '/requests': typeof AppRequestsRoute
+  '/connections/$providerId': typeof AppConnectionsProviderIdRoute
+  '/connections/': typeof AppConnectionsIndexRoute
 }
 export interface FileRoutesByTo {
   '/sign-in': typeof SignInRoute
-  '/connections': typeof AppConnectionsRoute
   '/keys': typeof AppKeysRoute
   '/requests': typeof AppRequestsRoute
   '/': typeof AppIndexRoute
+  '/connections/$providerId': typeof AppConnectionsProviderIdRoute
+  '/connections': typeof AppConnectionsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/sign-in': typeof SignInRoute
-  '/_app/connections': typeof AppConnectionsRoute
+  '/_app/connections': typeof AppConnectionsRouteWithChildren
   '/_app/keys': typeof AppKeysRoute
   '/_app/requests': typeof AppRequestsRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/connections/$providerId': typeof AppConnectionsProviderIdRoute
+  '/_app/connections/': typeof AppConnectionsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/sign-in' | '/connections' | '/keys' | '/requests'
+  fullPaths:
+    | '/'
+    | '/sign-in'
+    | '/connections'
+    | '/keys'
+    | '/requests'
+    | '/connections/$providerId'
+    | '/connections/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/sign-in' | '/connections' | '/keys' | '/requests' | '/'
+  to:
+    | '/sign-in'
+    | '/keys'
+    | '/requests'
+    | '/'
+    | '/connections/$providerId'
+    | '/connections'
   id:
     | '__root__'
     | '/_app'
@@ -82,6 +113,8 @@ export interface FileRouteTypes {
     | '/_app/keys'
     | '/_app/requests'
     | '/_app/'
+    | '/_app/connections/$providerId'
+    | '/_app/connections/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -133,18 +166,46 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRequestsRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/connections/': {
+      id: '/_app/connections/'
+      path: '/'
+      fullPath: '/connections/'
+      preLoaderRoute: typeof AppConnectionsIndexRouteImport
+      parentRoute: typeof AppConnectionsRoute
+    }
+    '/_app/connections/$providerId': {
+      id: '/_app/connections/$providerId'
+      path: '/$providerId'
+      fullPath: '/connections/$providerId'
+      preLoaderRoute: typeof AppConnectionsProviderIdRouteImport
+      parentRoute: typeof AppConnectionsRoute
+    }
   }
 }
 
+interface AppConnectionsRouteChildren {
+  AppConnectionsProviderIdRoute: typeof AppConnectionsProviderIdRoute
+  AppConnectionsIndexRoute: typeof AppConnectionsIndexRoute
+}
+
+const AppConnectionsRouteChildren: AppConnectionsRouteChildren = {
+  AppConnectionsProviderIdRoute: AppConnectionsProviderIdRoute,
+  AppConnectionsIndexRoute: AppConnectionsIndexRoute,
+}
+
+const AppConnectionsRouteWithChildren = AppConnectionsRoute._addFileChildren(
+  AppConnectionsRouteChildren,
+)
+
 interface AppRouteChildren {
-  AppConnectionsRoute: typeof AppConnectionsRoute
+  AppConnectionsRoute: typeof AppConnectionsRouteWithChildren
   AppKeysRoute: typeof AppKeysRoute
   AppRequestsRoute: typeof AppRequestsRoute
   AppIndexRoute: typeof AppIndexRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
-  AppConnectionsRoute: AppConnectionsRoute,
+  AppConnectionsRoute: AppConnectionsRouteWithChildren,
   AppKeysRoute: AppKeysRoute,
   AppRequestsRoute: AppRequestsRoute,
   AppIndexRoute: AppIndexRoute,

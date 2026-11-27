@@ -28,8 +28,12 @@ const (
 	codexRedirectURI = "http://localhost:1455/auth/callback"
 	codexAPIBase     = "https://chatgpt.com/backend-api/codex"
 	codexOriginator  = "codex_cli_rs"
-	codexVersion     = "0.159.0"
-	codexUserAgent   = "codex_cli_rs/" + codexVersion + " (Linux; x86_64)"
+	// codexVersion is the client identity sent upstream. The /models catalog is
+	// filtered by each entry's minimal_client_version, so a stale value silently
+	// drops newer models: 0.159.0 hides everything from gpt-6.2 onwards. Keep it
+	// at or above the newest advertised minimum (gpt-6.2-* needs 0.166.0).
+	codexVersion   = "0.172.0"
+	codexUserAgent = "codex_cli_rs/" + codexVersion + " (Linux; x86_64)"
 )
 
 type CodexEngine struct {

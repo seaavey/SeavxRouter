@@ -19,16 +19,24 @@ import (
 // backed by a single backend. Wire-format translation lives in the completions
 // package; this type owns routing, auth, usage storage and request logging.
 type Server struct {
-	backend    backend.BackendAPI
-	apiKey     string
-	keys       *KeyStore
-	dashboard  *DashboardStore
-	usage      *UsageStore
-	logs       *logBroker
-	compressor *compress.Engine
-	pricing    atomic.Pointer[Pricing]
-	wire       *completions.Server
-	hidden     *HiddenModels
+	backend      backend.BackendAPI
+	apiKey       string
+	keys         *KeyStore
+	dashboard    *DashboardStore
+	usage        *UsageStore
+	logs         *logBroker
+	compressor   *compress.Engine
+	pricing      atomic.Pointer[Pricing]
+	wire         *completions.Server
+	hidden       *HiddenModels
+	modelManager ModelManager
+	// customProviders, when set, lets the dashboard add a provider at runtime.
+	customProviders CustomProviderService
+}
+
+// WithCustomProviders enables the dashboard's add-provider flow.
+func WithCustomProviders(s CustomProviderService) ServerOption {
+	return func(srv *Server) { srv.customProviders = s }
 }
 
 // ServerOption customizes a Server built by NewServer.
@@ -38,6 +46,9 @@ type ServerOption func(*Server)
 func WithCompression(e *compress.Engine) ServerOption {
 	return func(s *Server) { s.compressor = e }
 }
+
+// WithModelManager enables authenticated provider-scoped model management.
+func WithModelManager(m ModelManager) ServerOption { return func(s *Server) { s.modelManager = m } }
 
 // WithoutCompression disables compression entirely.
 func WithoutCompression() ServerOption {

@@ -6,12 +6,15 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"seavxrouter/internal/auth"
 	"seavxrouter/internal/backend"
+	"seavxrouter/internal/httpapi"
 	"seavxrouter/internal/providers/codebuddy"
 	"seavxrouter/internal/providers/kiro"
+	"seavxrouter/internal/providers/upstream"
 )
 
 // MultiBackend routes requests across providers. backend.Model IDs may carry an
@@ -31,6 +34,11 @@ type MultiBackend struct {
 	OpenCode    backend.BackendAPI
 	// Custom holds user-defined providers keyed by their model prefix.
 	Custom map[string]backend.BackendAPI
+	// Store is where custom providers are persisted. When empty, runtime
+	// provider additions are refused.
+	Store       auth.AuthStore
+	customMu    sync.RWMutex
+	modelStates *httpapi.ProviderModelManager
 	// Combos holds named fallback lists requested as "combo/<name>".
 	Combos *Combos
 }
@@ -45,6 +53,8 @@ func (m *MultiBackend) comboMembers(model string) ([]string, bool) {
 }
 
 func (m *MultiBackend) custom(name string) (backend.BackendAPI, bool) {
+	m.customMu.RLock()
+	defer m.customMu.RUnlock()
 	b, ok := m.Custom[name]
 	if !ok || b == nil {
 		return nil, false
@@ -53,6 +63,8 @@ func (m *MultiBackend) custom(name string) (backend.BackendAPI, bool) {
 }
 
 func (m *MultiBackend) customNames() []string {
+	m.customMu.RLock()
+	defer m.customMu.RUnlock()
 	if len(m.Custom) == 0 {
 		return nil
 	}
@@ -136,6 +148,14 @@ func (m *MultiBackend) resolve(ctx context.Context, model string) (backend.Backe
 // resolveNamed is resolve plus the provider name, which callers report in
 // usage and logs for models served through a combo.
 func (m *MultiBackend) resolveNamed(ctx context.Context, model string) (backend.BackendAPI, string, string, error) {
+	b, id, provider, err := m.resolveNamedUnchecked(ctx, model)
+	if err == nil && m.modelStates != nil && m.modelStates.Disabled(provider, id) {
+		return nil, "", "", fmt.Errorf("model_not_found: model is disabled")
+	}
+	return b, id, provider, err
+}
+
+func (m *MultiBackend) resolveNamedUnchecked(ctx context.Context, model string) (backend.BackendAPI, string, string, error) {
 	if name, id, ok := strings.Cut(model, "/"); ok {
 		switch name {
 		case "codex":
@@ -233,12 +253,90 @@ func (m *MultiBackend) resolveNamed(ctx context.Context, model string) (backend.
 	return nil, "", "", fmt.Errorf("no providers configured")
 }
 
+func (m *MultiBackend) ProviderModels(ctx context.Context, name string) ([]backend.Model, error) {
+	b, ok := m.providerBackend(name)
+	if !ok {
+		return nil, fmt.Errorf("provider not configured")
+	}
+	models, err := b.Models(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if m.modelStates == nil {
+		return models, nil
+	}
+	return m.modelStates.ProviderModels(ctx, name, models)
+}
+func (m *MultiBackend) ProbeModel(ctx context.Context, provider, id string) error {
+	b, ok := m.providerBackend(provider)
+	if !ok {
+		return fmt.Errorf("provider not configured")
+	}
+	probe, ok := b.(interface {
+		ProbeChat(context.Context, string) error
+	})
+	if !ok {
+		return fmt.Errorf("verified add unsupported for this provider")
+	}
+	return probe.ProbeChat(ctx, id)
+}
+
+func (m *MultiBackend) SetModelManager(manager *httpapi.ProviderModelManager) {
+	m.modelStates = manager
+}
+func (m *MultiBackend) AddModel(ctx context.Context, p, id string) error {
+	if m.modelStates == nil {
+		return fmt.Errorf("model management unavailable")
+	}
+	b, ok := m.providerBackend(p)
+	if !ok {
+		return fmt.Errorf("provider not configured")
+	}
+	if _, ok := b.(*upstream.Engine); !ok {
+		return fmt.Errorf("verified add unsupported for this provider")
+	}
+	return m.modelStates.AddModel(ctx, p, id)
+}
+func (m *MultiBackend) DeleteModel(ctx context.Context, p, id string) error {
+	if m.modelStates == nil {
+		return fmt.Errorf("model management unavailable")
+	}
+	return m.modelStates.DeleteModel(ctx, p, id)
+}
+func (m *MultiBackend) providerBackend(name string) (backend.BackendAPI, bool) {
+	switch name {
+	case "antigravity":
+		return m.Antigravity, m.Antigravity != nil
+	case "codex":
+		return m.Codex, m.Codex != nil
+	case "codebuddy":
+		return m.CodeBuddy, m.CodeBuddy != nil
+	case "qoder":
+		return m.Qoder, m.Qoder != nil
+	case "kiro":
+		return m.Kiro, m.Kiro != nil
+	case "verboo":
+		return m.Verboo, m.Verboo != nil
+	case "nvidia":
+		return m.NVIDIA, m.NVIDIA != nil
+	case "groq":
+		return m.Groq, m.Groq != nil
+	case "cloudflare":
+		return m.Cloudflare, m.Cloudflare != nil
+	case "opencode":
+		return m.OpenCode, m.OpenCode != nil
+	default:
+		b, ok := m.custom(name)
+		return b, ok
+	}
+}
+
 func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 	out := []backend.Model{}
 	seen := map[string]bool{}
 	var lastErr error
 	if m.Antigravity != nil {
-		models, err := m.Antigravity.Models(ctx)
+		models, err := m.ProviderModels(ctx, "antigravity")
 		if err != nil {
 			lastErr = err
 			slog.Warn("antigravity models unavailable", "err", err)
@@ -249,7 +347,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		}
 	}
 	if m.Codex != nil {
-		models, err := m.Codex.Models(ctx)
+		models, err := m.ProviderModels(ctx, "codex")
 		if err != nil {
 			lastErr = err
 			slog.Warn("codex models unavailable", "err", err)
@@ -263,7 +361,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		}
 	}
 	if m.CodeBuddy != nil {
-		models, err := m.CodeBuddy.Models(ctx)
+		models, err := m.ProviderModels(ctx, "codebuddy")
 		if err != nil {
 			lastErr = err
 			slog.Warn("codebuddy models unavailable", "err", err)
@@ -273,7 +371,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		}
 	}
 	if m.Qoder != nil {
-		models, err := m.Qoder.Models(ctx)
+		models, err := m.ProviderModels(ctx, "qoder")
 		if err != nil {
 			lastErr = err
 			slog.Warn("qoder models unavailable", "err", err)
@@ -283,7 +381,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		}
 	}
 	if m.Kiro != nil {
-		models, err := m.Kiro.Models(ctx)
+		models, err := m.ProviderModels(ctx, "kiro")
 		if err != nil {
 			lastErr = err
 			slog.Warn("kiro models unavailable", "err", err)
@@ -293,7 +391,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		}
 	}
 	if m.Verboo != nil {
-		models, err := m.Verboo.Models(ctx)
+		models, err := m.ProviderModels(ctx, "verboo")
 		if err != nil {
 			lastErr = err
 			slog.Warn("verboo models unavailable", "err", err)
@@ -314,7 +412,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		if p.backend == nil {
 			continue
 		}
-		models, err := p.backend.Models(ctx)
+		models, err := m.ProviderModels(ctx, p.name)
 		if err != nil {
 			lastErr = err
 			slog.Warn(p.name+" models unavailable", "err", err)
@@ -324,7 +422,7 @@ func (m *MultiBackend) Models(ctx context.Context) ([]backend.Model, error) {
 		}
 	}
 	for _, name := range m.customNames() {
-		models, err := m.Custom[name].Models(ctx)
+		models, err := m.ProviderModels(ctx, name)
 		if err != nil {
 			lastErr = err
 			slog.Warn(name+" models unavailable", "err", err)
@@ -346,6 +444,21 @@ func (m *MultiBackend) HasModel(ctx context.Context, id string) bool {
 	if _, ok := m.comboMembers(id); ok {
 		return true
 	}
+	if strings.HasPrefix(id, "+") || strings.HasPrefix(id, "-") {
+		return false
+	}
+	if name, raw, ok := strings.Cut(id, "/"); ok {
+		if _, found := m.providerBackend(name); found && m.modelStates != nil && m.modelStates.Disabled(name, raw) {
+			return false
+		}
+		if _, found := m.providerBackend(name); found && m.modelStates != nil && m.modelStates.Enabled(name, raw) {
+			return true
+		}
+	}
+	if m.modelStates != nil && m.modelStates.Disabled(m.Provider(ctx, id), id) {
+		return false
+	}
+
 	b, model, err := m.resolve(ctx, id)
 	if err != nil {
 		return false
@@ -626,8 +739,13 @@ func (m *MultiBackend) Quota() []auth.ProviderQuota {
 		}
 	}
 	for _, name := range m.customNames() {
-		if q, ok := m.Custom[name].(quotaReporter); ok {
-			out = append(out, q.Quota())
+		b, ok := m.custom(name)
+		if !ok {
+			continue
+		}
+		if q, ok := b.(quotaReporter); ok {
+			quota := q.Quota()
+			out = append(out, quota)
 		}
 	}
 	return out

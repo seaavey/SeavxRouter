@@ -33,6 +33,8 @@ type AccountQuota struct {
 // ProviderQuota groups account status per provider for GET /v1/quota.
 type ProviderQuota struct {
 	Provider     string         `json:"provider"`
+	BaseURL      string         `json:"base_url,omitempty"`
+	SDK          string         `json:"sdk,omitempty"`
 	DefaultModel string         `json:"default_model,omitempty"`
 	Accounts     []AccountQuota `json:"accounts"`
 }
