@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sort"
 	"testing"
+	"time"
 
 	"seavxrouter/internal/backend"
 	"seavxrouter/internal/httpapi"
@@ -198,6 +200,8 @@ func (f *fakeBackend) Models(context.Context) ([]backend.Model, error) {
 	for id := range f.models {
 		out = append(out, backend.Model{ID: id, Name: id})
 	}
+	// Real engines return a sorted catalog; match that so tests can assert order.
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
 func (f *fakeBackend) HasModel(_ context.Context, id string) bool {
@@ -342,5 +346,93 @@ func TestChatRetriesSameProviderOnTransientFailure(t *testing.T) {
 	}
 	if agy.calls != 2 || codex.calls != 0 {
 		t.Fatalf("calls: antigravity=%d codex=%d", agy.calls, codex.calls)
+	}
+}
+
+// slowBackend blocks until released, so a test can prove the aggregator queries
+// providers concurrently instead of one after another.
+type slowBackend struct {
+	id      string
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *slowBackend) Models(context.Context) ([]backend.Model, error) {
+	s.started <- struct{}{}
+	<-s.release
+	return []backend.Model{{ID: s.id, Name: s.id}}, nil
+}
+func (s *slowBackend) HasModel(context.Context, string) bool { return false }
+func (s *slowBackend) Complete(context.Context, string, string) (*backend.Result, error) {
+	return &backend.Result{}, nil
+}
+func (s *slowBackend) Stream(context.Context, string, string, func(string)) (*backend.Result, error) {
+	return &backend.Result{}, nil
+}
+func (s *slowBackend) Chat(context.Context, *backend.ChatRequest, func(backend.ChatDelta)) (*backend.ChatResult, error) {
+	return &backend.ChatResult{}, nil
+}
+func (s *slowBackend) Default() string { return "" }
+
+// TestModelsFetchesProvidersConcurrently guards the latency fix: /v1/models used
+// to await every provider in sequence, so the response cost the sum of every
+// upstream round trip. Both fetches must be in flight at the same time.
+func TestModelsFetchesProvidersConcurrently(t *testing.T) {
+	one := &slowBackend{id: "a", started: make(chan struct{}, 1), release: make(chan struct{})}
+	two := &slowBackend{id: "b", started: make(chan struct{}, 1), release: make(chan struct{})}
+	m := &MultiBackend{Custom: map[string]backend.BackendAPI{"one": one, "two": two}}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.Models(context.Background())
+	}()
+
+	// Both providers must report a started fetch before either is released; a
+	// sequential implementation would leave the second one still waiting.
+	for _, b := range []*slowBackend{one, two} {
+		select {
+		case <-b.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("provider fetch did not start: aggregation is not concurrent")
+		}
+	}
+	close(one.release)
+	close(two.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Models did not return")
+	}
+}
+
+// TestModelsKeepsProviderOrder pins the response ordering that the concurrent
+// rewrite must preserve: antigravity IDs stay bare, codex is prefixed only on a
+// collision, and every other provider is namespaced.
+func TestModelsKeepsProviderOrder(t *testing.T) {
+	ctx := context.Background()
+	m := &MultiBackend{
+		Antigravity: &fakeBackend{models: map[string]bool{"shared": true, "gem": true}},
+		Codex:       &fakeBackend{models: map[string]bool{"shared": true, "codexonly": true}},
+		Verboo:      &fakeBackend{models: map[string]bool{"vb": true}},
+	}
+	models, err := m.Models(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(models))
+	for _, mo := range models {
+		got = append(got, mo.ID)
+	}
+	// antigravity and codex both advertise sorted catalogs; "shared" is claimed by
+	// antigravity first, so codex's copy is the one that gets namespaced.
+	want := []string{"gem", "shared", "codexonly", "codex/shared", "verboo/vb"}
+	if len(got) != len(want) {
+		t.Fatalf("models = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("models = %v, want %v", got, want)
+		}
 	}
 }

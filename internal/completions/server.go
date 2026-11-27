@@ -209,10 +209,17 @@ type ProviderNamer interface {
 
 func (s *Server) resolveModel(w http.ResponseWriter, r *http.Request, requested string) (string, bool) {
 	model := requested
+	// A caller that names no model gets the backend default. When that default is
+	// itself unavailable (hidden by the operator blocklist, or absent from an
+	// account-specific catalog) fall back to an empty model rather than 404: the
+	// backend resolves it against its own catalog, which is how this behaved
+	// before the default was resolved eagerly.
 	if model == "" || model == "auto" || model == "default" {
 		model = s.backend.Default()
-	}
-	if model != "" && !s.backend.HasModel(r.Context(), model) {
+		if model != "" && !s.backend.HasModel(r.Context(), model) {
+			model = ""
+		}
+	} else if !s.backend.HasModel(r.Context(), model) {
 		writeError(w, &apiError{http.StatusNotFound, "model not found: " + model, "invalid_request_error", "model_not_found"})
 		return "", false
 	}

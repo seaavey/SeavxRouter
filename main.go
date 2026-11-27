@@ -271,6 +271,10 @@ func main() {
 		combosPath = defaultCombosPath(*authFile)
 	}
 	multi := &multi.MultiBackend{Combos: multi.NewCombos(combosPath), Store: store}
+	// warmup fills each provider's catalog cache once the listener is up. It runs
+	// off the startup critical path: probing every upstream before net.Listen
+	// delayed the port by 10+ seconds and made /v1/models look like a hang.
+	var warmup []func()
 	if len(accounts.antigravity) > 0 {
 		engine, err := antigravity.NewEngine(store, *apiBase, accounts.antigravity)
 		if err != nil {
@@ -278,13 +282,7 @@ func main() {
 			os.Exit(1)
 		}
 		engine.DefaultModel = *defaultModel
-		if engine.DefaultModel == "" {
-			if models, err := engine.Models(ctx); err == nil {
-				engine.DefaultModel = antigravity.PreferredDefault(models)
-			} else {
-				slog.Warn("could not fetch default model", "provider", "antigravity", "err", err)
-			}
-		}
+		warmup = append(warmup, warmModels("antigravity", engine, ctx))
 		multi.Antigravity = engine
 	}
 	if len(accounts.codex) > 0 {
@@ -294,13 +292,7 @@ func main() {
 			os.Exit(1)
 		}
 		engine.DefaultModel = *defaultModel
-		if engine.DefaultModel == "" {
-			if models, err := engine.Models(ctx); err == nil {
-				engine.DefaultModel = models[0].ID
-			} else {
-				slog.Warn("could not fetch default model", "provider", "codex", "err", err)
-			}
-		}
+		warmup = append(warmup, warmModels("codex", engine, ctx))
 		multi.Codex = engine
 	}
 	if len(accounts.codebuddy) > 0 {
@@ -346,13 +338,7 @@ func main() {
 			os.Exit(1)
 		}
 		engine.DefaultModel = *defaultModel
-		if engine.DefaultModel == "" {
-			if models, err := engine.Models(ctx); err == nil && len(models) > 0 {
-				engine.DefaultModel = models[0].ID
-			} else if err != nil {
-				slog.Warn("could not fetch default model", "provider", "verboo", "err", err)
-			}
-		}
+		warmup = append(warmup, warmModels("verboo", engine, ctx))
 		multi.Verboo = engine
 	}
 	if len(accounts.nvidia) > 0 {
@@ -398,16 +384,7 @@ func main() {
 			os.Exit(1)
 		}
 		engine.DefaultModel = *defaultModel
-		if engine.DefaultModel == "" {
-			defaultCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			models, err := engine.Models(defaultCtx)
-			cancel()
-			if err == nil && len(models) > 0 {
-				engine.DefaultModel = models[0].ID
-			} else if err != nil {
-				slog.Warn("could not fetch default model", "provider", name, "err", err)
-			}
-		}
+		warmup = append(warmup, warmModels(name, engine, ctx))
 		multi.Custom[name] = engine
 	}
 	if len(accounts.opencode) > 0 {
@@ -524,6 +501,14 @@ func main() {
 		}
 	}()
 
+	// Catalog warm-up runs after the listener is up, for the same reason as the
+	// pricing fetch: /v1/models must answer immediately, and a slow upstream must
+	// not hold the port closed. Default() resolves its own fallback until this
+	// lands, so requests without a model still get a usable answer.
+	for _, warm := range warmup {
+		go warm()
+	}
+
 	// Pricing is advisory for cost reporting, so the catalog fetch runs after
 	// the listener is up: requests use the built-in table until it lands.
 	go func() {
@@ -551,6 +536,20 @@ func main() {
 	defer cancel()
 	httpSrv.Shutdown(shutdownCtx)
 	slog.Info("stopped")
+}
+
+// warmModels returns a function that primes one engine's catalog cache. It only
+// populates the cache: DefaultModel stays untouched so nothing writes a field
+// the request path reads concurrently. Errors are logged, never fatal — an
+// unreachable provider must not stop the router from serving the others.
+func warmModels(name string, engine backend.BackendAPI, parent context.Context) func() {
+	return func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), backend.DefaultFetchTimeout)
+		defer cancel()
+		if _, err := engine.Models(ctx); err != nil {
+			slog.Warn("could not warm model catalog", "provider", name, "err", err)
+		}
+	}
 }
 
 // pickDefault returns the configured override when set, otherwise the

@@ -7,6 +7,14 @@ import (
 	"time"
 )
 
+// DefaultFetchTimeout bounds one catalog fetch. Provider engines and the
+// multi-provider aggregator share it so a hung upstream can never hold a
+// response open indefinitely. It is deliberately generous: catalogs are large
+// (one upstream serves 2900+ entries), and a timeout that fires early drops that
+// provider's models from the answer while leaving the cache cold, so every
+// later request pays the fetch again.
+const DefaultFetchTimeout = 20 * time.Second
+
 // Catalog caches a provider's model list with stale-while-revalidate
 // semantics: the first call fetches synchronously, later calls return the last
 // known value immediately while one background refresh keeps it current. A
@@ -58,7 +66,9 @@ func (c *Catalog[T]) Get(ctx context.Context) (T, error) {
 		c.wait = make(chan struct{})
 		c.mu.Unlock()
 
-		val, err := c.fetch(ctx)
+		fctx, cancel := context.WithTimeout(ctx, DefaultFetchTimeout)
+		val, err := c.fetch(fctx)
+		cancel()
 
 		c.mu.Lock()
 		if err == nil {
@@ -94,7 +104,7 @@ func (c *Catalog[T]) Invalidate() {
 }
 
 func (c *Catalog[T]) refresh(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, DefaultFetchTimeout)
 	defer cancel()
 	val, err := c.fetch(ctx)
 
