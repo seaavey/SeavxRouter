@@ -26,14 +26,12 @@ func narrowSnapshot() Snapshot {
 		Compression:      httpapi.CompressionTotals{Events: 46, ToolResults: 25_100, Compressed: 5_500, BytesBefore: 58_000_000, BytesAfter: 46_000_000, BytesSaved: 12_000_000, SavedPercent: 20.4},
 		CompressionToday: httpapi.CompressionTotals{Events: 46, ToolResults: 25_100, Compressed: 5_500, BytesBefore: 58_000_000, BytesAfter: 46_000_000, BytesSaved: 12_000_000, SavedPercent: 20.4},
 		Recent: []httpapi.LogSummary{{
-			RequestLog: httpapi.RequestLog{
-				TS:         "2026-11-13T06:30:16Z",
-				Endpoint:   "chat",
-				Model:      "codebuddy/deepseek-v4-flash",
-				Status:     200,
-				DurationMS: 4200,
-				Usage:      backend.Usage{TotalTokens: 488_600},
-			},
+			TS:         "2026-11-13T06:30:16Z",
+			Endpoint:   "chat",
+			Model:      "codebuddy/deepseek-v4-flash",
+			Status:     200,
+			DurationMS: 4200,
+			Usage:      backend.Usage{TotalTokens: 488_600},
 		}},
 	}
 }
@@ -87,9 +85,9 @@ func TestRenderRecentFillsHeight(t *testing.T) {
 	snap := narrowSnapshot()
 	snap.Recent = nil
 	for i := 0; i < 40; i++ {
-		snap.Recent = append(snap.Recent, httpapi.LogSummary{RequestLog: httpapi.RequestLog{
+		snap.Recent = append(snap.Recent, httpapi.LogSummary{
 			TS: fmt.Sprintf("2026-11-13T06:%02d:00Z", i), Endpoint: "chat", Model: "m", Status: 200,
-		}})
+		})
 	}
 	frame := render(View{Snapshot: snap, Width: 120, Height: 60})
 	if !strings.Contains(frame, shortTime(fmt.Sprintf("2026-11-13T06:%02d:00Z", 39))) {
@@ -138,7 +136,7 @@ func TestLocalHour(t *testing.T) {
 	}
 }
 
-func detailEntry(request, response string) *httpapi.RequestLog {
+func detailEntry() *httpapi.RequestLog {
 	return &httpapi.RequestLog{
 		ID:         "abcd1234-5678-90ab-cdef-1234567890ab",
 		TS:         "2026-11-13T06:30:16Z",
@@ -149,14 +147,12 @@ func detailEntry(request, response string) *httpapi.RequestLog {
 		Status:     200,
 		DurationMS: 1234,
 		Stream:     true,
-		Request:    request,
-		Response:   response,
 		Usage:      backend.Usage{InputTokens: 1200, OutputTokens: 340, CacheReadTokens: 900, TotalTokens: 1540},
 	}
 }
 
 func TestRenderDetail(t *testing.T) {
-	entry := detailEntry(`{"model":"deepseek"}`, `{"content":"hi"}`)
+	entry := detailEntry()
 	frame := render(View{Detail: entry, Width: 100, Height: 24})
 	for _, want := range []string{
 		"request abcd1234", "DATE", localStamp(entry.TS), "MODEL", "deepseek-v4-flash",
@@ -165,11 +161,6 @@ func TestRenderDetail(t *testing.T) {
 	} {
 		if !strings.Contains(frame, want) {
 			t.Errorf("detail missing %q:\n%s", want, frame)
-		}
-	}
-	for _, hidden := range []string{`"content":"hi"`, `"model":"deepseek"`} {
-		if strings.Contains(frame, hidden) {
-			t.Errorf("detail leaks body %q:\n%s", hidden, frame)
 		}
 	}
 	lines := strings.Split(frame, "\n")
@@ -197,10 +188,10 @@ func TestRenderRecentSelectionWindow(t *testing.T) {
 	snap := narrowSnapshot()
 	snap.Recent = nil
 	for i := 0; i < 100; i++ {
-		snap.Recent = append(snap.Recent, httpapi.LogSummary{RequestLog: httpapi.RequestLog{
+		snap.Recent = append(snap.Recent, httpapi.LogSummary{
 			ID: fmt.Sprintf("id-%d", i), TS: "2026-11-13T06:30:16Z", Endpoint: "chat",
 			Model: fmt.Sprintf("model-%02d", i), Status: 200,
-		}})
+		})
 	}
 	frame := render(View{Snapshot: snap, Width: 120, Height: 40, Selected: 50})
 	if !strings.Contains(frame, "model-50") {

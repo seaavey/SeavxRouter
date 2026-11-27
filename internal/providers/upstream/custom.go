@@ -9,16 +9,43 @@ import (
 	"seavxrouter/internal/backend"
 )
 
-// ProbeKey verifies a bearer key against a custom OpenAI-compatible base URL.
-// It requires a non-empty model catalog and sends one tiny chat completion, so
-// endpoints that publish /models without authentication still get their key
-// checked. A quota rejection means the key authenticated but the account has no
-// allowance; that is reported as a note instead of a failure. probeModel pins
-// the smoke test to one model, for providers whose first catalog entries are
-// outside the caller's free tier; empty tries up to three chat-capable models.
-func ProbeKey(ctx context.Context, name, baseURL, key, probeModel string) (models []string, note string, err error) {
+// ProbeCatalog validates an API key by fetching the provider's model catalog.
+// This is the gate the dashboard uses when a provider is added: a key that
+// cannot list models gives the router nothing to route to. Unlike ProbeKey it
+// sends no chat completion, so no upstream tokens are spent and a provider with
+// no chat allowance on its free tier can still be connected.
+func ProbeCatalog(ctx context.Context, name, baseURL, key, sdk string) ([]string, error) {
 	acct := &auth.Auth{Provider: name, AccessToken: key}
-	e, err := NewEngine(name, baseURL, auth.AuthStore{}, []*auth.Auth{acct})
+	e, err := NewEngineSDK(name, baseURL, sdk, auth.AuthStore{}, []*auth.Auth{acct})
+	if err != nil {
+		return nil, err
+	}
+	list, err := e.fetchModelsWith(ctx, acct)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(list))
+	for _, m := range list {
+		ids = append(ids, m.ID)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%s returned an empty model catalog", name)
+	}
+	return ids, nil
+}
+
+// ProbeKey verifies a bearer key against a custom base URL. It requires a
+// non-empty model catalog and sends one tiny chat completion, so endpoints that
+// publish /models without authentication still get their key checked. A quota
+// rejection means the key authenticated but the account has no allowance; that
+// is reported as a note instead of a failure. probeModel pins the smoke test to
+// one model, for providers whose first catalog entries are outside the caller's
+// free tier; empty tries up to three chat-capable models. sdk selects the wire
+// protocol: "anthropic" for the Messages API, anything else for the
+// OpenAI-compatible surface.
+func ProbeKey(ctx context.Context, name, baseURL, key, probeModel, sdk string) (models []string, note string, err error) {
+	acct := &auth.Auth{Provider: name, AccessToken: key}
+	e, err := NewEngineSDK(name, baseURL, sdk, auth.AuthStore{}, []*auth.Auth{acct})
 	if err != nil {
 		return nil, "", err
 	}

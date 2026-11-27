@@ -27,6 +27,9 @@ type Engine struct {
 	// BaseURL is the API root without a trailing slash, e.g.
 	// "https://api.groq.com/openai/v1".
 	BaseURL string
+	// SDK selects the wire protocol: "openai" (the default, also used for
+	// every built-in provider) or "anthropic" for the Messages API.
+	SDK string
 	// AccountPath, when set, is a provider-specific endpoint that returns the
 	// signed-in account (Cloudflare answers /user instead of /models).
 	AccountPath string
@@ -40,16 +43,39 @@ type Engine struct {
 	Store        auth.AuthStore
 	HTTP         *http.Client
 
-	mu      sync.Mutex
-	auths   []*auth.Auth
-	cache   auth.AccountCache
-	next    int
-	catalog *backend.Catalog[[]backend.Model]
+	mu        sync.Mutex
+	auths     []*auth.Auth
+	cache     auth.AccountCache
+	next      int
+	catalog   *backend.Catalog[[]backend.Model]
+	quotaMu   sync.Mutex
+	quotaSeen map[*auth.Auth]time.Time
+}
+
+// AnthropicVersion is the Messages API version header sent to Anthropic-
+// compatible upstreams.
+const AnthropicVersion = "2023-06-01"
+
+// anthropic reports whether this engine speaks the Anthropic Messages API.
+func (e *Engine) anthropic() bool {
+	return strings.EqualFold(strings.TrimSpace(e.SDK), "anthropic")
 }
 
 var _ backend.BackendAPI = (*Engine)(nil)
 
 func (e *Engine) Default() string { return e.DefaultModel }
+
+func (e *Engine) ProbeChat(ctx context.Context, model string) error {
+	maxTokens := 256
+	result, err := e.Chat(ctx, &backend.ChatRequest{Model: model, Messages: []backend.ChatMessage{{Role: "user", Content: "Reply with OK"}}, MaxTokens: &maxTokens}, nil)
+	if err != nil {
+		return err
+	}
+	if result == nil || strings.TrimSpace(result.Content) == "" {
+		return fmt.Errorf("chat verification returned no content")
+	}
+	return nil
+}
 
 func (e *Engine) httpClient() *http.Client {
 	if e.HTTP != nil {
@@ -74,12 +100,22 @@ func (e *Engine) endpoint(tmpl, fallback string, a *auth.Auth) string {
 // NewEngine builds an engine for one provider from stored bearer keys. The
 // keys carry no refresh token, so the cache refreshes them from disk only.
 func NewEngine(name, baseURL string, store auth.AuthStore, auths []*auth.Auth) (*Engine, error) {
+	return NewEngineSDK(name, baseURL, "openai", store, auths)
+}
+
+// NewEngineSDK builds an engine for an explicit wire protocol. sdk "" and
+// "openai" both select the OpenAI-compatible surface.
+func NewEngineSDK(name, baseURL, sdk string, store auth.AuthStore, auths []*auth.Auth) (*Engine, error) {
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no %s accounts", name)
+	}
+	if sdk == "" {
+		sdk = "openai"
 	}
 	e := &Engine{
 		Name:    name,
 		BaseURL: strings.TrimRight(baseURL, "/"),
+		SDK:     sdk,
 		Store:   store,
 		HTTP:    backend.NewHTTPClient(),
 		auths:   auths,
@@ -119,11 +155,25 @@ type modelEntry struct {
 }
 
 type modelList struct {
-	Data []modelEntry `json:"data"`
+	Data   []modelEntry `json:"data"`
+	Models []modelEntry `json:"models"`
 }
 
 // Models discovers the catalog from GET /models. The list is account-specific,
 // so there is no static fallback.
+// ProbeModel performs a strict, bounded chat validation with configured credentials.
+func (e *Engine) ProbeModel(ctx context.Context, model string) error {
+	maxTokens := 4
+	result, err := e.Chat(ctx, &backend.ChatRequest{Model: model, Messages: []backend.ChatMessage{{Role: "user", Content: "Reply with OK"}}, MaxTokens: &maxTokens}, nil)
+	if err != nil {
+		return err
+	}
+	if result == nil || strings.TrimSpace(result.Content) == "" {
+		return fmt.Errorf("chat response contained no result")
+	}
+	return nil
+}
+
 func (e *Engine) Models(ctx context.Context) ([]backend.Model, error) {
 	return e.catalog.Get(ctx)
 }
@@ -144,6 +194,9 @@ func (e *Engine) fetchModels(ctx context.Context) ([]backend.Model, error) {
 }
 
 func (e *Engine) fetchModelsWith(ctx context.Context, a *auth.Auth) ([]backend.Model, error) {
+	if e.anthropic() {
+		return e.fetchAnthropicModels(ctx, a)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.endpoint(e.ModelsPath, "/models", a), nil)
 	if err != nil {
 		return nil, err
@@ -153,6 +206,23 @@ func (e *Engine) fetchModelsWith(ctx context.Context, a *auth.Auth) ([]backend.M
 	resp, err := e.httpClient().Do(req)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound && !e.anthropic() && e.ModelsPath == "" {
+		resp.Body.Close()
+		fallbackBase := e.BaseURL
+		if strings.HasSuffix(fallbackBase, "/v1") {
+			fallbackBase = strings.TrimSuffix(fallbackBase, "/v1")
+		}
+		fallback, fallbackErr := http.NewRequestWithContext(ctx, http.MethodGet, fallbackBase+"/api/models", nil)
+		if fallbackErr != nil {
+			return nil, fallbackErr
+		}
+		e.authorize(fallback, a)
+		fallback.Header.Set("Accept", "application/json")
+		resp, err = e.httpClient().Do(fallback)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -165,7 +235,7 @@ func (e *Engine) fetchModelsWith(ctx context.Context, a *auth.Auth) ([]backend.M
 	// Most providers wrap the catalog in {"data":[...]}; Cloudflare answers
 	// {"result":[...]} instead, so both shapes are decoded here.
 	var list modelList
-	if err := json.Unmarshal(body, &list); err != nil || len(list.Data) == 0 {
+	if err := json.Unmarshal(body, &list); err != nil || (len(list.Data) == 0 && len(list.Models) == 0) {
 		var cf struct {
 			Result []struct {
 				Name string `json:"name"`
@@ -177,8 +247,12 @@ func (e *Engine) fetchModelsWith(ctx context.Context, a *auth.Auth) ([]backend.M
 			}
 		}
 	}
-	out := make([]backend.Model, 0, len(list.Data))
-	for _, m := range list.Data {
+	out := make([]backend.Model, 0, len(list.Data)+len(list.Models))
+	entries := list.Data
+	if len(entries) == 0 {
+		entries = list.Models
+	}
+	for _, m := range entries {
 		if m.ID == "" {
 			continue
 		}
@@ -262,6 +336,9 @@ func (e *Engine) Stream(ctx context.Context, model, prompt string, onDelta func(
 // Chat always asks upstream for an SSE stream and folds it into one ChatResult,
 // so streaming and non-streaming callers share a single wire path.
 func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta func(backend.ChatDelta)) (*backend.ChatResult, error) {
+	if e.anthropic() {
+		return e.anthropicChat(ctx, req, onDelta)
+	}
 	model := req.Model
 	if model == "" {
 		model = e.Default()
@@ -296,9 +373,11 @@ func (e *Engine) Chat(ctx context.Context, req *backend.ChatRequest, onDelta fun
 		a := e.pick()
 		result, started, err := e.chatOnce(ctx, a, data, onDelta)
 		if err == nil {
+			e.trackQuota(a, nil)
 			result.Account = a.Label()
 			return result, nil
 		}
+		e.trackQuota(a, err)
 		lastErr = err
 		if started || ctx.Err() != nil {
 			return nil, err

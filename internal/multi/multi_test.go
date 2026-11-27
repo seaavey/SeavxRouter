@@ -3,10 +3,79 @@ package multi
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"seavxrouter/internal/backend"
+	"seavxrouter/internal/httpapi"
 )
+
+func TestManagedModelsAndManualEntries(t *testing.T) {
+	ctx := context.Background()
+	old := &fakeBackend{models: map[string]bool{"old": true, "keep": true}}
+	other := &fakeBackend{models: map[string]bool{"old": true}}
+	m := &MultiBackend{Custom: map[string]backend.BackendAPI{"one": old, "two": other}}
+	path := filepath.Join(t.TempDir(), "models.json")
+	manager, err := httpapi.NewProviderModelManager(m, path, func(context.Context, string, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SetModelManager(manager)
+	if err := manager.AddModel(ctx, "one", "new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.DeleteModel(ctx, "one", "old"); err != nil {
+		t.Fatal(err)
+	}
+	assertHas := func(id string, want bool) {
+		t.Helper()
+		if got := m.HasModel(ctx, id); got != want {
+			t.Errorf("HasModel(%q) = %v, want %v", id, got, want)
+		}
+	}
+	assertListed := func(want ...string) {
+		t.Helper()
+		models, err := m.Models(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, model := range models {
+			got[model.ID] = true
+		}
+		for _, id := range want {
+			if !got[id] {
+				t.Errorf("Models() missing %q: %v", id, got)
+			}
+		}
+		for _, id := range []string{"one/old"} {
+			if got[id] {
+				t.Errorf("Models() unexpectedly includes %q", id)
+			}
+		}
+	}
+	assertListed("one/new", "one/keep", "two/old")
+	assertHas("one/new", true)
+	assertHas("one/old", false)
+	assertHas("two/old", true)
+	m.Combos = &Combos{entries: map[string][]string{"disabled": {"one/old"}}}
+	if _, err := m.Chat(ctx, &backend.ChatRequest{Model: "combo/disabled"}, nil); err == nil {
+		t.Fatal("combo must not route to deleted model")
+	}
+	manager, err = httpapi.NewProviderModelManager(m, path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SetModelManager(manager)
+	assertListed("one/new", "one/keep", "two/old")
+	assertHas("one/new", true)
+	assertHas("one/old", false)
+	assertHas("two/old", true)
+	m.Combos = &Combos{entries: map[string][]string{"disabled": {"one/old"}}}
+	if _, err := m.Chat(ctx, &backend.ChatRequest{Model: "combo/disabled"}, nil); err == nil {
+		t.Fatal("combo must not route to deleted model")
+	}
+}
 
 func TestNormalizeModel(t *testing.T) {
 	cases := []struct {

@@ -46,27 +46,23 @@ type sseLog struct {
 
 func (e sseLog) summary() httpapi.LogSummary {
 	return httpapi.LogSummary{
-		RequestLog: httpapi.RequestLog{
-			ID:         e.ID,
-			TS:         e.Timestamp,
-			Endpoint:   e.Endpoint,
-			Provider:   e.Provider,
-			Model:      e.Model,
-			Account:    e.Account,
-			User:       e.User,
-			Status:     e.Status,
-			DurationMS: e.DurationMS,
-			Stream:     e.Stream,
-			Usage: backend.Usage{
-				InputTokens:     e.Usage.PromptTokens,
-				OutputTokens:    e.Usage.CompletionTokens,
-				ThinkingTokens:  e.Usage.ThinkingTokens,
-				CacheReadTokens: e.Usage.CachedTokens,
-				TotalTokens:     e.Usage.TotalTokens,
-			},
+		ID:         e.ID,
+		TS:         e.Timestamp,
+		Endpoint:   e.Endpoint,
+		Provider:   e.Provider,
+		Model:      e.Model,
+		Account:    e.Account,
+		User:       e.User,
+		Status:     e.Status,
+		DurationMS: e.DurationMS,
+		Stream:     e.Stream,
+		Usage: backend.Usage{
+			InputTokens:     e.Usage.PromptTokens,
+			OutputTokens:    e.Usage.CompletionTokens,
+			ThinkingTokens:  e.Usage.ThinkingTokens,
+			CacheReadTokens: e.Usage.CachedTokens,
+			TotalTokens:     e.Usage.TotalTokens,
 		},
-		RequestBytes:  e.RequestBytes,
-		ResponseBytes: e.ResponseBytes,
 	}
 }
 

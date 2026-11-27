@@ -60,7 +60,10 @@ func TestRequestLogging(t *testing.T) {
 	}
 	raw := list.Data[0]
 	if _, ok := raw["request"]; ok {
-		t.Fatalf("list must omit request body by default: %v", raw)
+		t.Fatalf("request bodies are not stored any more: %v", raw)
+	}
+	if _, ok := raw["response"]; ok {
+		t.Fatalf("response bodies are not stored any more: %v", raw)
 	}
 	if raw["id"] == "" || raw["endpoint"] != "chat" || raw["provider"] != "antigravity" || raw["model"] != "m" || raw["status"] != float64(200) {
 		t.Fatalf("entry = %v", raw)
@@ -68,37 +71,17 @@ func TestRequestLogging(t *testing.T) {
 	if raw["account"] != "alice@example.com" {
 		t.Fatalf("account = %v", raw["account"])
 	}
-	if raw["request_bytes"].(float64) != 0 || raw["response_bytes"].(float64) == 0 {
-		t.Fatalf("body sizes = %v / %v", raw["request_bytes"], raw["response_bytes"])
+	if _, ok := raw["request_bytes"]; ok {
+		t.Fatalf("body sizes are gone: %v", raw)
 	}
 	usage := raw["usage"].(map[string]any)
-	if usage["prompt_tokens"] != float64(3) || usage["completion_tokens"] != float64(2) ||
-		usage["thinking_tokens"] != float64(1) || usage["cached_tokens"] != float64(4) ||
+	// Input is stored net of the cached prefix: 3 reported, 4 cached -> 0 and 3.
+	if usage["prompt_tokens"] != float64(0) || usage["completion_tokens"] != float64(2) ||
+		usage["thinking_tokens"] != float64(1) || usage["cached_tokens"] != float64(3) ||
 		usage["total_tokens"] != float64(5) {
 		t.Fatalf("usage = %v", usage)
 	}
 	id := raw["id"].(string)
-
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest("GET", "/v1/logging?include=all&limit=1", nil))
-	if w.Code != 200 {
-		t.Fatalf("include=all code %d body %s", w.Code, w.Body.String())
-	}
-	var fullList struct {
-		Data []struct {
-			Request  json.RawMessage `json:"request"`
-			Response struct {
-				Content string `json:"content"`
-			} `json:"response"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &fullList); err != nil {
-		t.Fatal(err)
-	}
-	if len(fullList.Data) != 1 || string(fullList.Data[0].Request) != `""` ||
-		fullList.Data[0].Response.Content != "hi there" {
-		t.Fatalf("include=all request body must be omitted: %s", w.Body.String())
-	}
 
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/v1/logging/"+id, nil))
@@ -106,13 +89,8 @@ func TestRequestLogging(t *testing.T) {
 		t.Fatalf("detail code %d body %s", w.Code, w.Body.String())
 	}
 	var detail struct {
-		ID       string          `json:"id"`
-		Endpoint string          `json:"endpoint"`
-		Request  json.RawMessage `json:"request"`
-		Response struct {
-			Content      string `json:"content"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"response"`
+		ID       string `json:"id"`
+		Endpoint string `json:"endpoint"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &detail); err != nil {
 		t.Fatal(err)
@@ -120,11 +98,8 @@ func TestRequestLogging(t *testing.T) {
 	if detail.ID != id || detail.Endpoint != "chat" {
 		t.Fatalf("detail = %s", w.Body.String())
 	}
-	if string(detail.Request) != `""` {
-		t.Fatalf("detail request body must be omitted: %s", w.Body.String())
-	}
-	if detail.Response.Content != "hi there" || detail.Response.FinishReason != "stop" {
-		t.Fatalf("detail response = %+v", detail.Response)
+	if strings.Contains(w.Body.String(), `"response"`) || strings.Contains(w.Body.String(), `"request"`) {
+		t.Fatalf("detail must not carry bodies: %s", w.Body.String())
 	}
 
 	w = httptest.NewRecorder()
@@ -181,12 +156,11 @@ func TestRequestLoggingStream(t *testing.T) {
 
 	data := readSSEEvent(t, sc, "log")
 	var e struct {
-		Endpoint     string `json:"endpoint"`
-		Model        string `json:"model"`
-		Account      string `json:"account"`
-		Status       int    `json:"status"`
-		RequestBytes int    `json:"request_bytes"`
-		Usage        struct {
+		Endpoint string `json:"endpoint"`
+		Model    string `json:"model"`
+		Account  string `json:"account"`
+		Status   int    `json:"status"`
+		Usage    struct {
 			PromptTokens int `json:"prompt_tokens"`
 			TotalTokens  int `json:"total_tokens"`
 		} `json:"usage"`
@@ -194,7 +168,7 @@ func TestRequestLoggingStream(t *testing.T) {
 	if err := json.Unmarshal([]byte(data), &e); err != nil {
 		t.Fatal(err)
 	}
-	if e.Endpoint != "chat" || e.Model != "m" || e.Status != 200 || e.RequestBytes != 0 {
+	if e.Endpoint != "chat" || e.Model != "m" || e.Status != 200 {
 		t.Fatalf("streamed log = %s", data)
 	}
 	if e.Account != "bob@example.com" {
@@ -240,8 +214,8 @@ func TestRequestLoggingCapturesErrors(t *testing.T) {
 	if len(logs) != 1 || logs[0].Status != 400 {
 		t.Fatalf("logs = %+v", logs)
 	}
-	if logs[0].Request != "" || !strings.Contains(logs[0].Response, "messages must not be empty") {
-		t.Fatalf("response not captured or request body stored: %+v", logs[0])
+	if !strings.Contains(logs[0].Error, "messages must not be empty") {
+		t.Fatalf("failure message not captured: %+v", logs[0])
 	}
 }
 
@@ -269,8 +243,8 @@ func TestStreamFailureLogsUpstreamStatus(t *testing.T) {
 	if len(logs) != 1 || logs[0].Status != 492 {
 		t.Fatalf("logs = %+v", logs)
 	}
-	if !strings.Contains(logs[0].Response, "upstream exploded") {
-		t.Fatalf("error body not logged: %q", logs[0].Response)
+	if !strings.Contains(logs[0].Error, "upstream exploded") {
+		t.Fatalf("failure message not logged: %q", logs[0].Error)
 	}
 }
 
@@ -298,8 +272,8 @@ func TestStreamQuotaFailureLogs429(t *testing.T) {
 	if len(logs) != 1 || logs[0].Status != 429 {
 		t.Fatalf("logs = %+v", logs)
 	}
-	if !strings.Contains(logs[0].Response, "quota exceeded") {
-		t.Fatalf("error body not logged: %q", logs[0].Response)
+	if !strings.Contains(logs[0].Error, "quota exceeded") {
+		t.Fatalf("failure message not logged: %q", logs[0].Error)
 	}
 }
 

@@ -10,11 +10,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -178,6 +176,7 @@ func main() {
 	apiKey := fs.String("api-key", "", "require this bearer token on /v1/* (empty = no auth)")
 	defaultModel := fs.String("default-model", "", "model used when the request omits one")
 	usageDB := fs.String("usage-db", httpapi.DefaultUsageDBPath(), `SQLite file for token usage tracking (empty or "off" disables)`)
+	dashboardDB := fs.String("dashboard-db", "", "SQLite file for dashboard login (empty disables web dashboard authentication routes)")
 	keysDB := fs.String("keys-db", httpapi.DefaultKeysDBPath(), `SQLite file for tenant API keys (empty or "off" disables)`)
 	compressFlag := fs.String("compress", "on", "compress large tool-result output: on|off")
 	compressMinBytes := fs.Int("compress-min-bytes", 2000, "minimum tool-result bytes to compress")
@@ -271,7 +270,7 @@ func main() {
 	if combosPath == "" {
 		combosPath = defaultCombosPath(*authFile)
 	}
-	multi := &multi.MultiBackend{Combos: multi.NewCombos(combosPath)}
+	multi := &multi.MultiBackend{Combos: multi.NewCombos(combosPath), Store: store}
 	if len(accounts.antigravity) > 0 {
 		engine, err := antigravity.NewEngine(store, *apiBase, accounts.antigravity)
 		if err != nil {
@@ -393,7 +392,7 @@ func main() {
 			slog.Error("invalid custom provider", "provider", name, "err", err)
 			os.Exit(1)
 		}
-		engine, err := upstream.NewEngine(name, base, store, customAuths)
+		engine, err := upstream.NewEngineSDK(name, base, customAuths[0].SDK, store, customAuths)
 		if err != nil {
 			slog.Error("cannot start "+name, "err", err)
 			os.Exit(1)
@@ -480,12 +479,27 @@ func main() {
 
 	compressor := compress.New(compress.Options{Enabled: compressionEnabled(*compressFlag), MinBytes: *compressMinBytes})
 	slog.Info("compression", "enabled", compressor.Enabled(), "min_bytes", *compressMinBytes)
-	serverOpts := []httpapi.ServerOption{httpapi.WithCompression(compressor)}
+	serverOpts := []httpapi.ServerOption{httpapi.WithCompression(compressor), httpapi.WithCustomProviders(multi)}
+	modelManager, managerErr := httpapi.NewProviderModelManager(multi, filepath.Join(filepath.Dir(*authFile), "provider-models.json"), multi.ProbeModel)
+	if managerErr == nil {
+		multi.SetModelManager(modelManager)
+		serverOpts = append(serverOpts, httpapi.WithModelManager(multi))
+	} else {
+		slog.Error("cannot initialize provider model manager", "err", managerErr)
+	}
 	if keyStore != nil {
 		serverOpts = append(serverOpts, httpapi.WithKeys(keyStore))
 	}
+	if *dashboardDB != "" {
+		store, err := httpapi.OpenDashboardStore(*dashboardDB)
+		if err != nil {
+			slog.Error("cannot open dashboard db", "err", err)
+			os.Exit(1)
+		}
+		defer store.Close()
+		serverOpts = append(serverOpts, httpapi.WithDashboard(store))
+	}
 	srv := httpapi.NewServer(provider, *apiKey, usageStore, serverOpts...)
-
 	httpSrv := &http.Server{
 		Addr:              *listen,
 		Handler:           srv.Handler(),
@@ -548,7 +562,7 @@ func pickDefault(override, fallback string) string {
 	return fallback
 }
 
-var providerNames = []string{"antigravity", "codex", "codebuddy", "qoder", "kiro", "verboo", "nvidia", "groq", "cloudflare", "opencode"}
+var providerNames = auth.BuiltinProviders
 
 type providerAccounts struct {
 	antigravity []*auth.Auth
@@ -663,7 +677,7 @@ func newChecker(name string, accounts providerAccounts, store auth.AuthStore, ap
 		if err != nil {
 			return nil, err
 		}
-		return upstream.NewEngine(name, base, store, customAuths)
+		return upstream.NewEngineSDK(name, base, customAuths[0].SDK, store, customAuths)
 	}
 	switch name {
 	case "antigravity":
@@ -912,7 +926,16 @@ func runKeyCmd(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-var customProviderNameRE = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+// customProviderNameRE and the provider-name rules live in internal/auth so the
+// CLI and the dashboard validate identically.
+
+func normalizeCustomProviderName(raw string) (string, error) {
+	return auth.NormalizeCustomProviderName(raw)
+}
+
+func normalizeCustomBaseURL(raw string) (string, error) {
+	return auth.NormalizeCustomBaseURL(raw)
+}
 
 // runProviderCmd handles `seavxrouter provider add|list|remove` for custom
 // OpenAI-compatible endpoints. The base URL and bearer key live in auth.jsonc;
@@ -945,6 +968,7 @@ func runProviderCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 	baseURL := fs.String("base-url", "", "add: upstream API base URL, e.g. https://api.example.com/v1")
 	apiKey := fs.String("api-key", "", "add: upstream bearer API key (prompted when empty)")
 	probeModel := fs.String("model", "", "add: model ID used for the chat validation smoke test")
+	sdkFlag := fs.String("sdk", "openai", "add: wire protocol, openai or anthropic")
 	if err := fs.Parse(rest); err != nil {
 		return 2
 	}
@@ -966,7 +990,7 @@ func runProviderCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 	store := auth.AuthStore{Path: *authFile}
 	switch action {
 	case "add":
-		return runProviderAdd(store, positional[0], *baseURL, *apiKey, *probeModel, stdin, stdout, stderr)
+		return runProviderAdd(store, positional[0], *baseURL, *apiKey, *probeModel, *sdkFlag, stdin, stdout, stderr)
 	case "list":
 		return runProviderList(store, stdout, stderr)
 	default:
@@ -975,36 +999,9 @@ func runProviderCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 }
 
 func providerUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: seavxrouter provider add <name> -base-url URL [-api-key KEY] [-model ID] [-auth-file path]")
+	fmt.Fprintln(w, "usage: seavxrouter provider add <name> -base-url URL [-sdk openai|anthropic] [-api-key KEY] [-model ID] [-auth-file path]")
 	fmt.Fprintln(w, "       seavxrouter provider list [-auth-file path]")
 	fmt.Fprintln(w, "       seavxrouter provider remove <name> [-auth-file path]")
-}
-
-func normalizeCustomProviderName(raw string) (string, error) {
-	name := strings.ToLower(strings.TrimSpace(raw))
-	if !customProviderNameRE.MatchString(name) {
-		return "", fmt.Errorf("provider name %q must start with a letter and use only a-z, 0-9, _ or - (max 32 chars)", raw)
-	}
-	if isBuiltinProvider(name) {
-		return "", fmt.Errorf("provider name %q is built in; use: seavxrouter login %s", name, name)
-	}
-	switch name {
-	case "cf", "auto", "default", "combo":
-		return "", fmt.Errorf("provider name %q is reserved", name)
-	}
-	return name, nil
-}
-
-func normalizeCustomBaseURL(raw string) (string, error) {
-	base := strings.TrimRight(strings.TrimSpace(raw), "/")
-	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return "", fmt.Errorf("invalid base URL %q: want http(s)://host[/path]", raw)
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("invalid base URL %q: remove the query string and fragment", raw)
-	}
-	return base, nil
 }
 
 // customBaseURL validates the endpoint shared by a custom provider's accounts.
@@ -1034,8 +1031,13 @@ func readPrompt(reader *bufio.Reader, out io.Writer, label string) (string, erro
 	return value, nil
 }
 
-func runProviderAdd(store auth.AuthStore, rawName, rawBaseURL, rawKey, rawProbeModel string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runProviderAdd(store auth.AuthStore, rawName, rawBaseURL, rawKey, rawProbeModel, rawSDK string, stdin io.Reader, stdout, stderr io.Writer) int {
 	name, err := normalizeCustomProviderName(rawName)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	sdk, err := auth.NormalizeSDK(rawSDK)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -1092,7 +1094,7 @@ func runProviderAdd(store auth.AuthStore, rawName, rawBaseURL, rawKey, rawProbeM
 	// completion must pass before anything is stored. -model pins that
 	// completion to a model the operator knows their plan can use.
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	models, note, err := upstream.ProbeKey(ctx, name, base, key, strings.TrimSpace(rawProbeModel))
+	models, note, err := upstream.ProbeKey(ctx, name, base, key, strings.TrimSpace(rawProbeModel), sdk)
 	cancel()
 	if err != nil {
 		fmt.Fprintf(stderr, "cannot verify %s at %s: %v\n", name, base, err)
@@ -1100,7 +1102,7 @@ func runProviderAdd(store auth.AuthStore, rawName, rawBaseURL, rawKey, rawProbeM
 		return 1
 	}
 
-	acct := &auth.Auth{Provider: name, AccessToken: key, BaseURL: base}
+	acct := &auth.Auth{Provider: name, AccessToken: key, BaseURL: base, SDK: sdk}
 	if err := store.Save([]*auth.Auth{acct}); err != nil {
 		fmt.Fprintf(stderr, "cannot save credentials: %v\n", err)
 		return 1
@@ -1195,7 +1197,17 @@ func comboUsage(w io.Writer) {
 
 func normalizeComboName(raw string) (string, error) {
 	name := strings.ToLower(strings.TrimSpace(raw))
-	if !customProviderNameRE.MatchString(name) {
+	if len(name) == 0 || len(name) > 32 {
+		return "", fmt.Errorf("combo name %q must be 1 to 32 characters of a-z, 0-9, _ or -", raw)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return "", fmt.Errorf("combo name %q must start with a letter and use only a-z, 0-9, _ or - (max 32 chars)", raw)
+		}
+	}
+	if name[0] < 'a' || name[0] > 'z' {
 		return "", fmt.Errorf("combo name %q must start with a letter and use only a-z, 0-9, _ or - (max 32 chars)", raw)
 	}
 	return name, nil
